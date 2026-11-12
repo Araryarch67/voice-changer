@@ -171,11 +171,21 @@ pub fn preload_gpu_libraries() {
 #[cfg(target_os = "windows")]
 fn cuda_folders() -> Vec<PathBuf> {
     let mut folders = Vec::new();
+    if let Some(ort_dir) = std::env::var_os("ORT_DYLIB_PATH")
+        .map(PathBuf::from)
+        .and_then(|path| path.parent().map(PathBuf::from))
+    {
+        folders.push(ort_dir);
+    }
     if let Some(lib) = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|parent| parent.join("lib")))
     {
         folders.push(lib);
+    }
+    let manifest_runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime");
+    if manifest_runtime.is_dir() {
+        folders.push(manifest_runtime);
     }
     let program_files = std::env::var_os("ProgramFiles")
         .map_or_else(|| PathBuf::from(r"C:\Program Files"), PathBuf::from);

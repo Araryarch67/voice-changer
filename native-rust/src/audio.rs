@@ -57,6 +57,7 @@ pub struct Metrics {
     pub dropped_output: AtomicU64,
     pub underrun_samples: AtomicU64,
     pub stream_error: AtomicBool,
+    pub stream_error_detail: Mutex<Option<String>>,
     /// The monitor device failed; the main output keeps going.
     pub monitor_error: AtomicBool,
     pub error: Mutex<Option<String>>,
@@ -241,7 +242,10 @@ fn named_output(
 
 #[derive(Clone, Copy)]
 enum OutputRole {
-    Voice { virtual_mic: bool },
+    Voice {
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        virtual_mic: bool,
+    },
     Monitor,
 }
 
@@ -378,7 +382,15 @@ fn run(
     metrics.ready.store(true, Ordering::Release);
     while !stop.load(Ordering::Acquire) {
         if metrics.stream_error.load(Ordering::Relaxed) {
-            bail!("Audio stream failed; device may have disconnected or microphone permission may be missing");
+            let detail = metrics.stream_error_detail.lock().unwrap().take();
+            match detail {
+                Some(detail) => bail!(
+                    "Audio stream failed ({detail}); device may have disconnected or microphone permission may be missing"
+                ),
+                None => bail!(
+                    "Audio stream failed; device may have disconnected or microphone permission may be missing"
+                ),
+            }
         }
         for update in updates.try_iter() {
             update.validate()?;
@@ -508,6 +520,29 @@ fn finish_recording(recorder: &mut Option<Recorder>, metrics: &Metrics) {
     }
 }
 
+fn is_recoverable_stream_error(err: &cpal::Error) -> bool {
+    matches!(
+        err.kind(),
+        cpal::ErrorKind::Xrun | cpal::ErrorKind::RealtimeDenied | cpal::ErrorKind::DeviceChanged
+    )
+}
+
+fn record_stream_error(err: &cpal::Error, direction: &str, metrics: &Metrics, monitor: bool) {
+    if is_recoverable_stream_error(err) {
+        return;
+    }
+    if monitor {
+        metrics.monitor_error.store(true, Ordering::Relaxed);
+        return;
+    }
+    if let Ok(mut detail) = metrics.stream_error_detail.try_lock() {
+        if detail.is_none() {
+            *detail = Some(format!("{direction}: {err}"));
+        }
+    }
+    metrics.stream_error.store(true, Ordering::Relaxed);
+}
+
 fn input_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -534,9 +569,7 @@ where
                 }
             }
         },
-        move |_| {
-            errors.stream_error.store(true, Ordering::Relaxed);
-        },
+        move |err| record_stream_error(&err, "input", &errors, false),
         None,
     )?)
 }
@@ -586,14 +619,7 @@ where
                 frame.fill(T::from_sample(sample.clamp(-1.0, 1.0)));
             }
         },
-        move |_| {
-            let flag = if monitor {
-                &errors.monitor_error
-            } else {
-                &errors.stream_error
-            };
-            flag.store(true, Ordering::Relaxed);
-        },
+        move |err| record_stream_error(&err, "output", &errors, monitor),
         None,
     )?)
 }
