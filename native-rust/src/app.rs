@@ -210,35 +210,17 @@ impl VoiceApp {
             }
         }
     }
-    /// Virtual microphone: send the voice to Voice Changer Mic or VB-Cable.
+    /// Virtual microphone: send the voice to VB-Cable.
     #[cfg(all(windows, feature = "audio"))]
     fn windows_mic_settings(&mut self, ui: &mut egui::Ui) {
-        use crate::windows_mic::{self, Cable};
-        let cable = windows_mic::installed(
-            self.devices
-                .iter()
-                .filter(|device| !device.input)
-                .map(|device| device.name.as_str()),
-        );
-        let idle = self.work.is_none();
+        use crate::windows_mic;
+        let installed = self
+            .devices
+            .iter()
+            .any(|device| !device.input && windows_mic::is_cable(&device.name));
         m3::field_label(ui, "Virtual microphone");
-        let Some(cable) = cable else {
+        if !installed {
             self.saved.virtual_mic = false;
-            if windows_mic::packaged_inf().is_some() {
-                if ui
-                    .add_enabled(idle, m3::Button::tonal("Install Voice Changer Mic"))
-                    .clicked()
-                {
-                    self.begin_work(|| {
-                        windows_mic::install_with_prompt()?;
-                        Ok("Voice Changer Mic is installed. Turn on Virtual microphone, then pick Voice Changer Mic in Discord or OBS.".into())
-                    });
-                }
-                ui.label(m3::supporting(
-                    "Adds a \"Voice Changer Mic\" input that Discord, OBS and games can use. Windows asks for administrator permission once.",
-                ));
-                return;
-            }
             ui.horizontal(|ui| {
                 if ui
                     .add(m3::Button::tonal("Get VB-Cable"))
@@ -258,66 +240,50 @@ impl VoiceApp {
                 "To use the converted voice in Discord or a game, install VB-Cable (free, from VB-Audio's site): unzip it, run VBCABLE_Setup_x64 as administrator, restart Windows, then press Refresh devices. The app then sends its voice there by itself. For OBS alone nothing is needed: add an Application Audio Capture source for this app.",
             ));
             return;
-        };
+        }
         ui.horizontal(|ui| {
             m3::switch(ui, &mut self.saved.virtual_mic, "Virtual microphone");
             ui.label(if self.saved.virtual_mic {
-                format!("On: the voice goes to {}", cable.speaker())
+                format!("On: the voice goes to {}", windows_mic::SPEAKER)
             } else {
                 "Off".into()
             });
         });
         ui.label(m3::supporting(&format!(
             "Pick \"{}\" as the microphone in Discord, OBS or a game. It is silent while the voice changer is stopped.",
-            cable.microphone()
+            windows_mic::MICROPHONE
         )));
-        match cable {
-            Cable::VbCable => {
-                let buffer = windows_mic::vb_cable_buffer();
-                ui.horizontal(|ui| {
-                    if let Some((samples, rate)) = buffer {
-                        let ms = samples as f32 * 1000.0 / rate as f32;
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "VB-Cable buffer: {samples} samples, up to {ms:.0} ms"
-                            ))
-                            .color(if samples > 2048 {
-                                m3::TERTIARY
-                            } else {
-                                m3::ON_SURFACE
-                            }),
-                        );
-                    }
-                    if ui
-                        .add(m3::Button::text("VB-Cable settings"))
-                        .on_hover_text("Opens VB-Cable's control panel; Windows asks for administrator permission")
-                        .clicked()
-                    {
-                        if let Err(error) = windows_mic::open_vb_cable_settings() {
-                            self.error = Some(format!("{error:#}"));
-                        }
-                    }
-                });
-                ui.label(m3::supporting(
-                    "VB-Cable holds the voice in its buffer before Discord hears it. Its default, 7168 samples, adds about 110 ms; in VB-Cable settings set Max Latency to 2048 (or 1024 if it does not crackle). Most of the remaining delay is CHUNK in Studio: lower it as far as your computer keeps up.",
-                ));
+        let buffer = windows_mic::vb_cable_buffer();
+        ui.horizontal(|ui| {
+            if let Some((samples, rate)) = buffer {
+                let ms = samples as f32 * 1000.0 / rate as f32;
+                ui.label(
+                    egui::RichText::new(format!(
+                        "VB-Cable buffer: {samples} samples, up to {ms:.0} ms"
+                    ))
+                    .color(if samples > 2048 {
+                        m3::TERTIARY
+                    } else {
+                        m3::ON_SURFACE
+                    }),
+                );
             }
-            Cable::Own => {
-                if ui
-                    .add_enabled(idle, m3::Button::text("Remove Voice Changer Mic"))
-                    .on_hover_text(
-                        "Uninstalls the driver; Windows asks for administrator permission",
-                    )
-                    .clicked()
-                {
-                    self.saved.virtual_mic = false;
-                    self.begin_work(|| {
-                        windows_mic::uninstall_with_prompt()?;
-                        Ok("Voice Changer Mic was removed.".into())
-                    });
+            if ui
+                .add(m3::Button::text("VB-Cable settings"))
+                .on_hover_text(
+                    "Opens VB-Cable's control panel; Windows asks for administrator permission",
+                )
+                .clicked()
+            {
+                if let Err(error) = windows_mic::open_vb_cable_settings() {
+                    self.error = Some(format!("{error:#}"));
                 }
             }
-        }
+        });
+        ui.label(m3::supporting(
+            "VB-Cable holds the voice in its buffer before Discord hears it. Its default, 7168 samples, adds about 110 ms; in VB-Cable settings set Max Latency to 2048 (or 1024 if it does not crackle). Most of the remaining delay is Chunk in Studio: lower it as far as your computer keeps up.",
+        ))
+        ;
     }
     fn running(&self) -> bool {
         #[cfg(feature = "audio")]
@@ -861,7 +827,7 @@ impl VoiceApp {
                 let s = &mut self.saved.settings;
                 m3::setting(
                     ui,
-                    "Tune", "Makes the voice higher or lower. +12 is one octave up, -12 one octave down.",
+                    "Tune", "Makes the voice higher or lower. +12 is one octave up, -12 one octave down. Male to female voice: about +8 to +12; female to male: about -8 to -12. A natural range sounds most real.",
                     format!("{:+.1} semitones", s.semitones),
                     &mut s.semitones,
                     -24.0..=24.0,
@@ -869,7 +835,7 @@ impl VoiceApp {
                 );
                 m3::setting(
                     ui,
-                    "Index", "How much of the model's accent and tone to copy. Higher sounds more like the model but can add artifacts.",
+                    "Index", "How much of the model's accent and tone to copy from its .index file. 50-75% usually sounds most like the character; higher can add a metallic edge. No effect on voices without an index.",
                     format!("{:.0} %", s.index_ratio * 100.0),
                     &mut s.index_ratio,
                     0.0..=1.0,
@@ -1069,7 +1035,7 @@ impl VoiceApp {
             let s = &mut self.saved.settings;
             m3::setting(
                 ui,
-                "Tune", "Makes the voice higher or lower. +12 is one octave up, -12 one octave down.",
+                "Tune", "Makes the voice higher or lower. +12 is one octave up, -12 one octave down. Male to female voice: about +8 to +12; female to male: about -8 to -12. A natural range sounds most real.",
                 format!("{:+.1} semitones", s.semitones),
                 &mut s.semitones,
                 -24.0..=24.0,
@@ -1077,7 +1043,7 @@ impl VoiceApp {
             );
             m3::setting(
                 ui,
-                "Index", "How much of the model's accent and tone to copy. Higher sounds more like the model but can add artifacts.",
+                "Index", "How much of the model's accent and tone to copy from its .index file. 50-75% usually sounds most like the character; higher can add a metallic edge. No effect on voices without an index.",
                 format!("{:.0} %", s.index_ratio * 100.0),
                 &mut s.index_ratio,
                 0.0..=1.0,
@@ -1085,7 +1051,7 @@ impl VoiceApp {
             );
             m3::setting(
                 ui,
-                "Protect", "Keeps breaths and consonants natural. Lower protects more; 0.50 turns it off.",
+                "Protect", "Keeps breaths and s, t, k sounds natural when Index is on. Around 0.33 if they sound lispy or robotic; lower protects more; 0.50 turns it off.",
                 format!("{:.2}", s.protect),
                 &mut s.protect,
                 0.0..=0.5,
@@ -1094,7 +1060,7 @@ impl VoiceApp {
             choice(
                 ui,
                 "F0 detector",
-                "How your pitch is measured. RMVPE is the best all-rounder. CREPE full and Harvest are accurate but heavy; CREPE tiny, DIO and YIN are light.",
+                "How your pitch is measured. RMVPE is the best all-rounder and the most natural for speech and singing. CREPE full and Harvest are accurate but heavy; CREPE tiny, DIO and YIN are light but can crack on high notes.",
                 &mut s.f0_detector,
                 &[
                     (F0Detector::Rmvpe, "RMVPE"),
@@ -1151,7 +1117,7 @@ impl VoiceApp {
             };
             if m3::setting(
                 ui,
-                "Noise gate (S.Thresh)", "Silences everything quieter than this, so room noise is not converted. Try around -45 dB.",
+                "Noise gate (S.Thresh)", "Below this nothing is converted, so room noise stays out and the GPU rests while you are silent. -50 dB suits most microphones; lower it if quiet words are cut. The pink tick on the microphone meter shows it.",
                 shown,
                 &mut gate,
                 -100.0..=-20.0,
@@ -1191,7 +1157,7 @@ impl VoiceApp {
                 let s = &mut self.saved.settings;
                 m3::setting(
                     ui,
-                    "Chunk", "How much audio is converted at once. Bigger is smoother and lighter on the CPU, but adds delay.",
+                    "Chunk", "How much audio is converted at once, and most of the delay. Lower it while Load at the bottom stays under about 70%; raise it if the voice stutters. 160-250 ms suits a good GPU, 320 ms or more the CPU.",
                     format!("{} ms", s.block_ms),
                     &mut s.block_ms,
                     20..=500,
@@ -1200,7 +1166,7 @@ impl VoiceApp {
                 s.overlap_ms = s.overlap_ms.min(s.block_ms);
                 m3::setting(
                     ui,
-                    "Extra", "Past audio the model hears for context. More improves quality but needs more CPU.",
+                    "Extra", "Past audio the model hears for context, so chunk edges sound continuous. It costs little: about 500 ms is a good default; lower it only if Load is too high.",
                     format!("{} ms", s.context_ms),
                     &mut s.context_ms,
                     0..=2000,
@@ -1209,7 +1175,7 @@ impl VoiceApp {
                 let max_overlap = s.block_ms.min(100);
                 m3::setting(
                     ui,
-                    "Crossfade", "Blends each chunk into the next to hide the seams.",
+                    "Crossfade", "Blends each chunk into the next to hide the seams. Raise it to 60-80 ms if you hear a flutter every chunk.",
                     format!("{} ms", s.overlap_ms),
                     &mut s.overlap_ms,
                     1..=max_overlap,
@@ -1225,6 +1191,43 @@ impl VoiceApp {
                 );
             });
             ui.label(m3::supporting("Stop audio to change buffer durations."));
+        });
+        ui.add_space(4.0);
+        m3::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            m3::card_title(ui, icons::INFO, "Tips");
+            for (glyph, title, text) in [
+                (
+                    icons::VOICE,
+                    "More like the character",
+                    "Use the voice's index (Index 50-75%) and keep Tune in a natural range for the voice. Speak in your normal voice; the model copies your expression.",
+                ),
+                (
+                    icons::GRAPHIC_EQ,
+                    "Smoother",
+                    "If the voice stutters, raise Chunk until Load stays under 70%. If you hear a flutter at every chunk, raise Crossfade.",
+                ),
+                (
+                    icons::SPEED,
+                    "Less delay",
+                    "Lower Chunk while Load stays low, and use a GPU. On Windows, set VB-Cable's Max Latency to 2048 in Settings.",
+                ),
+                (
+                    icons::MEMORY,
+                    "Less GPU",
+                    "Keep the noise gate around -50 dB: nothing is converted while you are silent. Noise suppression Sup2 costs a little more.",
+                ),
+            ] {
+                ui.horizontal_top(|ui| {
+                    ui.label(m3::icon(glyph, 20.0, m3::PRIMARY));
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(m3::title(title));
+                        ui.add(egui::Label::new(m3::supporting(text)).wrap());
+                    });
+                });
+                ui.add_space(4.0);
+            }
         });
     }
     fn settings(&mut self, ui: &mut egui::Ui) {
@@ -1509,30 +1512,122 @@ impl VoiceApp {
             },
         );
         #[cfg(feature = "audio")]
-        if let Some(session) = &self.session {
-            let m = &session.metrics;
-            let load = |v: &std::sync::atomic::AtomicU32| f32::from_bits(v.load(Ordering::Relaxed));
-            ui.horizontal_wrapped(|ui| {
-                m3::meter(ui, icons::MIC, load(&m.input_level));
-                m3::meter(ui, icons::HEADPHONES, load(&m.output_level));
-                let rate = m.output_rate.load(Ordering::Relaxed);
-                let queued = if rate == 0 {
-                    0.0
-                } else {
-                    m.queued_samples.load(Ordering::Relaxed) as f32 * 1000.0 / rate as f32
-                };
-                ui.label(m3::supporting(&format!(
-                    "{:.1} ms processing · {queued:.0} ms queued",
-                    load(&m.processing_ms)
-                )));
-                ui.label(m3::supporting(&format!(
-                    "Dropped {} / {} · underrun {}",
-                    m.dropped_input.load(Ordering::Relaxed),
-                    m.dropped_output.load(Ordering::Relaxed),
-                    m.underrun_samples.load(Ordering::Relaxed)
-                )));
-            });
-        }
+        self.live_stats(ui);
+    }
+    /// Live meters and chips under the bottom bar while audio runs: levels, how much
+    /// delay the voice has, how hard the processor works, and any glitches.
+    #[cfg(feature = "audio")]
+    fn live_stats(&self, ui: &mut egui::Ui) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let m = &session.metrics;
+        let load = |v: &std::sync::atomic::AtomicU32| f32::from_bits(v.load(Ordering::Relaxed));
+        let settings = &self.saved.settings;
+        let gate_db = 20.0 * settings.silence_threshold.max(1e-6).log10();
+        let converting = !settings.bypass && m.ready.load(Ordering::Acquire);
+        let input_db = m3::level_db(load(&m.input_level));
+        let silent = converting && gate_db > m3::METER_FLOOR_DB && input_db < gate_db;
+        let block = settings.block_ms as f32;
+        let processing = load(&m.processing_ms);
+        let rate = m.output_rate.load(Ordering::Relaxed);
+        let queued = if rate == 0 {
+            0.0
+        } else {
+            m.queued_samples.load(Ordering::Relaxed) as f32 * 1000.0 / rate as f32
+        };
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+            m3::meter(
+                ui,
+                icons::MIC,
+                load(&m.input_level),
+                (!settings.bypass).then_some(gate_db),
+                "Microphone level. The pink tick is the noise gate (Studio > Noise gate): below it nothing is converted and the GPU rests.",
+            );
+            m3::meter(
+                ui,
+                icons::HEADPHONES,
+                load(&m.output_level),
+                None,
+                "Converted voice level. Red near 0 dB means it is clipping; lower the output gain.",
+            );
+            if !converting {
+                return;
+            }
+            if silent {
+                m3::stat(
+                    ui,
+                    icons::INFO,
+                    "Silent",
+                    "GPU idle",
+                    m3::OUTLINE,
+                    "You are quieter than the noise gate, so nothing is converted. Speak, or lower the gate in Studio if your voice is cut.",
+                );
+            }
+            // A sound waits for its chunk to fill, is converted, then plays after the
+            // audio already queued. The queue is measured right after a chunk is added,
+            // so it holds that chunk plus the safety lead: the delay is converting time
+            // plus the queue.
+            let delay = processing + queued;
+            let lead = (queued - block).max(0.0);
+            let (tone, advice) = if delay < 250.0 {
+                (m3::SUCCESS, "Low delay.")
+            } else if delay < 450.0 {
+                (m3::TERTIARY, "Noticeable delay. Lower Chunk in Studio if the load stays under 70%.")
+            } else {
+                (m3::ERROR, "High delay. Lower Chunk in Studio; use a GPU if the load is high.")
+            };
+            m3::stat(
+                ui,
+                icons::SPEED,
+                "Delay",
+                &format!("~{delay:.0} ms"),
+                tone,
+                &format!(
+                    "{advice}\nChunk {block:.0} ms + converting {processing:.0} ms + safety buffer {lead:.0} ms. A virtual cable such as VB-Cable adds its own buffer on top."
+                ),
+            );
+            let usage = if block > 0.0 { processing / block } else { 0.0 };
+            let (tone, advice) = if usage < 0.6 {
+                (m3::SUCCESS, "Plenty of headroom: you can lower Chunk for less delay.")
+            } else if usage < 0.9 {
+                (m3::TERTIARY, "Busy but keeping up.")
+            } else {
+                (m3::ERROR, "Cannot keep up, so the voice stutters: raise Chunk, lower Extra, or use a GPU.")
+            };
+            m3::stat(
+                ui,
+                icons::MEMORY,
+                "Load",
+                &format!("{:.0}%", usage * 100.0),
+                tone,
+                &format!(
+                    "{advice}\nConverting one {block:.0} ms chunk takes {processing:.0} ms on {}.",
+                    crate::gpu_info::name_for(settings.device)
+                        .unwrap_or_else(|| settings.device.label())
+                ),
+            );
+            let glitches = m.dropped_input.load(Ordering::Relaxed)
+                + m.dropped_output.load(Ordering::Relaxed)
+                + m.underrun_samples.load(Ordering::Relaxed);
+            if glitches > 0 {
+                m3::stat(
+                    ui,
+                    icons::ERROR,
+                    "Glitches",
+                    &format!(
+                        "{} / {} / {}",
+                        m.dropped_input.load(Ordering::Relaxed),
+                        m.dropped_output.load(Ordering::Relaxed),
+                        m.underrun_samples.load(Ordering::Relaxed)
+                    ),
+                    m3::TERTIARY,
+                    "Samples dropped from the microphone / dropped from the output / missing when the output ran dry. Occasional ones are harmless; if they keep rising, raise Chunk.",
+                );
+            }
+        });
     }
     fn model_dialog(&mut self, ctx: &egui::Context) {
         let running = self.running();
@@ -1830,9 +1925,6 @@ impl eframe::App for VoiceApp {
         });
         if let Some(result) = completed {
             self.work = None;
-            // Installing or removing Voice Changer Mic changes the device list.
-            #[cfg(all(windows, feature = "audio"))]
-            self.refresh_devices();
             #[cfg(feature = "catalog")]
             {
                 self.browse.download = None;

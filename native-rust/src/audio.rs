@@ -74,8 +74,8 @@ pub struct AudioOptions {
     pub settings: Settings,
     /// Folder for REC files.
     pub record_dir: PathBuf,
-    /// Send the converted voice to the built-in virtual microphone (Linux, or the
-    /// Voice Changer Mic driver on Windows) instead of `output`.
+    /// Send the converted voice to the virtual microphone (built in on Linux,
+    /// VB-Cable on Windows) instead of `output`.
     pub virtual_mic: bool,
     /// A second output that plays the converted voice, to hear yourself:
     /// `Some(None)` is the system default device.
@@ -255,7 +255,7 @@ fn voice_output(host: &cpal::Host, options: &AudioOptions) -> Result<cpal::Devic
     if !options.virtual_mic {
         return select_device(host, &options.output, false);
     }
-    // Windows: the Voice Changer Mic driver's speaker, which feeds its microphone.
+    // Windows: VB-Cable's speaker, which feeds its microphone.
     #[cfg(windows)]
     {
         crate::windows_mic::output_device(host)
@@ -348,7 +348,7 @@ fn route_to_virtual_mic(stop: Arc<AtomicBool>) -> Result<()> {
             })?;
         Ok(())
     }
-    // Windows: the voice already plays into the driver's speaker, which feeds its mic.
+    // Windows: the voice already plays into VB-Cable's speaker, which feeds its mic.
     #[cfg(windows)]
     {
         let _ = stop;
@@ -402,7 +402,7 @@ fn run(
         output_config.channels(),
         output_config.sample_format(),
         if options.virtual_mic {
-            ", routed to Voice Changer Mic"
+            ", routed to the virtual microphone"
         } else {
             ""
         }
@@ -623,7 +623,7 @@ fn run(
             output_started = true;
             if options.virtual_mic {
                 route_to_virtual_mic(routing.clone())?;
-                log::info!("Voice is going to Voice Changer Mic");
+                log::info!("Voice is going to the virtual microphone");
             }
             if let Some(device) = &options.monitor {
                 monitor = Some(Monitor::open(&host, device, input_rate, &metrics)?);

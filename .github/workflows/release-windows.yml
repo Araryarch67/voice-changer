@@ -1,0 +1,232 @@
+name: Release Windows
+
+# Builds native-rust/ for Windows (DirectML and CUDA; ZIP and installer). A pushed
+# tag (v*) creates the release if needed and adds each build as it finishes, so
+# the Linux downloads from release-linux.yml do not wait for these. Manual runs can
+# publish to an existing tag; without a tag they only keep workflow artifacts.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and publish (leave empty for artifacts only)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  # Must match the ONNX Runtime the pinned ort crate targets.
+  ORT_VERSION: "1.22.0"
+  # DirectML version the ONNX Runtime DirectML package of ORT_VERSION depends on.
+  DIRECTML_VERSION: "1.15.4"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Create release if needed
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+        run: |
+          if [ -n "$RELEASE_TAG" ]; then
+            # Validate the tag before making it available to the build jobs.
+            gh api "repos/${GH_REPO}/git/ref/tags/${RELEASE_TAG}" >/dev/null
+            # Each platform's workflow runs this; whichever comes first creates the
+            # release and the others reuse it.
+            if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes \
+                || gh release view "$RELEASE_TAG" >/dev/null
+            fi
+          fi
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Any DirectX 12 GPU (NVIDIA, AMD, Intel) through DirectML, plus the CPU.
+          # ONNX Runtime publishes its DirectML build on NuGet only.
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ort_archive: onnxruntime-win-x64
+            ort_ext: zip
+            ort_lib: onnxruntime.dll
+            directml: true
+          # NVIDIA GPUs: the CUDA build of ONNX Runtime. Users install CUDA 12 and
+          # cuDNN 9 themselves; the app finds them through PATH and cuDNN's folder.
+          - name: windows-x64-cuda
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ort_archive: onnxruntime-win-x64-gpu
+            ort_ext: zip
+            ort_lib: onnxruntime.dll
+            cuda: true
+    defaults:
+      run:
+        shell: bash
+        working-directory: native-rust
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag || github.ref }}
+
+      # Packaging can be updated for an existing release without moving its tag.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: release-packaging
+          sparse-checkout: |
+            native-rust/platforms/packaging
+            native-rust/assets
+
+      - name: Read application version
+        id: version
+        run: |
+          version=$(python -c 'import re; print(re.search(r"^version = \"([^\"]+)\"", open("Cargo.toml").read(), re.M).group(1))')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native-rust
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Fetch ONNX Runtime (DirectML)
+        if: matrix.directml
+        run: |
+          nuget=https://api.nuget.org/v3-flatcontainer
+          curl -fsSL -o ort.nupkg "$nuget/microsoft.ml.onnxruntime.directml/${ORT_VERSION}/microsoft.ml.onnxruntime.directml.${ORT_VERSION}.nupkg"
+          curl -fsSL -o dml.nupkg "$nuget/microsoft.ai.directml/${DIRECTML_VERSION}/microsoft.ai.directml.${DIRECTML_VERSION}.nupkg"
+          7z x -y -oort-pkg ort.nupkg >/dev/null
+          7z x -y -odml-pkg dml.nupkg >/dev/null
+          mkdir -p ort-lib ort-root
+          cp ort-pkg/runtimes/win-x64/native/onnxruntime.dll ort-pkg/runtimes/win-x64/native/onnxruntime_providers_shared.dll ort-lib/
+          # Beside the executable, so Windows loads it before the older copy in System32.
+          cp dml-pkg/bin/x64-win/DirectML.dll ort-root/
+
+      - name: Fetch ONNX Runtime
+        if: ${{ !matrix.directml }}
+        run: |
+          archive="${{ matrix.ort_archive }}-${ORT_VERSION}"
+          curl -fsSL -o "ort.${{ matrix.ort_ext }}" \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${archive}.${{ matrix.ort_ext }}"
+          if [ "${{ matrix.ort_ext }}" = zip ]; then
+            7z x -y ort.zip >/dev/null
+          else
+            tar -xzf ort.tgz
+          fi
+          mkdir -p ort-lib
+          # -L: the Unix archives ship the library as a versioned file plus symlinks.
+          cp -L "${archive}/lib/${{ matrix.ort_lib }}" ort-lib/
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp "${archive}/lib/onnxruntime_providers_shared.dll" ort-lib/
+          fi
+          if [ "${{ matrix.cuda }}" = true ]; then
+            cp "${archive}/lib/onnxruntime_providers_cuda.dll" ort-lib/
+          fi
+
+      # The app looks for the runtime in lib/ beside its executable and for voices in
+      # models/ beside it, so each archive is laid out that way.
+      - name: Package
+        run: |
+          app="voice-changer-${{ matrix.name }}"
+          mkdir -p "dist/${app}/lib" "dist/${app}/models"
+          binary=voice-changer-native
+          if [ "$RUNNER_OS" = Windows ]; then binary="${binary}.exe"; fi
+          cp "target/${{ matrix.target }}/release/${binary}" "dist/${app}/"
+          cp ort-lib/* "dist/${app}/lib/"
+          if [ -d ort-root ]; then cp ort-root/* "dist/${app}/"; fi
+          cp README.md "dist/${app}/"
+          cp ../LICENSE "dist/${app}/"
+          cp examples/model.json "dist/${app}/models/example-model.json.txt"
+          cd dist
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a -tzip "${app}.zip" "${app}" >/dev/null
+          else
+            zip -r "${app}.zip" "${app}" >/dev/null
+          fi
+
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        run: |
+          if [ ! -f '/c/Program Files (x86)/NSIS/makensis.exe' ]; then
+            choco install nsis --yes --no-progress
+          fi
+          # MSYS must not rewrite NSIS /D options as filesystem paths.
+          MSYS_NO_PATHCONV=1 '/c/Program Files (x86)/NSIS/makensis.exe' \
+            "/DVERSION=${{ steps.version.outputs.version }}" \
+            "/DICON=$(cygpath -w "$PWD/../release-packaging/native-rust/assets/icon.ico")" \
+            "/DPAYLOAD=$(cygpath -w "$PWD/dist/voice-changer-${{ matrix.name }}")" \
+            "/DOUTPUT=$(cygpath -w "$PWD/dist/voice-changer-${{ matrix.name }}-setup.exe")" \
+            "$(cygpath -w "$PWD/../release-packaging/native-rust/platforms/packaging/windows.nsi")"
+
+      - name: Verify Windows installation and removal
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installDir = Join-Path $env:RUNNER_TEMP 'voice-changer-install-test'
+          $setup = Start-Process -FilePath '.\dist\voice-changer-${{ matrix.name }}-setup.exe' -ArgumentList '/S', "/D=$installDir" -Wait -PassThru
+          if ($setup.ExitCode -ne 0) { throw 'Installer failed' }
+          $expected = @('voice-changer-native.exe', 'lib\onnxruntime.dll', 'Uninstall.exe')
+          if ('${{ matrix.cuda }}' -eq 'true') { $expected += 'lib\onnxruntime_providers_cuda.dll' }
+          if ('${{ matrix.directml }}' -eq 'true') { $expected += 'DirectML.dll' }
+          foreach ($file in $expected) {
+            if (!(Test-Path (Join-Path $installDir $file))) { throw "Missing installed file: $file" }
+          }
+          & (Join-Path $installDir 'voice-changer-native.exe') --help
+          if ($LASTEXITCODE -ne 0) { throw 'Installed executable failed' }
+          Set-Content (Join-Path $installDir 'models\keep-user-model.txt') 'user model'
+          $uninstall = Start-Process -FilePath (Join-Path $installDir 'Uninstall.exe') -ArgumentList '/S', "_?=$installDir" -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw 'Uninstaller failed' }
+          if (Test-Path (Join-Path $installDir 'voice-changer-native.exe')) { throw 'Executable was not removed' }
+          if (!(Test-Path (Join-Path $installDir 'models\keep-user-model.txt'))) { throw 'Uninstaller deleted user model' }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-changer-${{ matrix.name }}
+          path: |
+            native-rust/dist/*.zip
+            native-rust/dist/*.exe
+            native-rust/dist/*.deb
+            native-rust/dist/*.rpm
+          if-no-files-found: error
+
+      - name: Publish this platform
+        if: needs.prepare.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          shopt -s nullglob
+          archives=(dist/*.zip dist/*.exe dist/*.deb dist/*.rpm)
+          if [ "${#archives[@]}" -eq 0 ]; then
+            echo "No release archives found" >&2
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" "${archives[@]}" --clobber

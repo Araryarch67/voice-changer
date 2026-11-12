@@ -83,7 +83,10 @@ impl Default for Settings {
             context_ms: 500,
             overlap_ms: 40,
             search_ms: 12,
-            silence_threshold: 0.00001,
+            // -50 dBFS on the loudest 20 ms: speech passes, a quiet room does not, so
+            // the GPU rests between sentences. The reference's 0.00001 (-100 dB)
+            // converts silence too.
+            silence_threshold: 0.0032,
             index_ratio: 0.0,
             protect: 0.5,
             noise: Noise::Off,

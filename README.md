@@ -5,7 +5,7 @@
 **A native, real-time RVC voice changer written in Rust.**
 No Python, no browser, no local server: one desktop app.
 
-[![Release build](https://github.com/Araryarch67/voice-changer/actions/workflows/release.yml/badge.svg)](https://github.com/Araryarch67/voice-changer/actions/workflows/release.yml)
+[![Linux release](https://github.com/Araryarch67/voice-changer/actions/workflows/release-linux.yml/badge.svg)](https://github.com/Araryarch67/voice-changer/actions/workflows/release-linux.yml) [![Windows release](https://github.com/Araryarch67/voice-changer/actions/workflows/release-windows.yml/badge.svg)](https://github.com/Araryarch67/voice-changer/actions/workflows/release-windows.yml)
 [![Latest release](https://img.shields.io/github/v/release/Araryarch67/voice-changer?include_prereleases&label=release)](https://github.com/Araryarch67/voice-changer/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-stable-orange?logo=rust)
@@ -51,7 +51,7 @@ Each download bundles ONNX Runtime 1.22, and the CPU always works. Voice models 
 2. Add a voice: press **Import model** (or an empty **+** card), pick the RVC `.pth`, and pick its `.index` if it has one; the index beside the `.pth` is filled in for you. Dropping the files on the window does the same. On first start the app offers to download the two shared models every voice needs (ContentVec and RMVPE, about 706 MB) into `models/shared/`; **Settings → Processing** has the same button.
 3. Put on headphones, pick the voice, and press **Start**.
 
-To send the converted voice to another app such as Discord or OBS: on Linux, turn on **Settings → Virtual microphone** and pick "Voice Changer Mic" in that app; on Windows, install [VB-Cable](https://vb-audio.com/Cable/) (**Settings → Get VB-Cable** opens its page; its licence does not let other programs install it), restart, turn on **Settings → Virtual microphone** and pick "CABLE Output" in that app. The app finds VB-Cable and plays to "CABLE Input" by itself. For OBS alone, an *Application Audio Capture* source for this app is enough. The app's own driver, [Voice Changer Mic](native-rust/platforms/windows/driver/README.md), takes VB-Cable's place in downloads that include it once Microsoft has signed it. Turn on **Monitor** to hear yourself on headphones at the same time.
+To send the converted voice to another app such as Discord or OBS: on Linux, turn on **Settings → Virtual microphone** and pick "Voice Changer Mic" in that app; on Windows, install [VB-Cable](https://vb-audio.com/Cable/) (**Settings → Get VB-Cable** opens its page; its licence does not let other programs install it), restart, turn on **Settings → Virtual microphone** and pick "CABLE Output" in that app. The app finds VB-Cable and plays to "CABLE Input" by itself. For OBS alone, an *Application Audio Capture* source for this app is enough. Turn on **Monitor** to hear yourself on headphones at the same time.
 
 ### Preparing a voice
 
@@ -108,7 +108,7 @@ Linux is the platform this is developed and tested on. Windows builds are produc
 | Path | Contents |
 |---|---|
 | [`native-rust/`](native-rust) | The application and its documentation |
-| [`.github/workflows/release.yml`](.github/workflows/release.yml) | Release builds for Linux and Windows |
+| [`.github/workflows/release-linux.yml`](.github/workflows/release-linux.yml), [`release-windows.yml`](.github/workflows/release-windows.yml) | Release builds, one per OS: Linux publishes as soon as it is ready, Windows follows |
 | [`AGENTS.md`](AGENTS.md) | Notes for contributors and coding agents |
 
 ## Contributing

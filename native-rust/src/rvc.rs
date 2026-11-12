@@ -12,6 +12,11 @@ use ort::{
 };
 use std::path::Path;
 
+/// Pitch is detected again for this much audio before the part that is converted
+/// (10 ms frames), so the detector has some context; older frames keep the pitch
+/// found in earlier blocks, as the reference's "silence front" does.
+const PITCH_MARGIN_FRAMES: usize = 16;
+
 fn open_session(file: &Path, threads: usize, device: Device) -> Result<Session> {
     anyhow::ensure!(
         crate::runtime::available_devices().contains(&device),
@@ -61,6 +66,10 @@ pub struct Rvc {
     sola: Sola,
     geometry: Option<(u32, u32, u32, u32, u32)>,
     bank: Option<FeatureBank>,
+    /// Detected F0 for every 10 ms frame of `history`, before smoothing and the
+    /// pitch shift, and the detector that found it; reused for older frames.
+    pitch_track: Vec<f32>,
+    pitch_track_detector: Option<F0Detector>,
 }
 impl Rvc {
     pub fn load(path: &Path) -> Result<Self> {
@@ -175,6 +184,8 @@ impl Rvc {
             sola: Sola::default(),
             geometry: None,
             bank,
+            pitch_track: Vec::new(),
+            pitch_track_detector: None,
         })
     }
 
@@ -214,16 +225,8 @@ impl Rvc {
         Ok(values.to_vec())
     }
 
-    fn pitches(
-        &mut self,
-        audio: &[f32],
-        frames: usize,
-        semitones: f32,
-        detector: F0Detector,
-    ) -> Result<(Vec<i64>, Vec<f32>)> {
-        if self.pitch.is_none() {
-            return Ok((Vec::new(), Vec::new()));
-        }
+    /// F0 per frame for `frames` 10 ms frames of `audio`, from `detector`.
+    fn detect(&mut self, audio: &[f32], frames: usize, detector: F0Detector) -> Result<Vec<f32>> {
         let detected = match detector {
             F0Detector::Yin => crate::pitch::yin(audio, frames),
             #[cfg(feature = "world")]
@@ -267,7 +270,7 @@ impl Rvc {
                 crate::pitch::crepe_decode(activations)
             }
             F0Detector::Rmvpe => {
-                let model = self.pitch.as_mut().expect("checked above");
+                let model = self.pitch.as_mut().expect("checked by the caller");
                 let waveform =
                     Tensor::from_array(([1, audio.len()], audio.to_vec().into_boxed_slice()))?;
                 let output = if model.inputs.iter().any(|i| i.name == "threshold") {
@@ -283,11 +286,48 @@ impl Rvc {
             !detected.is_empty() && detected.iter().all(|v| v.is_finite() && *v >= 0.0),
             "Invalid pitch detector output"
         );
-        let stabilized = crate::pitch::stabilize_f0(&detected);
-        let shift = 2.0_f32.powf(semitones / 12.0);
-        let pitchf: Vec<_> = (0..frames)
-            .map(|i| stabilized[(i * stabilized.len() / frames).min(stabilized.len() - 1)] * shift)
-            .collect();
+        Ok((0..frames)
+            .map(|i| detected[(i * detected.len() / frames).min(detected.len() - 1)])
+            .collect())
+    }
+
+    /// Coarse and fine pitch for `frames` frames of `audio`. `fresh_frames` is how
+    /// many frames at the end are new since the last block (`None` when the blocks
+    /// do not line up with 10 ms frames) and `tail_frames` how many at the end must
+    /// be detected again; the rest come from the previous block's track.
+    fn pitches(
+        &mut self,
+        audio: &[f32],
+        frames: usize,
+        fresh_frames: Option<usize>,
+        tail_frames: usize,
+        settings: &Settings,
+    ) -> Result<(Vec<i64>, Vec<f32>)> {
+        if self.pitch.is_none() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let detector = settings.f0_detector;
+        let tail = tail_frames.min(frames);
+        let reusable = fresh_frames.filter(|&fresh| {
+            self.pitch_track_detector == Some(detector)
+                && self.pitch_track.len() == frames
+                && fresh <= tail
+                && audio.len() >= tail * 160
+        });
+        let track = match reusable {
+            Some(fresh) if tail < frames => {
+                let detected = self.detect(&audio[audio.len() - tail * 160..], tail, detector)?;
+                let mut track = self.pitch_track[fresh..fresh + frames - tail].to_vec();
+                track.extend(detected);
+                track
+            }
+            _ => self.detect(audio, frames, detector)?,
+        };
+        self.pitch_track.clone_from(&track);
+        self.pitch_track_detector = Some(detector);
+        let stabilized = crate::pitch::stabilize_f0(&track);
+        let shift = 2.0_f32.powf(settings.semitones / 12.0);
+        let pitchf: Vec<_> = stabilized.iter().map(|v| v * shift).collect();
         let pitch = pitchf.iter().map(|v| dsp::coarse_pitch(*v)).collect();
         Ok((pitch, pitchf))
     }
@@ -302,6 +342,8 @@ impl Rvc {
             .context("Index ratio is nonzero but no feature_bank is configured")?;
         let channels = self.manifest.channels;
         let mut retrieved = vec![0.0_f32; channels];
+        // Frames come in identical pairs (x2 interpolation); search once per pair.
+        let mut searched: Option<usize> = None;
         for (i, frame) in features.chunks_exact_mut(channels).enumerate() {
             let unvoiced = !pitch.is_empty() && pitch[i] <= 0.0;
             let protection = if unvoiced && settings.protect < 0.5 {
@@ -313,7 +355,10 @@ impl Rvc {
             if ratio <= 0.0 {
                 continue;
             }
-            bank.blend_nearest(frame, 8, &mut retrieved);
+            if searched != Some(i / 2) {
+                bank.blend_nearest(frame, 8, &mut retrieved);
+                searched = Some(i / 2);
+            }
             for (sample, &blended) in frame.iter_mut().zip(&retrieved) {
                 *sample = *sample * (1.0 - ratio) + blended * ratio;
             }
@@ -335,6 +380,16 @@ impl Converter for Rvc {
             self.geometry = Some(geometry);
         }
         let new_audio = dsp::resample(input, rate, 16000);
+        // New 10 ms frames this block; pitch for older ones is reused only when the
+        // block is a whole number of frames, so frames line up between blocks.
+        let fresh_frames = new_audio
+            .len()
+            .is_multiple_of(160)
+            .then_some(new_audio.len() / 160);
+        let convert_frames = (new_audio.len()
+            + settings.overlap_ms as usize * 16
+            + settings.search_ms as usize * 16)
+            .div_ceil(160);
         let overlap = settings.overlap_ms as usize * 16;
         let search = settings.search_ms as usize * 16;
         let context = settings.context_ms as usize * 16;
@@ -365,6 +420,8 @@ impl Converter for Rvc {
             self.gate_open = false;
         } else {
             self.sola.reset();
+            // The pitch track no longer lines up with the history after a gap.
+            self.pitch_track.clear();
             return Ok(vec![0.0; input.len()]);
         }
         let audio = self.history.clone();
@@ -381,8 +438,13 @@ impl Converter for Rvc {
             features.extend_from_slice(&extracted[offset..offset + self.manifest.channels]);
         }
         let pitch_start = std::time::Instant::now();
-        let (pitch, pitchf) =
-            self.pitches(&audio, frames, settings.semitones, settings.f0_detector)?;
+        let (pitch, pitchf) = self.pitches(
+            &audio,
+            frames,
+            fresh_frames,
+            convert_frames + PITCH_MARGIN_FRAMES,
+            settings,
+        )?;
         let pitch_ms = pitch_start.elapsed().as_secs_f64() * 1000.0;
         self.retrieve(&mut features, &pitchf, settings)?;
         let feats = Tensor::from_array((
@@ -449,5 +511,7 @@ impl Converter for Rvc {
         self.geometry = None;
         self.gate_hold = 0;
         self.gate_open = false;
+        self.pitch_track.clear();
+        self.pitch_track_detector = None;
     }
 }

@@ -633,25 +633,124 @@ pub fn list_item(ui: &mut Ui, glyph: char, headline: &str, detail: &str) {
         .galley(egui::pos2(x, rect.top() + 29.0), second, ON_SURFACE_VARIANT);
 }
 
-/// Level meter: an icon followed by a rounded linear indicator.
-pub fn meter(ui: &mut Ui, glyph: char, level: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(150.0, 24.0), Sense::hover());
+/// Lowest level a meter shows, in dBFS.
+pub const METER_FLOOR_DB: f32 = -60.0;
+
+/// RMS level in dBFS, clamped to the meter's range.
+pub fn level_db(level: f32) -> f32 {
+    (20.0 * level.max(1e-6).log10()).clamp(METER_FLOOR_DB, 0.0)
+}
+
+/// Level meter: an icon, a rounded track filled to the level on a -60..0 dB scale,
+/// an optional tick at `gate_db` (the noise gate), and the level in dB.
+pub fn meter(ui: &mut Ui, glyph: char, level: f32, gate_db: Option<f32>, hint: &str) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(196.0, 32.0), Sense::hover());
+    let db = level_db(level);
+    let open = gate_db.is_none_or(|gate| db >= gate);
     paint_icon(
         ui,
         egui::pos2(rect.left() + 10.0, rect.center().y),
         glyph,
         20.0,
         false,
-        ON_SURFACE_VARIANT,
+        if open { ON_SURFACE } else { ON_SURFACE_VARIANT },
     );
     let track = Rect::from_min_max(
-        egui::pos2(rect.left() + 28.0, rect.center().y - 3.0),
-        egui::pos2(rect.right(), rect.center().y + 3.0),
+        egui::pos2(rect.left() + 28.0, rect.center().y - 4.0),
+        egui::pos2(rect.right() - 52.0, rect.center().y + 4.0),
     );
-    ui.painter().rect_filled(track, 3.0, SECONDARY_CONTAINER);
+    let x = |db: f32| {
+        egui::lerp(
+            track.left()..=track.right(),
+            (db - METER_FLOOR_DB) / -METER_FLOOR_DB,
+        )
+    };
+    let painter = ui.painter();
+    painter.rect_filled(track, 4.0, SECONDARY_CONTAINER);
     let mut active = track;
-    active.set_width((track.width() * level.clamp(0.0, 1.0)).max(6.0));
-    ui.painter().rect_filled(active, 3.0, PRIMARY);
+    active.set_right(x(db).max(track.left() + 8.0));
+    let fill = if db > -3.0 {
+        ERROR
+    } else if open {
+        PRIMARY
+    } else {
+        OUTLINE
+    };
+    painter.rect_filled(active, 4.0, fill);
+    if let Some(gate) = gate_db.filter(|gate| *gate > METER_FLOOR_DB) {
+        let gx = x(gate);
+        painter.line_segment(
+            [
+                egui::pos2(gx, track.top() - 4.0),
+                egui::pos2(gx, track.bottom() + 4.0),
+            ],
+            Stroke::new(2.0_f32, TERTIARY),
+        );
+    }
+    painter.text(
+        egui::pos2(rect.right(), rect.center().y),
+        Align2::RIGHT_CENTER,
+        if db <= METER_FLOOR_DB {
+            "silent".to_owned()
+        } else {
+            format!("{db:.0} dB")
+        },
+        FontId::new(12.0, medium()),
+        ON_SURFACE_VARIANT,
+    );
+    response.on_hover_text(hint)
+}
+
+/// Status chip: a tonal pill with an icon, a short label and a value, tinted by
+/// `tone` (PRIMARY when fine, TERTIARY for a caution, ERROR for a problem).
+pub fn stat(
+    ui: &mut Ui,
+    glyph: char,
+    label: &str,
+    value: &str,
+    tone: Color32,
+    hint: &str,
+) -> Response {
+    let label_galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::proportional(12.0),
+        ON_SURFACE_VARIANT,
+    );
+    let value_galley =
+        ui.painter()
+            .layout_no_wrap(value.to_owned(), FontId::new(13.0, medium()), ON_SURFACE);
+    let width = 10.0 + 18.0 + 8.0 + label_galley.size().x + 6.0 + value_galley.size().x + 12.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 8.0, tone.gamma_multiply(0.14));
+    painter.rect_stroke(
+        rect,
+        8.0,
+        Stroke::new(1.0_f32, tone.gamma_multiply(0.45)),
+        StrokeKind::Inside,
+    );
+    paint_icon(
+        ui,
+        egui::pos2(rect.left() + 19.0, rect.center().y),
+        glyph,
+        18.0,
+        false,
+        tone,
+    );
+    let mut x = rect.left() + 36.0;
+    let y = rect.center().y;
+    painter.galley(
+        egui::pos2(x, y - label_galley.size().y / 2.0),
+        label_galley.clone(),
+        ON_SURFACE_VARIANT,
+    );
+    x += label_galley.size().x + 6.0;
+    painter.galley(
+        egui::pos2(x, y - value_galley.size().y / 2.0),
+        value_galley,
+        ON_SURFACE,
+    );
+    response.on_hover_text(hint)
 }
 
 const TONES: [(Color32, Color32); 6] = [

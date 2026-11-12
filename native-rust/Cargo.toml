@@ -1,6 +1,6 @@
 [package]
 name = "voice-changer-native"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 license = "MIT"
 description = "Native Rust and egui real-time RVC voice changer"
@@ -50,12 +50,10 @@ jni = "0.21"
 rfd = { version = "=0.16.0", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-# Installs the Voice Changer Mic driver (SetupAPI) after a UAC prompt (ShellExecuteExW).
+# Reads VB-Cable's buffer setting and opens its control panel.
 windows-sys = { version = "0.61", features = [
-  "Win32_Devices_DeviceAndDriverInstallation",
   "Win32_Foundation",
   "Win32_System_Registry",
-  "Win32_System_Threading",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
