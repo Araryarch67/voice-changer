@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+# Installed binaries live in /opt; user models belong in writable storage.
+data_root="${XDG_DATA_HOME:-$HOME/.local/share}/voice-changer"
+mkdir -p "$data_root/models"
+cd "$data_root"
+exec /opt/voice-changer/voice-changer-native "$@"

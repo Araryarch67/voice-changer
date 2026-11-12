@@ -26,6 +26,10 @@ This is **not yet feature parity** with the reference. non-standard RVC checkpoi
 
 ## Run on desktop
 
+The [GitHub releases](https://github.com/Araryarch67/voice-changer/releases) provide a Windows `-setup.exe` installer, macOS `.dmg` images for Apple Silicon and Intel, and Linux x64 `.deb` / `.rpm` packages. Portable ZIP archives are also available. Each platform publishes its files as soon as its build finishes.
+
+On Windows, run the setup executable; it installs for the current user and adds a Start Menu shortcut and an uninstaller. On macOS, open the DMG and drag **Voice Changer** into **Applications**. The macOS app is ad-hoc signed and is not notarized. On Linux, install the DEB with `sudo apt install ./voice-changer-linux-x64.deb` or the RPM with `sudo dnf install ./voice-changer-linux-x64.rpm`, then launch **Voice Changer** from the application menu. Installed Linux builds use `${XDG_DATA_HOME:-$HOME/.local/share}/voice-changer/models` for user models. The packages include the CPU ONNX Runtime; voice models are obtained separately.
+
 Use a recent stable Rust toolchain. On Linux install the ALSA development package and a working Vulkan or OpenGL driver; Wayland and X11 are enabled. Windows uses WASAPI, macOS uses CoreAudio.
 
 ```sh

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Voice Changer
+Comment=Real-time RVC voice changer
+Exec=voice-changer
+Icon=audio-input-microphone
+Terminal=false
+Categories=AudioVideo;Audio;
+StartupNotify=true

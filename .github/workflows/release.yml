@@ -89,6 +89,19 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.tag || github.ref }}
 
+      # Packaging can be updated for an existing release without moving its tag.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: release-packaging
+          sparse-checkout: native-rust/platforms/packaging
+
+      - name: Read application version
+        id: version
+        run: |
+          version=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -102,7 +115,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libasound2-dev libxkbcommon-dev libwayland-dev libudev-dev
+          sudo apt-get install -y pkg-config libasound2-dev libxkbcommon-dev libwayland-dev libudev-dev zip
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
@@ -136,12 +149,13 @@ jobs:
           cp "target/${{ matrix.target }}/release/${binary}" "dist/${app}/"
           cp ort-lib/* "dist/${app}/lib/"
           cp README.md "dist/${app}/"
+          cp ../LICENSE "dist/${app}/"
           cp examples/model.json "dist/${app}/models/example-model.json.txt"
           cd dist
           if [ "$RUNNER_OS" = Windows ]; then
             7z a -tzip "${app}.zip" "${app}" >/dev/null
           else
-            tar -czf "${app}.tar.gz" "${app}"
+            zip -r "${app}.zip" "${app}" >/dev/null
           fi
 
       - name: Package (macOS app bundle)
@@ -154,17 +168,71 @@ jobs:
           cp ort-lib/* "${bundle}/Contents/MacOS/lib/"
           # The plist carries the microphone usage description macOS requires.
           cp platforms/macos/Info.plist "${bundle}/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.version.outputs.version }}" "${bundle}/Contents/Info.plist"
           # Ad-hoc signature only: the app is not notarized, so Gatekeeper still warns.
           codesign --force --deep --sign - "${bundle}"
           cd dist
           ditto -c -k --keepParent "Voice Changer.app" "${app}.zip"
 
+      - name: Build macOS installer
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dmg-root
+          ditto "dist/Voice Changer.app" "dmg-root/Voice Changer.app"
+          cp README.md ../LICENSE dmg-root/
+          ln -s /Applications dmg-root/Applications
+          hdiutil create -volname "Voice Changer" -srcfolder dmg-root \
+            -ov -format UDZO "dist/voice-changer-${{ matrix.name }}.dmg"
+          hdiutil verify "dist/voice-changer-${{ matrix.name }}.dmg"
+
+      - name: Build Linux installers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y ruby ruby-dev rpm
+          sudo gem install fpm --version 1.17.0 --no-document
+          bash ../release-packaging/native-rust/platforms/packaging/linux.sh \
+            "${{ steps.version.outputs.version }}" "dist/voice-changer-${{ matrix.name }}" "$PWD/dist"
+
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        run: |
+          if [ ! -f '/c/Program Files (x86)/NSIS/makensis.exe' ]; then
+            choco install nsis --yes --no-progress
+          fi
+          # MSYS must not rewrite NSIS /D options as filesystem paths.
+          MSYS_NO_PATHCONV=1 '/c/Program Files (x86)/NSIS/makensis.exe' \
+            "/DVERSION=${{ steps.version.outputs.version }}" \
+            "/DPAYLOAD=$(cygpath -w "$PWD/dist/voice-changer-${{ matrix.name }}")" \
+            "/DOUTPUT=$(cygpath -w "$PWD/dist/voice-changer-${{ matrix.name }}-setup.exe")" \
+            "$(cygpath -w "$PWD/../release-packaging/native-rust/platforms/packaging/windows.nsi")"
+
+      - name: Verify Windows installation and removal
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installDir = Join-Path $env:RUNNER_TEMP 'voice-changer-install-test'
+          $setup = Start-Process -FilePath '.\dist\voice-changer-${{ matrix.name }}-setup.exe' -ArgumentList '/S', "/D=$installDir" -Wait -PassThru
+          if ($setup.ExitCode -ne 0) { throw 'Installer failed' }
+          foreach ($file in @('voice-changer-native.exe', 'lib\onnxruntime.dll', 'Uninstall.exe')) {
+            if (!(Test-Path (Join-Path $installDir $file))) { throw "Missing installed file: $file" }
+          }
+          & (Join-Path $installDir 'voice-changer-native.exe') --help
+          if ($LASTEXITCODE -ne 0) { throw 'Installed executable failed' }
+          Set-Content (Join-Path $installDir 'models\keep-user-model.txt') 'user model'
+          $uninstall = Start-Process -FilePath (Join-Path $installDir 'Uninstall.exe') -ArgumentList '/S', "_?=$installDir" -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw 'Uninstaller failed' }
+          if (Test-Path (Join-Path $installDir 'voice-changer-native.exe')) { throw 'Executable was not removed' }
+          if (!(Test-Path (Join-Path $installDir 'models\keep-user-model.txt'))) { throw 'Uninstaller deleted user model' }
+
       - uses: actions/upload-artifact@v4
         with:
           name: voice-changer-${{ matrix.name }}
           path: |
-            native-rust/dist/*.tar.gz
             native-rust/dist/*.zip
+            native-rust/dist/*.exe
+            native-rust/dist/*.dmg
+            native-rust/dist/*.deb
+            native-rust/dist/*.rpm
           if-no-files-found: error
 
       - name: Publish this platform
@@ -175,7 +243,7 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           shopt -s nullglob
-          archives=(dist/*.tar.gz dist/*.zip)
+          archives=(dist/*.zip dist/*.exe dist/*.dmg dist/*.deb dist/*.rpm)
           if [ "${#archives[@]}" -eq 0 ]; then
             echo "No release archives found" >&2
             exit 1
