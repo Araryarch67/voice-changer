@@ -9,7 +9,7 @@ No Python, no browser, no local server: one desktop app.
 [![Latest release](https://img.shields.io/github/v/release/Araryarch67/voice-changer?include_prereleases&label=release)](https://github.com/Araryarch67/voice-changer/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-stable-orange?logo=rust)
-![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows%20%7C%20macOS-informational)
+![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-informational)
 
 <img src="native-rust/docs/preview-desktop.png" alt="Voice Changer main window: a gallery of voice cards with a detail pane and an audio control bar" width="820">
 
@@ -37,22 +37,21 @@ Voice Changer converts your microphone into another voice as you speak, using [R
 
 Prebuilt archives for each tagged version are on the [Releases](https://github.com/Araryarch67/voice-changer/releases) page.
 
-| Platform | File | Notes |
+| Platform | File | GPU |
 |---|---|---|
-| Linux x64 | `voice-changer-linux-x64.tar.gz` | Needs ALSA and a Vulkan or OpenGL driver |
-| Windows x64 | `voice-changer-windows-x64.zip` | |
-| macOS Apple Silicon | `voice-changer-macos-arm64.zip` | Not notarized; allow it in Privacy & Security on first launch |
-| macOS Intel | `voice-changer-macos-x64.zip` | Not notarized; allow it in Privacy & Security on first launch |
+| Windows x64 | `voice-changer-windows-x64-setup.exe` (or `.zip`) | DirectML: any DirectX 12 GPU, nothing to install |
+| Windows x64, NVIDIA | `voice-changer-windows-x64-cuda-setup.exe` (or `.zip`) | CUDA: fastest on NVIDIA; needs CUDA 12 and cuDNN 9 |
+| Linux x64 | `voice-changer-linux-x64.deb` / `.rpm` (or `.zip`) | CPU; CUDA with a GPU build of ONNX Runtime |
 
-Each archive bundles the CPU build of ONNX Runtime 1.22. Voice models are not included.
+Each download bundles ONNX Runtime 1.22, and the CPU always works. Voice models are not included.
 
 ## Quick start
 
-1. Extract the archive and run `voice-changer-native` (on macOS, open `Voice Changer.app`).
-2. Add a voice: press **Import model** and pick an RVC `.pth` checkpoint or a `.zip` that contains one, or drop the file on the window. The app converts it, attaches the `.index` it finds beside it, and adds the voice. This needs `contentvec.onnx` and `rmvpe.onnx` in `models/shared/`.
+1. Install it (or extract the ZIP and run `voice-changer-native`).
+2. Add a voice: press **Import model** (or an empty **+** card), pick the RVC `.pth`, and pick its `.index` if it has one; the index beside the `.pth` is filled in for you. Dropping the files on the window does the same. This needs `contentvec.onnx` and `rmvpe.onnx` in `models/shared/`.
 3. Put on headphones, pick the voice, and press **Start**.
 
-To send the converted voice to another app such as Discord or OBS, choose a virtual audio device as the output in **Settings**. The app does not install one.
+To send the converted voice to another app such as Discord or OBS: on Linux, turn on **Settings → Virtual microphone** and pick "Voice Changer Mic" in that app; on Windows, choose a virtual audio cable as the output. Turn on **Monitor** to hear yourself on headphones at the same time.
 
 ### Preparing a voice
 
@@ -102,14 +101,14 @@ Then choose **GPU (CUDA)** under **Settings → Processing**. As a rough guide f
 | Checkpoint export for RVC v1 and v2, with and without f0 | Supported |
 | Other engines (MMVC, so-vits-svc, DDSP-SVC, Beatrice), training | Not planned for now |
 
-Linux is the platform this is developed and tested on. Windows and macOS builds are produced by CI and are less exercised; Android and iOS entry points exist but are experimental.
+Linux is the platform this is developed and tested on. Windows builds are produced by CI and are less exercised; Android and iOS entry points exist but are experimental.
 
 ## Repository layout
 
 | Path | Contents |
 |---|---|
 | [`native-rust/`](native-rust) | The application and its documentation |
-| [`.github/workflows/release.yml`](.github/workflows/release.yml) | Release builds for Linux, Windows and macOS |
+| [`.github/workflows/release.yml`](.github/workflows/release.yml) | Release builds for Linux and Windows |
 | [`AGENTS.md`](AGENTS.md) | Notes for contributors and coding agents |
 
 ## Contributing

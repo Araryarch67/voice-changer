@@ -320,6 +320,25 @@ fn run(
     let output_config = output_device.default_output_config()?;
     let input_rate = input_config.sample_rate();
     let output_rate = output_config.sample_rate();
+    log::info!(
+        "Microphone: {} ({} Hz, {} ch, {:?})",
+        input_device,
+        input_rate,
+        input_config.channels(),
+        input_config.sample_format()
+    );
+    log::info!(
+        "Output: {} ({} Hz, {} ch, {:?}){}",
+        output_device,
+        output_rate,
+        output_config.channels(),
+        output_config.sample_format(),
+        if options.virtual_mic {
+            ", routed to Voice Changer Mic"
+        } else {
+            ""
+        }
+    );
     metrics.input_rate.store(input_rate, Ordering::Relaxed);
     metrics.output_rate.store(output_rate, Ordering::Relaxed);
     // Both queues are bounded; callbacks never wait on inference, locks, or allocation.
@@ -380,6 +399,19 @@ fn run(
     let mut output_started = false;
     let mut recorder: Option<Recorder> = None;
     metrics.ready.store(true, Ordering::Release);
+    log::info!(
+        "Live: block {} ms, extra {} ms, crossfade {} ms, pitch {:?}, tune {:+.1}, index {:.0}%, noise {:?}, echo {}{}",
+        settings.block_ms,
+        settings.context_ms,
+        settings.overlap_ms,
+        settings.f0_detector,
+        settings.semitones,
+        settings.index_ratio * 100.0,
+        settings.noise,
+        if settings.echo { "on" } else { "off" },
+        if settings.bypass { ", voice changer off" } else { "" }
+    );
+    let mut report = (Instant::now(), 0u32, 0f32, 0f32);
     while !stop.load(Ordering::Acquire) {
         if metrics.stream_error.load(Ordering::Relaxed) {
             let detail = metrics.stream_error_detail.lock().unwrap().take();
@@ -429,10 +461,28 @@ fn run(
             .store(dsp::rms(&pending).to_bits(), Ordering::Relaxed);
         let started = Instant::now();
         let processed = engine.process(&pending, input_rate, &settings)?;
-        metrics.processing_ms.store(
-            (started.elapsed().as_secs_f32() * 1000.0).to_bits(),
-            Ordering::Relaxed,
-        );
+        let took = started.elapsed().as_secs_f32() * 1000.0;
+        metrics
+            .processing_ms
+            .store(took.to_bits(), Ordering::Relaxed);
+        // A short summary every 10 seconds, so the terminal shows how it keeps up.
+        report.1 += 1;
+        report.2 += took;
+        report.3 = report.3.max(took);
+        if report.0.elapsed() >= Duration::from_secs(10) {
+            log::info!(
+                "{} blocks: {:.1} ms average, {:.1} ms worst of {} ms; queued {} ms; dropped {} in / {} out; underrun {} samples",
+                report.1,
+                report.2 / report.1 as f32,
+                report.3,
+                settings.block_ms,
+                output.len() as u64 * 1000 / output_rate.max(1) as u64,
+                metrics.dropped_input.load(Ordering::Relaxed),
+                metrics.dropped_output.load(Ordering::Relaxed),
+                metrics.underrun_samples.load(Ordering::Relaxed)
+            );
+            report = (Instant::now(), 0, 0.0, 0.0);
+        }
         metrics
             .output_level
             .store(dsp::rms(&processed).to_bits(), Ordering::Relaxed);
@@ -492,6 +542,7 @@ fn run(
             output_started = true;
             if options.virtual_mic {
                 route_to_virtual_mic(routing.clone())?;
+                log::info!("Voice is going to Voice Changer Mic");
             }
             if let Some(device) = &options.monitor {
                 monitor = Some(Monitor::open(&host, device, input_rate, &metrics)?);
@@ -508,6 +559,7 @@ fn run(
     }
     finish_recording(&mut recorder, &metrics);
     metrics.recording.store(false, Ordering::Release);
+    log::info!("Audio stopped");
     Ok(())
 }
 
@@ -528,9 +580,12 @@ fn is_recoverable_stream_error(err: &cpal::Error) -> bool {
 }
 
 fn record_stream_error(err: &cpal::Error, direction: &str, metrics: &Metrics, monitor: bool) {
+    let stream = if monitor { "monitor" } else { direction };
     if is_recoverable_stream_error(err) {
+        log::warn!("Audio {stream}: {err} (recovered)");
         return;
     }
+    log::error!("Audio {stream} failed: {err}");
     if monitor {
         metrics.monitor_error.store(true, Ordering::Relaxed);
         return;
@@ -643,6 +698,7 @@ impl Monitor {
         let config = device.default_output_config()?;
         let rate = config.sample_rate();
         let queue = Arc::new(ArrayQueue::new(rate as usize * 2));
+        log::info!("Monitor: {} ({} Hz)", device, rate);
         let stream = named_output(OutputRole::Monitor, &device, config, queue.clone(), metrics)?;
         stream.play()?;
         Ok(Self {

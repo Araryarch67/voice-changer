@@ -10,6 +10,8 @@ pub mod echo;
 pub mod engine;
 #[cfg(feature = "export")]
 pub mod export;
+#[cfg(feature = "gui")]
+pub mod gpu_info;
 #[cfg(feature = "export")]
 pub mod import;
 #[cfg(feature = "gui")]

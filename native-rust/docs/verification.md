@@ -10,7 +10,7 @@ Host: Linux x86_64; Rust 1.99.1. This records checks actually executed in the wo
 - The ONNX tests execute synthetic embedder, pitch, and voice graphs through the actual Rust inference pipeline. They verify model contracts, pitch-control propagation, duration, silence and retrieval-bank error handling. They do not validate perceptual voice quality.
 - The CPAL test opened only ALSA null input/output devices, processed audio and shut down its worker. It did not record a physical microphone or play through physical speakers.
 - GUI screenshots were rendered using WGPU in private headless Weston compositors at 1100×760 and 390×844. The captures are `preview-desktop.png` and `preview-mobile.png`. These are Linux renders of two layouts, not screenshots from Android/iOS devices.
-- macOS/iOS plists parsed successfully; packaging shell scripts passed `bash -n`.
+- iOS plist parsed successfully; packaging shell scripts passed `bash -n`.
 
 ## Update — FAISS index retrieval (2026-11-12)
 
@@ -20,7 +20,7 @@ Host: Linux x86_64; Rust 1.99.1. This records checks actually executed in the wo
 - Zeta (`voice-rvc/zeta`, 40 kHz, 109 speakers) was first exported with the former `tools/export_rvc.py --realtime` to `models/zeta/voice-realtime.onnx`, with `models/zeta/model.json` using its own index (768-d, 18033 rows, 462 lists). Kobo and Zeta both converted the same signal at index ratio 0 and 0.75, and the app's model discovery lists both.
 - fmt, clippy (`-D warnings`), `--no-default-features` check and the full test suite (including ignored ONNX and null-audio tests) passed after the change.
 
-Windows, macOS, Android and iOS builds have not been executed. Mobile permissions, lifecycle, device routing, static ONNX Runtime integration and signing need validation on the respective toolchains/devices. Real trained RVC models and end-to-end voice quality/latency have not been validated.
+Windows, Android and iOS builds have not been executed. Mobile permissions, lifecycle, device routing, static ONNX Runtime integration and signing need validation on the respective toolchains/devices. Real trained RVC models and end-to-end voice quality/latency have not been validated.
 
 See the README for repeatable commands and the explicit model contract.
 

@@ -34,8 +34,20 @@ pub enum F0Detector {
 pub enum Device {
     #[default]
     Cpu,
-    /// CUDA execution provider; needs a GPU build of ONNX Runtime.
+    /// CUDA execution provider (NVIDIA); needs a CUDA build of ONNX Runtime with CUDA
+    /// and cuDNN installed.
     Gpu,
+    /// DirectML execution provider: any DirectX 12 GPU on Windows, no extra install.
+    DirectMl,
+}
+impl Device {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Gpu => "GPU (CUDA)",
+            Self::DirectMl => "GPU (DirectML)",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,5 +194,91 @@ impl ModelManifest {
             }
         }
         Ok(model)
+    }
+}
+
+/// Gives a voice a new index (copied into its folder) or, with `None`, none. The
+/// manifest is restored if the result does not load.
+pub fn set_feature_bank(manifest: &Path, index: Option<&Path>) -> Result<()> {
+    let original = std::fs::read_to_string(manifest)
+        .with_context(|| format!("Read {}", manifest.display()))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&original).context("The voice's model.json is not valid JSON")?;
+    let folder = manifest.parent().context("The manifest has no folder")?;
+    let object = value
+        .as_object_mut()
+        .context("The voice's model.json is not an object")?;
+    match index {
+        Some(index) => {
+            anyhow::ensure!(
+                index
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("index")),
+                "Choose a .index file"
+            );
+            let name = index.file_name().context("The index has no file name")?;
+            let target = folder.join(name);
+            if index.canonicalize().ok() != target.canonicalize().ok() {
+                std::fs::copy(index, &target)
+                    .with_context(|| format!("Copy {}", index.display()))?;
+            }
+            object.insert(
+                "feature_bank".into(),
+                serde_json::Value::String(name.to_string_lossy().into_owned()),
+            );
+        }
+        None => {
+            object.remove("feature_bank");
+        }
+    }
+    std::fs::write(manifest, serde_json::to_string_pretty(&value)?)?;
+    if let Err(error) = ModelManifest::load(manifest) {
+        std::fs::write(manifest, original)?;
+        return Err(error.context("The voice did not load with that index; nothing was changed"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changes_and_removes_a_voice_index() {
+        let root = std::env::temp_dir().join(format!("vc-bank-{}", std::process::id()));
+        let (voice, shared) = (root.join("voice"), root.join("shared"));
+        std::fs::create_dir_all(&voice).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        for file in [
+            voice.join("voice.onnx"),
+            shared.join("e.onnx"),
+            shared.join("p.onnx"),
+        ] {
+            std::fs::write(file, b"").unwrap();
+        }
+        let manifest = voice.join("model.json");
+        let mut model = ModelManifest {
+            model: "voice.onnx".into(),
+            embedder: "../shared/e.onnx".into(),
+            pitch: "../shared/p.onnx".into(),
+            ..ModelManifest::default()
+        };
+        model.feature_bank = None;
+        std::fs::write(&manifest, serde_json::to_string(&model).unwrap()).unwrap();
+        let elsewhere = root.join("added_IVF1_Flat.index");
+        std::fs::write(&elsewhere, b"bank").unwrap();
+
+        set_feature_bank(&manifest, Some(&elsewhere)).unwrap();
+        assert!(voice.join("added_IVF1_Flat.index").is_file());
+        let loaded = ModelManifest::load(&manifest).unwrap();
+        assert_eq!(
+            loaded.feature_bank,
+            Some(voice.join("added_IVF1_Flat.index"))
+        );
+
+        set_feature_bank(&manifest, None).unwrap();
+        assert_eq!(ModelManifest::load(&manifest).unwrap().feature_bank, None);
+        assert!(set_feature_bank(&manifest, Some(&voice.join("voice.onnx"))).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

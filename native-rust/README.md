@@ -27,13 +27,15 @@ This is **not yet feature parity** with the reference. non-standard RVC checkpoi
 
 ## Run on desktop
 
-The [GitHub releases](https://github.com/Araryarch67/voice-changer/releases) provide a Windows `-setup.exe` installer, macOS `.dmg` images for Apple Silicon and Intel, and Linux x64 `.deb` / `.rpm` packages. Portable ZIP archives are also available. Each platform publishes its files as soon as its build finishes.
+The [GitHub releases](https://github.com/Araryarch67/voice-changer/releases) provide Windows `-setup.exe` installers and Linux x64 `.deb` / `.rpm` packages. Portable ZIP archives are also available. Each platform publishes its files as soon as its build finishes.
 
-On Windows, run the setup executable; it installs for the current user and adds a Start Menu shortcut and an uninstaller. On macOS, open the DMG and drag **Voice Changer** into **Applications**. The macOS app is ad-hoc signed and is not notarized. On Linux, install the DEB with `sudo apt install ./voice-changer-linux-x64.deb` or the RPM with `sudo dnf install ./voice-changer-linux-x64.rpm`, then launch **Voice Changer** from the application menu. Installed Linux builds use `${XDG_DATA_HOME:-$HOME/.local/share}/voice-changer/models` for user models. The packages include the CPU ONNX Runtime; voice models are obtained separately.
+On Windows, run the setup executable; it installs for the current user and adds a Start Menu shortcut and an uninstaller. On Linux, install the DEB with `sudo apt install ./voice-changer-linux-x64.deb` or the RPM with `sudo dnf install ./voice-changer-linux-x64.rpm`, then launch **Voice Changer** from the application menu. Installed Linux builds use `${XDG_DATA_HOME:-$HOME/.local/share}/voice-changer/models` for user models. The packages include the CPU ONNX Runtime; voice models are obtained separately.
 
-For NVIDIA GPUs on Windows, use `voice-changer-windows-x64-cuda-setup.exe` (or its ZIP) instead. It bundles the CUDA build of ONNX Runtime 1.22, which needs a recent NVIDIA driver, [CUDA 12.x](https://developer.nvidia.com/cuda-downloads) and [cuDNN 9.x for CUDA 12](https://developer.nvidia.com/cudnn-downloads) installed separately. The app adds cuDNN's install folder (`C:\Program Files\NVIDIA\CUDNN\v9.*\bin\12.*`) and `%CUDA_PATH%\bin` to its search path, so they do not have to be on `PATH`; DLLs copied into the app's `lib\` folder also work. GPU is selected automatically on first launch when the runtime offers CUDA; if CUDA cannot start, Start reports it instead of quietly using the CPU, and CPU can still be chosen in Settings. RTX 50 (Blackwell) GPUs need driver 570 or newer, CUDA 12.8+ and cuDNN 9.8+; the first conversion on them is slower while CUDA compiles its kernels, which are then cached. To check that the GPU is used, compare `voice-changer-native --benchmark models/<voice>/model.json 250 20 gpu` with the same command ending in `cpu`.
+The standard Windows download (`voice-changer-windows-x64`) includes the DirectML build of ONNX Runtime, so any DirectX 12 GPU (NVIDIA, AMD or Intel) can be used with nothing else to install: choose **GPU (DirectML)** in Settings. On laptops with two GPUs the discrete one is used, and Settings shows its name. DirectML is usually somewhat slower than CUDA on NVIDIA.
 
-Use a recent stable Rust toolchain. On Linux install the ALSA development package and a working Vulkan or OpenGL driver; Wayland and X11 are enabled. Windows uses WASAPI, macOS uses CoreAudio.
+For the fastest NVIDIA path on Windows, use `voice-changer-windows-x64-cuda-setup.exe` (or its ZIP) instead. It bundles the CUDA build of ONNX Runtime 1.22, which needs a recent NVIDIA driver, [CUDA 12.x](https://developer.nvidia.com/cuda-downloads) and [cuDNN 9.x for CUDA 12](https://developer.nvidia.com/cudnn-downloads) installed separately. The app adds cuDNN's install folder (`C:\Program Files\NVIDIA\CUDNN\v9.*\bin\12.*`) and `%CUDA_PATH%\bin` to its search path, so they do not have to be on `PATH`; DLLs copied into the app's `lib\` folder also work. A GPU is selected automatically on first launch (CUDA first, then DirectML); if CUDA cannot start, Start reports it instead of quietly using the CPU, and CPU can still be chosen in Settings. RTX 50 (Blackwell) GPUs need driver 570 or newer, CUDA 12.8+ and cuDNN 9.8+; the first conversion on them is slower while CUDA compiles its kernels, which are then cached. To check that the GPU is used, compare `voice-changer-native --benchmark models/<voice>/model.json 250 20 cuda` (or `directml`) with the same command ending in `cpu`.
+
+Use a recent stable Rust toolchain. On Linux install the ALSA development package and a working Vulkan or OpenGL driver; Wayland and X11 are enabled. Windows uses WASAPI.
 
 ```sh
 cd native-rust
@@ -55,11 +57,11 @@ export ORT_DYLIB_PATH=/absolute/path/libonnxruntime.so.1.22.0
 cargo run --release
 ```
 
-On macOS use the corresponding `.dylib`; on Windows set `ORT_DYLIB_PATH` to `onnxruntime.dll` in PowerShell (`$env:ORT_DYLIB_PATH = 'C:\path\onnxruntime.dll'`). Keep any required runtime companion libraries beside it. Packaged macOS applications need the microphone usage description supplied in `platforms/macos/Info.plist`.
+On Windows set `ORT_DYLIB_PATH` to `onnxruntime.dll` in PowerShell (`$env:ORT_DYLIB_PATH = 'C:\path\onnxruntime.dll'`). Keep any required runtime companion libraries beside it.
 
 ## Importing a voice
 
-**Import model** opens a dialog with separate fields for the RVC `.pth` checkpoint and its `.index`; the index is optional, and the one beside the checkpoint is filled in when there is one. **Other file** in that dialog, or dropping a file on the window, accepts an RVC `.pth` checkpoint, a `.zip` containing one, or an existing `model.json`. A checkpoint is exported to `models/<name>/voice-realtime.onnx`, the `added_*.index` beside it (or inside the archive) is placed in the same folder, and a manifest is written that uses `models/shared/contentvec.onnx` and `models/shared/rmvpe.onnx`, which must already exist. `G_*`/`D_*` training files in an archive are ignored. A `portrait.png` (or `.jpg`, `.jpeg`, `.webp`) in a voice's folder is shown on its card; **Edit → Choose picture** copies one there.
+**Import model** (or dropping a `.pth` or `.index` on the window) opens a dialog with separate fields for the RVC `.pth` checkpoint and its `.index`; the index is optional, and the one beside the checkpoint is filled in when there is one. The checkpoint is exported to `models/<name>/voice-realtime.onnx`, the index is copied into the same folder, and a manifest is written that uses `models/shared/contentvec.onnx` and `models/shared/rmvpe.onnx`, which must already exist. **Edit → Change index** replaces or removes a voice's index later. A `portrait.png` (or `.jpg`, `.jpeg`, `.webp`) in a voice's folder is shown on its card; **Edit → Choose picture** copies one there.
 
 ## Model contract
 
@@ -97,7 +99,7 @@ WAV input is downmixed to mono; output is mono PCM16 at the input sample rate. I
 
 ## Mobile
 
-Mobile source and packaging instructions are provided, but Android/iOS binaries have **not been built or tested in this Linux environment**. Desktop binaries also require testing on Windows and macOS. A responsive desktop preview does not establish mobile compatibility.
+Mobile source and packaging instructions are provided, but Android/iOS binaries have **not been built or tested in this Linux environment**. Windows binaries also require testing on Windows. A responsive desktop preview does not establish mobile compatibility.
 
 ### Android
 

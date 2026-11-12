@@ -5,18 +5,42 @@ use crate::{
     retrieval::FeatureBank,
 };
 use anyhow::{bail, Context, Result};
-use ort::{execution_providers::CUDAExecutionProvider, session::Session, value::Tensor};
+use ort::{
+    execution_providers::{CUDAExecutionProvider, DirectMLExecutionProvider},
+    session::Session,
+    value::Tensor,
+};
 use std::path::Path;
 
 fn open_session(file: &Path, threads: usize, device: Device) -> Result<Session> {
+    anyhow::ensure!(
+        crate::runtime::available_devices().contains(&device),
+        "{} is not available with this ONNX Runtime on this system; choose another device",
+        device.label()
+    );
     let mut builder = Session::builder()?.with_intra_threads(threads)?;
-    if device == Device::Gpu {
-        builder = builder
+    // A chosen GPU that cannot start is an error, never a quiet switch to the CPU.
+    builder = match device {
+        Device::Cpu => builder,
+        Device::Gpu => builder
+            // TF32 makes RTX GPUs faster but changes the voice: output came out about
+            // 12% quieter than on the CPU. Full precision matches the CPU and is still
+            // several times faster than real time.
             .with_execution_providers([CUDAExecutionProvider::default()
+                .with_tf32(false)
                 .build()
                 .error_on_failure()])
-            .context("GPU is selected but CUDA could not start; use the GPU (CUDA) download with CUDA 12 and cuDNN 9 installed, or switch the device to CPU")?;
-    }
+            .context("GPU (CUDA) is selected but CUDA could not start; use the GPU (CUDA) download with CUDA 12 and cuDNN 9 installed, or choose another device")?,
+        // DirectML needs sequential execution without memory patterns.
+        Device::DirectMl => builder
+            .with_memory_pattern(false)?
+            .with_parallel_execution(false)?
+            .with_execution_providers([DirectMLExecutionProvider::default()
+                .with_device_id(crate::runtime::directml_device())
+                .build()
+                .error_on_failure()])
+            .context("GPU (DirectML) is selected but DirectML could not start; update the graphics driver (DirectX 12 is required) or choose another device")?,
+    };
     Ok(builder.commit_from_file(file)?)
 }
 
@@ -47,12 +71,36 @@ impl Rvc {
         ))?
     }
     fn load_inner(path: &Path, device: Device) -> Result<Self> {
+        let started = std::time::Instant::now();
         let manifest = ModelManifest::load(path)?;
+        log::info!(
+            "Loading voice \"{}\" on {} ({} Hz, {} features, {})",
+            manifest.name,
+            device.label(),
+            manifest.sample_rate,
+            manifest.channels,
+            if manifest.use_f0 {
+                "with pitch"
+            } else {
+                "no pitch"
+            }
+        );
         crate::runtime::initialize()?;
         if device == Device::Gpu {
             crate::runtime::preload_gpu_libraries();
         }
-        let session = |file: &Path| open_session(file, manifest.intra_threads, device);
+        let session = |file: &Path| {
+            let opened = std::time::Instant::now();
+            let session = open_session(file, manifest.intra_threads, device);
+            if session.is_ok() {
+                log::info!(
+                    "  loaded {} in {} ms",
+                    file.file_name().unwrap_or_default().to_string_lossy(),
+                    opened.elapsed().as_millis()
+                );
+            }
+            session
+        };
         let voice = session(&manifest.model).context("Load RVC ONNX")?;
         let embedder = session(&manifest.embedder).context("Load ContentVec/HuBERT ONNX")?;
         for required in ["feats", "p_len", "sid"] {
@@ -104,6 +152,14 @@ impl Rvc {
             .as_deref()
             .map(|file| FeatureBank::load(file, manifest.channels))
             .transpose()?;
+        match &manifest.feature_bank {
+            Some(file) => log::info!(
+                "  index {}",
+                file.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            None => log::info!("  no index"),
+        }
+        log::info!("Voice ready in {} ms", started.elapsed().as_millis());
         Ok(Self {
             manifest,
             voice,
@@ -356,12 +412,10 @@ impl Converter for Rvc {
             .map(|v| v * self.manifest.output_scale)
             .collect();
         drop(output);
-        if std::env::var_os("VC_PROFILE").is_some() {
-            eprintln!(
-                "features={feature_ms:.1}ms pitch={pitch_ms:.1}ms voice={:.1}ms",
-                voice_start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
+        log::trace!(
+            "block: features {feature_ms:.1} ms, pitch {pitch_ms:.1} ms, voice {:.1} ms",
+            voice_start.elapsed().as_secs_f64() * 1000.0
+        );
         let converted = dsp::resample(&values, self.manifest.sample_rate, rate);
         self.sola.process(
             &converted,

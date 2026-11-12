@@ -9,7 +9,7 @@ This repository is a Rust port of [w-okada/voice-changer](https://github.com/w-o
 | `native-rust/` | The Rust application (egui GUI, CPAL audio, ONNX Runtime inference). All new work goes here. |
 | `reference/` | The original Python server and web client. Git-ignored, read-only, may be absent. |
 | `voice-rvc/` | Local RVC checkpoints (`.pth`) and FAISS indexes. Git-ignored. |
-| `.github/workflows/release.yml` | Builds release archives for Linux, Windows and macOS. |
+| `.github/workflows/release.yml` | Builds release archives and installers for Linux and Windows. |
 
 ## Using `reference/`
 

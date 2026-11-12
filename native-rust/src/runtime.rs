@@ -76,6 +76,12 @@ fn resolved(path: PathBuf) -> PathBuf {
     path.canonicalize().unwrap_or(path)
 }
 
+#[cfg(all(feature = "onnx", not(feature = "onnx-static")))]
+fn log_runtime(path: &std::path::Path) {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| log::info!("ONNX Runtime loaded from {}", path.display()));
+}
+
 #[cfg(any(feature = "onnx", feature = "onnx-static"))]
 pub fn initialize() -> Result<()> {
     #[cfg(all(feature = "onnx", not(feature = "onnx-static")))]
@@ -88,6 +94,7 @@ pub fn initialize() -> Result<()> {
                 .with_name("voice-changer")
                 .commit()
                 .context("Initialize ONNX Runtime from ORT_DYLIB_PATH")?;
+            log_runtime(&path);
             return Ok(());
         }
         let mut candidates = Vec::new();
@@ -111,6 +118,7 @@ pub fn initialize() -> Result<()> {
                     .with_name("voice-changer")
                     .commit()
                     .context("Initialize bundled ONNX Runtime")?;
+                log_runtime(&path);
                 return Ok(());
             }
         }
@@ -134,6 +142,7 @@ pub fn preload_gpu_libraries() {
     // 256 MiB cache is too small for ONNX Runtime and would recompile every launch.
     static CACHE: std::sync::Once = std::sync::Once::new();
     CACHE.call_once(|| {
+        log::info!("Preparing CUDA libraries");
         if std::env::var_os("CUDA_CACHE_MAXSIZE").is_none() {
             std::env::set_var("CUDA_CACHE_MAXSIZE", "4294967296");
         }
@@ -223,6 +232,62 @@ fn cudnn_folders(root: &std::path::Path) -> Vec<PathBuf> {
         folders.push(bin);
     }
     folders
+}
+
+static DIRECTML_DEVICE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// The DirectX 12 adapter DirectML runs on; the UI sets it to the discrete GPU.
+pub fn set_directml_device(index: i32) {
+    DIRECTML_DEVICE.store(index, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn directml_device() -> i32 {
+    DIRECTML_DEVICE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The devices the loaded ONNX Runtime can use here, CPU first. Checked once.
+pub fn available_devices() -> &'static [crate::config::Device] {
+    use crate::config::Device;
+    static AVAILABLE: std::sync::OnceLock<Vec<Device>> = std::sync::OnceLock::new();
+    AVAILABLE.get_or_init(|| {
+        let mut devices = vec![Device::Cpu];
+        #[cfg(any(feature = "onnx", feature = "onnx-static"))]
+        {
+            use ort::execution_providers::{DirectMLExecutionProvider, ExecutionProvider};
+            // ort load-dynamic can panic when its shared library cannot be located.
+            let offered = |provider: &dyn ExecutionProvider| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    provider.supported_by_platform()
+                        && initialize().is_ok()
+                        && provider.is_available().unwrap_or(false)
+                }))
+                .unwrap_or(false)
+            };
+            if gpu_available() {
+                devices.push(Device::Gpu);
+            }
+            if offered(&DirectMLExecutionProvider::default()) {
+                devices.push(Device::DirectMl);
+            }
+        }
+        log::info!(
+            "Devices available: {}",
+            devices
+                .iter()
+                .map(|device| device.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        devices
+    })
+}
+
+/// The GPU to use when the user has not chosen: CUDA, then DirectML.
+pub fn preferred_gpu() -> Option<crate::config::Device> {
+    use crate::config::Device;
+    [Device::Gpu, Device::DirectMl]
+        .into_iter()
+        .find(|device| available_devices().contains(device))
 }
 
 /// Whether the loaded ONNX Runtime offers the CUDA execution provider. Checked once.

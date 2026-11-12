@@ -1,6 +1,6 @@
 [package]
 name = "voice-changer-native"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 description = "Native Rust and egui real-time RVC voice changer"
@@ -36,6 +36,8 @@ miniz_oxide = "0.8"
 rsworld = { version = "0.1", optional = true }
 rsworld-sys = { version = "0.1", optional = true }
 aec3 = "0.4"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }

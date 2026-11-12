@@ -76,6 +76,8 @@ pub struct VoiceApp {
     file_output: String,
     work: Option<mpsc::Receiver<Result<String, String>>>,
     message: Option<String>,
+    /// The error and message last written to the terminal, so each is logged once.
+    logged: (Option<String>, Option<String>),
     /// Voice pictures by manifest path; `None` once a voice is known to have none.
     portraits: std::collections::HashMap<String, Option<egui::TextureHandle>>,
     #[cfg(feature = "audio")]
@@ -94,9 +96,11 @@ impl VoiceApp {
             .and_then(|s| eframe::get_value(s, "voice-changer"));
         let first_run = stored.is_none();
         let mut saved = stored.unwrap_or_default();
-        // An NVIDIA runtime is used from the start; the choice is kept afterwards.
-        if first_run && crate::runtime::gpu_available() {
-            saved.settings.device = Device::Gpu;
+        // A GPU is used from the start when there is one; the choice is kept afterwards.
+        if first_run {
+            if let Some(gpu) = crate::runtime::preferred_gpu() {
+                saved.settings.device = gpu;
+            }
         }
         if saved.settings.validate().is_err() {
             saved.settings = Settings::default();
@@ -110,6 +114,22 @@ impl VoiceApp {
             .iter()
             .all(|slot| slot.manifest.trim().is_empty());
         adopt_models(&mut saved);
+        log::info!(
+            "Models folder: {}",
+            crate::runtime::models_root()
+                .map(|root| root.display().to_string())
+                .unwrap_or_else(|| {
+                    "not found (needs shared/contentvec.onnx and shared/rmvpe.onnx)".into()
+                })
+        );
+        log::info!(
+            "{} voices ready",
+            saved
+                .slots
+                .iter()
+                .filter(|slot| !slot.manifest.trim().is_empty())
+                .count()
+        );
         if was_empty && !saved.slots[0].manifest.is_empty() {
             saved.selected = 0;
             saved.settings.bypass = false;
@@ -129,6 +149,7 @@ impl VoiceApp {
             file_output: String::new(),
             work: None,
             message: None,
+            logged: (None, None),
             portraits: Default::default(),
             #[cfg(feature = "audio")]
             devices: Vec::new(),
@@ -137,6 +158,7 @@ impl VoiceApp {
             #[cfg(all(feature = "audio", target_os = "linux"))]
             virtual_mic: None,
         };
+        crate::gpu_info::detect_in_background();
         #[cfg(feature = "audio")]
         app.refresh_devices();
         #[cfg(all(feature = "audio", target_os = "linux"))]
@@ -225,7 +247,14 @@ impl VoiceApp {
                 .then(|| self.saved.monitor_device.clone()),
         };
         match AudioSession::start(options) {
-            Ok(s) => self.session = Some(s),
+            Ok(s) => {
+                log::info!(
+                    "Start: \"{}\" on {}",
+                    self.saved.slots[self.saved.selected].name,
+                    self.saved.settings.device.label()
+                );
+                self.session = Some(s)
+            }
             Err(e) => self.error = Some(format!("{e:#}")),
         }
     }
@@ -313,6 +342,7 @@ impl VoiceApp {
         }
         self.portraits.remove(&manifest);
     }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     fn add_slot(&mut self) {
         self.saved.slots.push(ModelSlot {
             name: format!("Voice {:02}", self.saved.slots.len() + 1),
@@ -330,6 +360,33 @@ impl VoiceApp {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         self.add_slot();
     }
+    /// Puts a checkpoint in the import dialog, with the index beside it if the index
+    /// field is still empty.
+    fn choose_checkpoint(&mut self, path: PathBuf) {
+        if self.import_index.trim().is_empty() {
+            if let Some(index) = path.parent().and_then(crate::import::find_index) {
+                self.import_index = index.to_string_lossy().into_owned();
+            }
+        }
+        self.import_checkpoint = path.to_string_lossy().into_owned();
+    }
+    /// A dropped `.pth` or `.index` opens the import dialog with it filled in.
+    fn drop_file(&mut self, path: PathBuf) {
+        let extension = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        match extension.as_str() {
+            "pth" => self.choose_checkpoint(path),
+            "index" => self.import_index = path.to_string_lossy().into_owned(),
+            _ => {
+                self.error = Some("Drop an RVC .pth checkpoint or its .index file.".into());
+                return;
+            }
+        }
+        self.error = None;
+        self.import_dialog = true;
+    }
     /// Converts the chosen checkpoint with the chosen index, or with none.
     fn import_pair(&mut self) {
         if self.work.is_some() {
@@ -340,9 +397,22 @@ impl VoiceApp {
         let index = Some(self.import_index.trim())
             .filter(|index| !index.is_empty())
             .map(PathBuf::from);
+        log::info!(
+            "Importing {} with {}",
+            checkpoint.display(),
+            index
+                .as_deref()
+                .map_or("no index".into(), |index| index.display().to_string())
+        );
         #[cfg(feature = "export")]
         self.begin_work(move || {
+            let started = std::time::Instant::now();
             let manifest = crate::import::import_pair(&checkpoint, index.as_deref())?;
+            log::info!(
+                "Converted to {} in {:.1} s",
+                manifest.parent().unwrap_or(&manifest).display(),
+                started.elapsed().as_secs_f32()
+            );
             let voice = crate::config::ModelManifest::load(&manifest)?;
             Ok(format!(
                 "Imported {}{}.",
@@ -364,7 +434,7 @@ impl VoiceApp {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn import_dialog(&mut self, ctx: &egui::Context) {
         let busy = self.running() || self.work.is_some();
-        let (mut close, mut import, mut other) = (false, false, false);
+        let (mut close, mut import) = (false, false);
         let (_, dismissed) = m3::dialog(ctx, "import-dialog", "Import RVC voice", |ui| {
             ui.add_enabled_ui(!busy, |ui| {
                 m3::field_label(ui, "Model (.pth)");
@@ -388,14 +458,7 @@ impl VoiceApp {
                             .pick_file()
                         {
                             // Suggest the index beside it; the user can still change it.
-                            if self.import_index.trim().is_empty() {
-                                if let Some(index) =
-                                    path.parent().and_then(crate::import::find_index)
-                                {
-                                    self.import_index = index.to_string_lossy().into_owned();
-                                }
-                            }
-                            self.import_checkpoint = path.to_string_lossy().into_owned();
+                            self.choose_checkpoint(path);
                         }
                     }
                 });
@@ -446,9 +509,6 @@ impl VoiceApp {
                     .add_enabled(ready, m3::Button::filled("Import").icon(icons::ADD))
                     .clicked();
                 close = ui.add(m3::Button::text("Cancel")).clicked();
-                other = ui
-                    .add_enabled(!busy, m3::Button::text("Other file (.zip, .json)…"))
-                    .clicked();
             });
         });
         if import {
@@ -456,65 +516,7 @@ impl VoiceApp {
             self.import_checkpoint.clear();
             self.import_index.clear();
         }
-        if other {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter(
-                    "RVC voice (.pth, .zip) or manifest (.json)",
-                    &["pth", "zip", "json"],
-                )
-                .pick_file()
-            {
-                self.import_file(path);
-                close = true;
-            }
-        }
         self.import_dialog = !(import || close || dismissed);
-    }
-    /// A manifest is linked as it is; an RVC checkpoint or archive is converted into a
-    /// new voice folder in the background and picked up when that finishes.
-    fn import_file(&mut self, path: PathBuf) {
-        if path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("json"))
-        {
-            match crate::config::ModelManifest::load(&path) {
-                Ok(model) => {
-                    self.saved.slots.push(ModelSlot {
-                        name: model.name,
-                        manifest: path.to_string_lossy().into_owned(),
-                        favorite: false,
-                    });
-                    self.saved.selected = self.saved.slots.len() - 1;
-                    self.saved.settings.bypass = false;
-                    self.error = None;
-                }
-                Err(error) => self.error = Some(format!("{error:#}")),
-            }
-            return;
-        }
-        if self.work.is_some() {
-            self.error = Some("Wait for the current task to finish, then import again.".into());
-            return;
-        }
-        #[cfg(feature = "export")]
-        self.begin_work(move || {
-            let manifest = crate::import::import_voice(&path)?;
-            let voice = crate::config::ModelManifest::load(&manifest)?;
-            Ok(format!(
-                "Imported {}{}.",
-                voice.name,
-                if voice.feature_bank.is_some() {
-                    " with its index"
-                } else {
-                    " (no index found)"
-                }
-            ))
-        });
-        #[cfg(not(feature = "export"))]
-        {
-            self.error =
-                Some("This build cannot convert checkpoints; import a model.json instead.".into());
-        }
     }
     fn begin_work<F>(&mut self, work: F)
     where
@@ -551,7 +553,7 @@ impl VoiceApp {
         header(
             ui,
             "Voices",
-            "Pick a voice, then press Start. Import an RVC .pth or .zip, or drop one on the window.",
+            "Pick a voice, then press Start. Import an RVC .pth (and its .index), or drop them on the window.",
         );
         let total = ui.available_width();
         let side = 320.0;
@@ -637,15 +639,6 @@ impl VoiceApp {
                 self.test_button(ui);
                 self.edit_button(ui);
             }
-            if ui
-                .add_enabled(
-                    !running && self.work.is_none(),
-                    m3::Button::text("Empty slot").icon(icons::ADD),
-                )
-                .clicked()
-            {
-                self.add_slot();
-            }
         });
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
@@ -717,19 +710,19 @@ impl VoiceApp {
                 egui::Label::new(RichText::new(&slot.name).size(22.0).color(m3::ON_SURFACE))
                     .truncate(),
             );
-            let file = PathBuf::from(slot.manifest.trim());
-            let folder = file
-                .parent()
-                .and_then(|p| p.file_name())
-                .map(|name| format!("{}/", name.to_string_lossy()))
-                .unwrap_or_default();
             let detail = if configured {
-                format!(
-                    "RVC · ONNX · {folder}{}",
-                    file.file_name().unwrap_or_default().to_string_lossy()
-                )
+                let index = crate::config::ModelManifest::load(std::path::Path::new(
+                    slot.manifest.trim(),
+                ))
+                .ok()
+                .map(|model| model.feature_bank.is_some());
+                match index {
+                    Some(true) => "RVC · ONNX · with index".to_owned(),
+                    Some(false) => "RVC · ONNX · no index".to_owned(),
+                    None => "RVC · ONNX · files missing".to_owned(),
+                }
             } else {
-                "Empty slot. Connect a model manifest to use it.".to_owned()
+                "Empty slot. Import an RVC .pth to use it.".to_owned()
             };
             ui.add(egui::Label::new(m3::supporting(&detail)).truncate());
             ui.add_space(8.0);
@@ -758,12 +751,12 @@ impl VoiceApp {
                 });
             } else if ui
                 .add_enabled(
-                    !self.running(),
-                    m3::Button::filled("Connect model").icon(icons::ADD),
+                    !self.running() && self.work.is_none(),
+                    m3::Button::filled("Import model").icon(icons::ADD),
                 )
                 .clicked()
             {
-                self.edit_model = true;
+                self.import_model();
             }
         });
     }
@@ -865,10 +858,15 @@ impl VoiceApp {
                 self.saved.slots[index].favorite = !favorite;
             }
         }
+        let empty = self.saved.slots[index].manifest.trim().is_empty();
         if response.clicked() && !running {
             self.saved.selected = index;
+            // An empty card is the same as Import model.
+            if empty && self.work.is_none() {
+                self.import_model();
+            }
         }
-        if response.double_clicked() && !running {
+        if response.double_clicked() && !running && !empty {
             self.saved.selected = index;
             self.edit_model = true;
         }
@@ -1175,19 +1173,36 @@ impl VoiceApp {
         m3::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             m3::card_title(ui, icons::MEMORY, "Processing");
-            let gpu = crate::runtime::gpu_available();
-            ui.add_enabled_ui(!running && (gpu || self.saved.settings.device == Device::Gpu), |ui| {
+            let available = crate::runtime::available_devices();
+            let current = self.saved.settings.device;
+            // A saved choice stays visible even when this runtime cannot use it.
+            let options: Vec<(Device, &str)> = available
+                .iter()
+                .copied()
+                .chain((!available.contains(&current)).then_some(current))
+                .map(|device| (device, device.label()))
+                .collect();
+            ui.add_enabled_ui(!running && options.len() > 1, |ui| {
                 choice(
                     ui,
-                    "Device", "Where the model runs. A GPU is much faster than the CPU.",
+                    "Device",
+                    "Where the model runs. A GPU is much faster than the CPU. CUDA is the fastest on NVIDIA; DirectML works on any DirectX 12 GPU (NVIDIA, AMD, Intel) without installing anything.",
                     &mut self.saved.settings.device,
-                    &[(Device::Cpu, "CPU"), (Device::Gpu, "GPU (CUDA)")],
+                    &options,
                 );
             });
-            ui.label(m3::supporting(if gpu {
-                "GPU is available. The choice applies the next time you press Start."
+            if let Some(name) = crate::gpu_info::name_for(current) {
+                ui.horizontal(|ui| {
+                    ui.label(m3::icon(icons::MEMORY, 18.0, m3::PRIMARY));
+                    ui.label(egui::RichText::new(format!("Runs on {name}")).color(m3::ON_SURFACE));
+                });
+            }
+            ui.label(m3::supporting(if !available.contains(&current) {
+                "The selected device is not available with this ONNX Runtime; choose another one."
+            } else if available.len() > 1 {
+                "The choice applies the next time you press Start."
             } else {
-                "This ONNX Runtime has no CUDA provider, so only CPU is available. Install a GPU build of ONNX Runtime with matching CUDA and cuDNN libraries to enable GPU."
+                "Only the CPU is available with this ONNX Runtime. On Windows, the standard download includes DirectML for any GPU."
             }));
         });
         ui.add_space(4.0);
@@ -1225,7 +1240,11 @@ impl VoiceApp {
         #[cfg(feature = "audio")]
         if let Some(session) = &self.session {
             status = if session.metrics.ready.load(Ordering::Acquire) {
-                "Live".to_owned()
+                let device = self.saved.settings.device;
+                match crate::gpu_info::name_for(device) {
+                    Some(name) => format!("Live · {name}"),
+                    None => format!("Live · {}", device.label()),
+                }
             } else {
                 "Loading model…".to_owned()
             };
@@ -1247,6 +1266,7 @@ impl VoiceApp {
                         .add_enabled(!stopping, m3::Button::fab_stop(label).icon(icons::STOP))
                         .clicked()
                     {
+                        log::info!("Stop pressed");
                         session.stop();
                     }
                     if !session.metrics.ready.load(Ordering::Acquire) {
@@ -1384,37 +1404,61 @@ impl VoiceApp {
         let (mut remove, mut done) = (false, false);
         #[allow(unused_mut)]
         let mut picture: Option<PathBuf> = None;
+        // Some(None) removes the index, Some(Some(path)) replaces it.
+        #[allow(unused_mut)]
+        let mut index_change: Option<Option<PathBuf>> = None;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let current_index = crate::config::ModelManifest::load(std::path::Path::new(
+            &self.saved.slots[self.saved.selected].manifest,
+        ))
+        .ok()
+        .and_then(|model| model.feature_bank)
+        .and_then(|bank| bank.file_name().map(|n| n.to_string_lossy().into_owned()));
         let (_, dismissed) = m3::dialog(ctx, "model-dialog", "Configure voice", |ui| {
             ui.add_enabled_ui(!running, |ui| {
                 let slot = &mut self.saved.slots[self.saved.selected];
                 m3::field_label(ui, "Display name");
                 ui.add(m3::text_edit(&mut slot.name, "Voice name", f32::INFINITY));
-                m3::field_label(ui, "Model manifest (.json)");
-                ui.horizontal(|ui| {
-                    let browse = cfg!(not(any(target_os = "android", target_os = "ios")));
-                    let width = ui.available_width() - if browse { 48.0 } else { 0.0 };
+                // Phones have no file picker for checkpoints; there the manifest path
+                // is typed in.
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                {
+                    m3::field_label(ui, "Model manifest (.json)");
                     ui.add(m3::text_edit(
                         &mut slot.manifest,
                         "/path/to/model.json",
-                        width,
+                        f32::INFINITY,
                     ));
-                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    if m3::icon_button(
-                        ui,
-                        icons::FOLDER_OPEN,
-                        m3::ON_SURFACE_VARIANT,
-                        "Browse manifest…",
-                    )
-                    .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Voice model manifest", &["json"])
-                            .pick_file()
+                }
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                if !slot.manifest.trim().is_empty() {
+                    m3::field_label(ui, "Index (.index)");
+                    ui.label(
+                        egui::RichText::new(current_index.as_deref().unwrap_or("No index"))
+                            .color(m3::ON_SURFACE),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(m3::Button::outlined("Change index").icon(icons::FOLDER_OPEN))
+                            .clicked()
                         {
-                            slot.manifest = path.to_string_lossy().into_owned();
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("RVC feature index", &["index"])
+                                .pick_file()
+                            {
+                                index_change = Some(Some(path));
+                            }
                         }
-                    }
-                });
+                        if current_index.is_some()
+                            && ui.add(m3::Button::text("Remove index")).clicked()
+                        {
+                            index_change = Some(None);
+                        }
+                    });
+                    ui.label(m3::supporting(
+                        "Makes the voice sound closer to the original speaker; the Index slider sets how much. The file is copied into the voice's folder.",
+                    ));
+                }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     m3::switch(ui, &mut slot.favorite, "Favorite");
@@ -1438,6 +1482,7 @@ impl VoiceApp {
                         "Shown on the voice card. It is copied into the voice's folder as portrait.*",
                     ));
                 }
+                #[cfg(any(target_os = "android", target_os = "ios"))]
                 ui.label(m3::supporting(
                     "The manifest connects RVC, ContentVec and RMVPE. See examples/model.json.",
                 ));
@@ -1459,6 +1504,20 @@ impl VoiceApp {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if let Some(picked) = picture {
             self.set_portrait(picked);
+        }
+        if let Some(index) = index_change {
+            let manifest = PathBuf::from(&self.saved.slots[self.saved.selected].manifest);
+            match crate::config::set_feature_bank(&manifest, index.as_deref()) {
+                Ok(()) => {
+                    self.message = Some(match index {
+                        Some(_) => {
+                            "Index updated; it applies the next time you press Start.".into()
+                        }
+                        None => "Index removed.".into(),
+                    })
+                }
+                Err(error) => self.error = Some(format!("{error:#}")),
+            }
         }
         if remove {
             self.saved.slots.remove(self.saved.selected);
@@ -1579,6 +1638,19 @@ impl VoiceApp {
 }
 impl eframe::App for VoiceApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Whatever the window shows as an error or a message also goes to the terminal.
+        if self.error != self.logged.0 {
+            if let Some(error) = &self.error {
+                log::error!("{error}");
+            }
+            self.logged.0 = self.error.clone();
+        }
+        if self.message != self.logged.1 {
+            if let Some(message) = &self.message {
+                log::info!("{message}");
+            }
+            self.logged.1 = self.message.clone();
+        }
         let completed = self.work.as_ref().and_then(|work| match work.try_recv() {
             Ok(result) => Some(result),
             Err(mpsc::TryRecvError::Empty) => None,
@@ -1626,7 +1698,7 @@ impl eframe::App for VoiceApp {
                 session.stop();
             }
         }
-        // Dropping a checkpoint, archive or manifest on the window imports it.
+        // Dropping a checkpoint or index on the window opens the import dialog with it.
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -1636,7 +1708,7 @@ impl eframe::App for VoiceApp {
         });
         if !self.running() {
             for path in dropped {
-                self.import_file(path);
+                self.drop_file(path);
             }
         }
         let compact = ctx.screen_rect().width() < 650.0;

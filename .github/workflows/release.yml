@@ -1,6 +1,6 @@
 name: Release native app
 
-# Builds native-rust/ for Linux, Windows and macOS. A pushed tag (v*) publishes the
+# Builds native-rust/ for Linux and Windows. A pushed tag (v*) publishes the
 # archives independently as each platform finishes. Manual runs can also publish
 # to an existing tag; without a tag they only keep workflow artifacts.
 on:
@@ -19,6 +19,8 @@ permissions:
 env:
   # Must match the ONNX Runtime the pinned ort crate targets.
   ORT_VERSION: "1.22.0"
+  # DirectML version the ONNX Runtime DirectML package of ORT_VERSION depends on.
+  DIRECTML_VERSION: "1.15.4"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -62,12 +64,15 @@ jobs:
             ort_archive: onnxruntime-linux-x64
             ort_ext: tgz
             ort_lib: libonnxruntime.so
+          # Any DirectX 12 GPU (NVIDIA, AMD, Intel) through DirectML, plus the CPU.
+          # ONNX Runtime publishes its DirectML build on NuGet only.
           - name: windows-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             ort_archive: onnxruntime-win-x64
             ort_ext: zip
             ort_lib: onnxruntime.dll
+            directml: true
           # NVIDIA GPUs: the CUDA build of ONNX Runtime. Users install CUDA 12 and
           # cuDNN 9 themselves; the app finds them through PATH and cuDNN's folder.
           - name: windows-x64-cuda
@@ -77,18 +82,6 @@ jobs:
             ort_ext: zip
             ort_lib: onnxruntime.dll
             cuda: true
-          - name: macos-arm64
-            os: macos-latest
-            target: aarch64-apple-darwin
-            ort_archive: onnxruntime-osx-arm64
-            ort_ext: tgz
-            ort_lib: libonnxruntime.dylib
-          - name: macos-x64
-            os: macos-latest
-            target: x86_64-apple-darwin
-            ort_archive: onnxruntime-osx-x86_64
-            ort_ext: tgz
-            ort_lib: libonnxruntime.dylib
     defaults:
       run:
         shell: bash
@@ -131,7 +124,21 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      - name: Fetch ONNX Runtime (DirectML)
+        if: matrix.directml
+        run: |
+          nuget=https://api.nuget.org/v3-flatcontainer
+          curl -fsSL -o ort.nupkg "$nuget/microsoft.ml.onnxruntime.directml/${ORT_VERSION}/microsoft.ml.onnxruntime.directml.${ORT_VERSION}.nupkg"
+          curl -fsSL -o dml.nupkg "$nuget/microsoft.ai.directml/${DIRECTML_VERSION}/microsoft.ai.directml.${DIRECTML_VERSION}.nupkg"
+          7z x -y -oort-pkg ort.nupkg >/dev/null
+          7z x -y -odml-pkg dml.nupkg >/dev/null
+          mkdir -p ort-lib ort-root
+          cp ort-pkg/runtimes/win-x64/native/onnxruntime.dll ort-pkg/runtimes/win-x64/native/onnxruntime_providers_shared.dll ort-lib/
+          # Beside the executable, so Windows loads it before the older copy in System32.
+          cp dml-pkg/bin/x64-win/DirectML.dll ort-root/
+
       - name: Fetch ONNX Runtime
+        if: ${{ !matrix.directml }}
         run: |
           archive="${{ matrix.ort_archive }}-${ORT_VERSION}"
           curl -fsSL -o "ort.${{ matrix.ort_ext }}" \
@@ -154,7 +161,6 @@ jobs:
       # The app looks for the runtime in lib/ beside its executable and for voices in
       # models/ beside it, so each archive is laid out that way.
       - name: Package (Linux, Windows)
-        if: runner.os != 'macOS'
         run: |
           app="voice-changer-${{ matrix.name }}"
           mkdir -p "dist/${app}/lib" "dist/${app}/models"
@@ -162,6 +168,7 @@ jobs:
           if [ "$RUNNER_OS" = Windows ]; then binary="${binary}.exe"; fi
           cp "target/${{ matrix.target }}/release/${binary}" "dist/${app}/"
           cp ort-lib/* "dist/${app}/lib/"
+          if [ -d ort-root ]; then cp ort-root/* "dist/${app}/"; fi
           cp README.md "dist/${app}/"
           cp ../LICENSE "dist/${app}/"
           cp examples/model.json "dist/${app}/models/example-model.json.txt"
@@ -171,35 +178,6 @@ jobs:
           else
             zip -r "${app}.zip" "${app}" >/dev/null
           fi
-
-      - name: Package (macOS app bundle)
-        if: runner.os == 'macOS'
-        run: |
-          app="voice-changer-${{ matrix.name }}"
-          bundle="dist/Voice Changer.app"
-          mkdir -p "${bundle}/Contents/MacOS/lib" "${bundle}/Contents/MacOS/models"
-          cp "target/${{ matrix.target }}/release/voice-changer-native" "${bundle}/Contents/MacOS/"
-          cp ort-lib/* "${bundle}/Contents/MacOS/lib/"
-          # The plist carries the microphone usage description macOS requires.
-          cp platforms/macos/Info.plist "${bundle}/Contents/Info.plist"
-          mkdir -p "${bundle}/Contents/Resources"
-          cp ../release-packaging/native-rust/assets/icon.icns "${bundle}/Contents/Resources/icon.icns"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.version.outputs.version }}" "${bundle}/Contents/Info.plist"
-          # Ad-hoc signature only: the app is not notarized, so Gatekeeper still warns.
-          codesign --force --deep --sign - "${bundle}"
-          cd dist
-          ditto -c -k --keepParent "Voice Changer.app" "${app}.zip"
-
-      - name: Build macOS installer
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p dmg-root
-          ditto "dist/Voice Changer.app" "dmg-root/Voice Changer.app"
-          cp README.md ../LICENSE dmg-root/
-          ln -s /Applications dmg-root/Applications
-          hdiutil create -volname "Voice Changer" -srcfolder dmg-root \
-            -ov -format UDZO "dist/voice-changer-${{ matrix.name }}.dmg"
-          hdiutil verify "dist/voice-changer-${{ matrix.name }}.dmg"
 
       - name: Build Linux installers
         if: runner.os == 'Linux'
@@ -232,6 +210,7 @@ jobs:
           if ($setup.ExitCode -ne 0) { throw 'Installer failed' }
           $expected = @('voice-changer-native.exe', 'lib\onnxruntime.dll', 'Uninstall.exe')
           if ('${{ matrix.cuda }}' -eq 'true') { $expected += 'lib\onnxruntime_providers_cuda.dll' }
+          if ('${{ matrix.directml }}' -eq 'true') { $expected += 'DirectML.dll' }
           foreach ($file in $expected) {
             if (!(Test-Path (Join-Path $installDir $file))) { throw "Missing installed file: $file" }
           }
@@ -249,7 +228,6 @@ jobs:
           path: |
             native-rust/dist/*.zip
             native-rust/dist/*.exe
-            native-rust/dist/*.dmg
             native-rust/dist/*.deb
             native-rust/dist/*.rpm
           if-no-files-found: error
@@ -262,7 +240,7 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           shopt -s nullglob
-          archives=(dist/*.zip dist/*.exe dist/*.dmg dist/*.deb dist/*.rpm)
+          archives=(dist/*.zip dist/*.exe dist/*.deb dist/*.rpm)
           if [ "${#archives[@]}" -eq 0 ]; then
             echo "No release archives found" >&2
             exit 1

@@ -44,8 +44,10 @@ pub fn ensure() -> Result<()> {
         has(format!("source_name={SOURCE}")),
     );
     if sink && source {
+        log::info!("Voice Changer Mic is ready (kept from before)");
         return Ok(());
     }
+    log::info!("Creating Voice Changer Output and Voice Changer Mic");
     // Half a pair is rebuilt whole, so the microphone always reads this sink.
     remove();
     load(&[
@@ -74,7 +76,11 @@ fn load(args: &[&str]) -> Result<()> {
 /// Removes both devices: when the option is turned off, or left over while it is off.
 pub fn remove() {
     if let Ok(list) = pactl(&["list", "short", "modules"]) {
-        for id in removal_order(&list) {
+        let ids = removal_order(&list);
+        if !ids.is_empty() {
+            log::info!("Removing Voice Changer Mic");
+        }
+        for id in ids {
             let _ = pactl(&["unload-module", &id.to_string()]);
         }
     }
@@ -161,6 +167,7 @@ pub fn ensure_routed() -> Result<usize> {
     let streams = voice_streams(&pactl(&["list", "sink-inputs"])?);
     for (index, on) in &streams {
         if *on != sink {
+            log::warn!("The voice stream left Voice Changer Mic; moving it back");
             pactl(&["move-sink-input", &index.to_string(), SINK])?;
         }
     }
@@ -223,12 +230,14 @@ pub fn keep_mic_on_sink() -> Result<()> {
         if source == u32::MAX || Some(source) == monitor_index {
             continue;
         }
+        log::warn!("Voice Changer Mic was connected to another source; moving it back");
         let moved = match monitor_index {
             Some(_) => pactl(&["move-source-output", &index.to_string(), &monitor]).map(drop),
             None => Err(anyhow::anyhow!("Voice Changer Output is missing")),
         };
         if let Err(error) = moved {
             // Last resort: a silent microphone rather than the real voice.
+            log::error!("Could not move Voice Changer Mic back ({error:#}); muting it");
             let _ = pactl(&["set-source-mute", SOURCE, "1"]);
             MUTED.store(true, Ordering::Release);
             result = Err(error
