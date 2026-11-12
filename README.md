@@ -43,12 +43,12 @@ Prebuilt archives for each tagged version are on the [Releases](https://github.c
 | Windows x64, NVIDIA | `voice-changer-windows-x64-cuda-setup.exe` (or `.zip`) | CUDA: fastest on NVIDIA; needs CUDA 12 and cuDNN 9 |
 | Linux x64 | `voice-changer-linux-x64.deb` / `.rpm` (or `.zip`) | CPU; CUDA with a GPU build of ONNX Runtime |
 
-Each download bundles ONNX Runtime 1.22 and the shared ContentVec and RMVPE models (about 740 MB) in `models/shared/`, and the CPU always works. Voice models are not included.
+Each download bundles ONNX Runtime 1.22, and the CPU always works. Voice models are not included.
 
 ## Quick start
 
 1. Install it (or extract the ZIP and run `voice-changer-native`).
-2. Add a voice: press **Import model** (or an empty **+** card), pick the RVC `.pth`, and pick its `.index` if it has one; the index beside the `.pth` is filled in for you. Dropping the files on the window does the same. This uses `models/shared/contentvec.onnx` and `models/shared/rmvpe.onnx`, which come with every download; a source build needs them from [contentvec-f.onnx](https://huggingface.co/wok000/weights_gpl/resolve/main/content-vec/contentvec-f.onnx) and [rmvpe_20231006.onnx](https://huggingface.co/wok000/weights_gpl/resolve/main/rmvpe/rmvpe_20231006.onnx), renamed.
+2. Add a voice: press **Import model** (or an empty **+** card), pick the RVC `.pth`, and pick its `.index` if it has one; the index beside the `.pth` is filled in for you. Dropping the files on the window does the same. On first start the app offers to download the two shared models every voice needs (ContentVec and RMVPE, about 706 MB) into `models/shared/`; **Settings → Processing** has the same button.
 3. Put on headphones, pick the voice, and press **Start**.
 
 To send the converted voice to another app such as Discord or OBS: on Linux, turn on **Settings → Virtual microphone** and pick "Voice Changer Mic" in that app; on Windows, choose a virtual audio cable as the output. Turn on **Monitor** to hear yourself on headphones at the same time.

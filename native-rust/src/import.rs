@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 /// Imports `source` into the models folder and returns the new manifest's path.
 pub fn import_voice(source: &Path) -> Result<PathBuf> {
     let root = runtime::models_root().context(
-        "No models folder with shared/contentvec.onnx and shared/rmvpe.onnx was found; add those two files first",
+        "The voice engine (shared/contentvec.onnx and shared/rmvpe.onnx) is not set up yet; download it in Settings under Processing",
     )?;
     import_into(&root, source)
 }
@@ -15,7 +15,7 @@ pub fn import_voice(source: &Path) -> Result<PathBuf> {
 /// Imports a downloaded `.zip` (or `.pth`) as a voice called `name`.
 pub fn import_download(source: &Path, name: &str) -> Result<PathBuf> {
     let root = runtime::models_root().context(
-        "No models folder with shared/contentvec.onnx and shared/rmvpe.onnx was found; add those two files first",
+        "The voice engine (shared/contentvec.onnx and shared/rmvpe.onnx) is not set up yet; download it in Settings under Processing",
     )?;
     import_named(&root, source, Some(name))
 }
@@ -23,7 +23,7 @@ pub fn import_download(source: &Path, name: &str) -> Result<PathBuf> {
 /// Imports a checkpoint with an index the user chose themselves, or with none.
 pub fn import_pair(checkpoint: &Path, index: Option<&Path>) -> Result<PathBuf> {
     let root = runtime::models_root().context(
-        "No models folder with shared/contentvec.onnx and shared/rmvpe.onnx was found; add those two files first",
+        "The voice engine (shared/contentvec.onnx and shared/rmvpe.onnx) is not set up yet; download it in Settings under Processing",
     )?;
     import_pair_into(&root, checkpoint, index)
 }

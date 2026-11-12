@@ -26,6 +26,8 @@ pub mod retrieval;
 pub mod runtime;
 #[cfg(any(feature = "onnx", feature = "onnx-static"))]
 pub mod rvc;
+#[cfg(feature = "catalog")]
+pub mod setup;
 #[cfg(all(feature = "audio", target_os = "linux"))]
 pub mod virtual_mic;
 pub mod wav;

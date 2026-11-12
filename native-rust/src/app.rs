@@ -10,6 +10,8 @@ use std::{path::PathBuf, sync::mpsc};
 
 #[cfg(feature = "catalog")]
 mod browse;
+#[cfg(feature = "catalog")]
+mod setup;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct ModelSlot {
@@ -76,6 +78,9 @@ pub struct VoiceApp {
     import_dialog: bool,
     #[cfg(feature = "catalog")]
     browse: browse::Browse,
+    /// Downloads the shared models on first start.
+    #[cfg(feature = "catalog")]
+    setup: setup::Setup,
     import_checkpoint: String,
     import_index: String,
     file_output: String,
@@ -151,6 +156,8 @@ impl VoiceApp {
             import_dialog: false,
             #[cfg(feature = "catalog")]
             browse: Default::default(),
+            #[cfg(feature = "catalog")]
+            setup: setup::Setup::on_start(),
             import_checkpoint: String::new(),
             import_index: String::new(),
             file_output: String::new(),
@@ -360,6 +367,10 @@ impl VoiceApp {
         self.edit_model = true;
     }
     fn import_model(&mut self) {
+        #[cfg(feature = "catalog")]
+        if !self.shared_models_ready() {
+            return;
+        }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             self.import_dialog = true;
@@ -1213,6 +1224,8 @@ impl VoiceApp {
             } else {
                 "Only the CPU is available with this ONNX Runtime. On Windows, the standard download includes DirectML for any GPU."
             }));
+            #[cfg(feature = "catalog")]
+            self.setup_status(ui);
         });
         ui.add_space(4.0);
         m3::card().show(ui, |ui| {
@@ -1796,6 +1809,10 @@ impl eframe::App for VoiceApp {
         #[cfg(feature = "catalog")]
         if self.browse.open {
             self.browse_dialog(ctx);
+        }
+        #[cfg(feature = "catalog")]
+        if self.setup.open {
+            self.setup_dialog(ctx);
         }
         if self.running() || self.work.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));

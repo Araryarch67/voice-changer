@@ -57,6 +57,7 @@ Section "Uninstall"
   Delete "$INSTDIR\README.md"
   Delete "$INSTDIR\LICENSE"
   Delete "$INSTDIR\models\example-model.json.txt"
+  ; The shared models the app downloaded on first start.
   Delete "$INSTDIR\models\shared\contentvec.onnx"
   Delete "$INSTDIR\models\shared\rmvpe.onnx"
   RMDir "$INSTDIR\models\shared"

@@ -47,7 +47,7 @@ pub struct Page {
     pub has_more: bool,
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .user_agent(USER_AGENT)
         .timeout_connect(std::time::Duration::from_secs(15))

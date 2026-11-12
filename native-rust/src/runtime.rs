@@ -29,17 +29,9 @@ pub fn model_directories() -> Vec<PathBuf> {
 }
 
 /// The models folder that holds the shared embedder and pitch models; imported voices
-/// are created beside them. The working directory's folders come first: the Linux
-/// packages run from a writable data folder that links to the read-only shared models
-/// beside the executable.
+/// are created beside them.
 pub fn models_root() -> Option<PathBuf> {
-    let beside_exe = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|parent| parent.join("models")));
-    let mut directories = model_directories();
-    directories.retain(|directory| Some(directory) != beside_exe.as_ref());
-    directories.extend(beside_exe);
-    directories.into_iter().find(|directory| {
+    model_directories().into_iter().find(|directory| {
         directory.join("shared/contentvec.onnx").is_file()
             && directory.join("shared/rmvpe.onnx").is_file()
     })

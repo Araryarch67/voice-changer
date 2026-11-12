@@ -32,6 +32,7 @@ impl VoiceApp {
             )
             .on_hover_text("Search voice-models.com and add a voice in one step")
             .clicked()
+            && self.shared_models_ready()
         {
             self.browse.open = true;
         }
@@ -81,7 +82,7 @@ impl VoiceApp {
         let title = name.clone();
         self.begin_work(move || {
             let root = crate::runtime::models_root().ok_or_else(|| {
-                anyhow::anyhow!("No models folder with shared/contentvec.onnx and shared/rmvpe.onnx was found; add those two files first")
+                anyhow::anyhow!("The voice engine (shared/contentvec.onnx and shared/rmvpe.onnx) is not set up yet; download it in Settings under Processing")
             })?;
             let folder = root.join(".downloads");
             let url = catalog::resolve(&link)?;
