@@ -39,7 +39,12 @@ fn main() -> eframe::Result {
                 }
             }
             self.frames += 1;
-            if self.frames == 40 {
+            // CAPTURE_FRAMES waits longer, e.g. for an online search to come back.
+            let wait = std::env::var("CAPTURE_FRAMES")
+                .ok()
+                .and_then(|frames| frames.parse().ok())
+                .unwrap_or(40);
+            if self.frames == wait {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
             }
             ctx.request_repaint();

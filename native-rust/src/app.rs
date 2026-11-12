@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 use std::{path::PathBuf, sync::mpsc};
 
+#[cfg(feature = "catalog")]
+mod browse;
+
 #[derive(Clone, Serialize, Deserialize)]
 struct ModelSlot {
     name: String,
@@ -71,6 +74,8 @@ pub struct VoiceApp {
     file_dialog: bool,
     file_input: String,
     import_dialog: bool,
+    #[cfg(feature = "catalog")]
+    browse: browse::Browse,
     import_checkpoint: String,
     import_index: String,
     file_output: String,
@@ -144,6 +149,8 @@ impl VoiceApp {
             file_dialog: false,
             file_input: String::new(),
             import_dialog: false,
+            #[cfg(feature = "catalog")]
+            browse: Default::default(),
             import_checkpoint: String::new(),
             import_index: String::new(),
             file_output: String::new(),
@@ -553,7 +560,7 @@ impl VoiceApp {
         header(
             ui,
             "Voices",
-            "Pick a voice, then press Start. Import an RVC .pth (and its .index), or drop them on the window.",
+            "Pick a voice, then press Start. Import an RVC .pth (and its .index), drop them on the window, or find one online.",
         );
         let total = ui.available_width();
         let side = 320.0;
@@ -635,6 +642,8 @@ impl VoiceApp {
             {
                 self.import_model();
             }
+            #[cfg(feature = "catalog")]
+            self.browse_button(ui);
             if actions {
                 self.test_button(ui);
                 self.edit_button(ui);
@@ -1658,6 +1667,10 @@ impl eframe::App for VoiceApp {
         });
         if let Some(result) = completed {
             self.work = None;
+            #[cfg(feature = "catalog")]
+            {
+                self.browse.download = None;
+            }
             match result {
                 Ok(message) => {
                     // An import leaves a new voice folder behind; select it.
@@ -1779,6 +1792,10 @@ impl eframe::App for VoiceApp {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if self.import_dialog {
             self.import_dialog(ctx);
+        }
+        #[cfg(feature = "catalog")]
+        if self.browse.open {
+            self.browse_dialog(ctx);
         }
         if self.running() || self.work.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));

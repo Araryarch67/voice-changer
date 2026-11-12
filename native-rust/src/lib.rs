@@ -3,6 +3,8 @@ pub mod app;
 #[cfg(feature = "audio")]
 pub mod audio;
 pub mod benchmark;
+#[cfg(feature = "catalog")]
+pub mod catalog;
 pub mod config;
 pub mod denoise;
 pub mod dsp;

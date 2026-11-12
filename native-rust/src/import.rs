@@ -12,6 +12,14 @@ pub fn import_voice(source: &Path) -> Result<PathBuf> {
     import_into(&root, source)
 }
 
+/// Imports a downloaded `.zip` (or `.pth`) as a voice called `name`.
+pub fn import_download(source: &Path, name: &str) -> Result<PathBuf> {
+    let root = runtime::models_root().context(
+        "No models folder with shared/contentvec.onnx and shared/rmvpe.onnx was found; add those two files first",
+    )?;
+    import_named(&root, source, Some(name))
+}
+
 /// Imports a checkpoint with an index the user chose themselves, or with none.
 pub fn import_pair(checkpoint: &Path, index: Option<&Path>) -> Result<PathBuf> {
     let root = runtime::models_root().context(
@@ -42,10 +50,14 @@ fn import_pair_into(root: &Path, checkpoint: &Path, index: Option<&Path>) -> Res
             index.display()
         );
     }
-    import_checkpoint(root, checkpoint, index, false)
+    import_checkpoint(root, checkpoint, index, false, None)
 }
 
 fn import_into(root: &Path, source: &Path) -> Result<PathBuf> {
+    import_named(root, source, None)
+}
+
+fn import_named(root: &Path, source: &Path, name: Option<&str>) -> Result<PathBuf> {
     let extension = source
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
@@ -53,13 +65,22 @@ fn import_into(root: &Path, source: &Path) -> Result<PathBuf> {
     match extension.as_str() {
         "pth" => {
             let index = source.parent().and_then(find_index);
-            import_checkpoint(root, source, index.as_deref(), false)
+            import_checkpoint(root, source, index.as_deref(), false, name)
         }
         "zip" => {
             let unpacked = root.join(format!(".import-{}", std::process::id()));
             let result = unpack(source, &unpacked).and_then(|checkpoint| {
                 let index = find_index(&unpacked);
-                import_checkpoint(root, &checkpoint, index.as_deref(), true)
+                log::info!(
+                    "Archive holds {}{}",
+                    checkpoint.file_name().unwrap_or_default().to_string_lossy(),
+                    index
+                        .as_deref()
+                        .and_then(Path::file_name)
+                        .map(|index| format!(" and {}", index.to_string_lossy()))
+                        .unwrap_or_else(|| ", no index".into())
+                );
+                import_checkpoint(root, &checkpoint, index.as_deref(), true, name)
             });
             let _ = std::fs::remove_dir_all(&unpacked);
             result
@@ -99,6 +120,7 @@ fn unpack(archive: &Path, target: &Path) -> Result<PathBuf> {
     let mut zip = zip::ZipArchive::new(file).context("Read zip archive")?;
     std::fs::create_dir_all(target)?;
     let mut checkpoints = Vec::new();
+    let (mut audio, mut training_states, mut nested) = (0, 0, 0);
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
         let Some(name) = entry.enclosed_name().and_then(|path| {
@@ -110,6 +132,21 @@ fn unpack(archive: &Path, target: &Path) -> Result<PathBuf> {
         let lower = name.to_lowercase();
         // G_*/D_* are training states, not voices.
         let training = lower.starts_with("g_") || lower.starts_with("d_");
+        if [".wav", ".mp3", ".flac", ".ogg", ".m4a"]
+            .iter()
+            .any(|kind| lower.ends_with(kind))
+        {
+            audio += 1;
+        }
+        if training && lower.ends_with(".pth") {
+            training_states += 1;
+        }
+        if [".zip", ".7z", ".rar"]
+            .iter()
+            .any(|kind| lower.ends_with(kind))
+        {
+            nested += 1;
+        }
         if entry.is_dir() || !(lower.ends_with(".index") || lower.ends_with(".pth") && !training) {
             continue;
         }
@@ -120,13 +157,21 @@ fn unpack(archive: &Path, target: &Path) -> Result<PathBuf> {
             checkpoints.push(path);
         }
     }
-    checkpoints.sort();
-    match checkpoints.len() {
-        0 => bail!("The archive contains no RVC .pth checkpoint"),
-        1 => Ok(checkpoints.remove(0)),
-        count => bail!(
-            "The archive contains {count} checkpoints; extract it and import the one you want"
+    // Some archives carry extra small checkpoints; the voice is the largest one.
+    checkpoints.sort_by_key(|path| std::fs::metadata(path).map_or(0, |m| m.len()));
+    match checkpoints.pop() {
+        Some(checkpoint) => Ok(checkpoint),
+        // Say what is there instead, so a broken upload is not mistaken for a bug.
+        None if training_states > 0 => bail!(
+            "The archive contains no RVC .pth checkpoint, only training states (G_/D_ files) that are not a finished voice"
         ),
+        None if nested > 0 => bail!(
+            "The archive contains no RVC .pth checkpoint, only another archive inside; extract it and import the .pth"
+        ),
+        None if audio > 0 => bail!(
+            "The archive contains no RVC .pth checkpoint, only {audio} audio files (probably the uploader's training recordings, not a voice)"
+        ),
+        None => bail!("The archive contains no RVC .pth checkpoint"),
     }
 }
 
@@ -135,11 +180,16 @@ fn import_checkpoint(
     checkpoint: &Path,
     index: Option<&Path>,
     take_index: bool,
+    name: Option<&str>,
 ) -> Result<PathBuf> {
-    let stem = checkpoint
+    let file_stem = checkpoint
         .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
+        .map(|s| s.to_string_lossy().replace(['_', '-'], " "))
         .unwrap_or_default();
+    let stem = name
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map_or(file_stem, str::to_owned);
     let slug: String = stem
         .chars()
         .map(|c| {
@@ -150,7 +200,13 @@ fn import_checkpoint(
             }
         })
         .collect();
-    let slug = slug.trim_matches('-');
+    // One dash between words, however many symbols separated them.
+    let slug = slug
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let slug = slug.as_str();
     let slug = if slug.is_empty() { "voice" } else { slug };
     let folder = (1..)
         .map(|n| {
@@ -191,7 +247,7 @@ fn build(
         None => None,
     };
     let manifest = ModelManifest {
-        name: stem.replace(['_', '-'], " "),
+        name: stem.to_owned(),
         model: "voice-realtime.onnx".into(),
         embedder: "../shared/contentvec.onnx".into(),
         pitch: "../shared/rmvpe.onnx".into(),
@@ -266,6 +322,7 @@ mod tests {
         zip.finish().unwrap();
         let error = import_into(&root, &archive).unwrap_err().to_string();
         assert!(error.contains("no RVC .pth"), "{error}");
+        assert!(error.contains("training states"), "{error}");
         // Nothing is left behind.
         let left: Vec<_> = std::fs::read_dir(&root)
             .unwrap()

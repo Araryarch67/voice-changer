@@ -1,6 +1,6 @@
 [package]
 name = "voice-changer-native"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license = "MIT"
 description = "Native Rust and egui real-time RVC voice changer"
@@ -9,7 +9,7 @@ description = "Native Rust and egui real-time RVC voice changer"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [features]
-default = ["gui", "audio", "onnx", "export", "world"]
+default = ["gui", "audio", "onnx", "export", "world", "catalog"]
 # Harvest and DIO pitch detection through the WORLD vocoder (C++, built with cc).
 world = ["dep:rsworld", "dep:rsworld-sys"]
 export = ["dep:zip"]
@@ -18,6 +18,8 @@ audio = ["dep:cpal", "dep:crossbeam-queue"]
 onnx = ["dep:ort", "ort/load-dynamic", "ort/cuda"]
 onnx-static = ["dep:ort"]
 android = ["gui", "audio", "eframe/android-native-activity"]
+# Search and download voices from voice-models.com.
+catalog = ["dep:ureq", "export"]
 
 [dependencies]
 anyhow = "1"
@@ -38,6 +40,7 @@ rsworld-sys = { version = "0.1", optional = true }
 aec3 = "0.4"
 log = "0.4"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+ureq = { version = "2", optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }
