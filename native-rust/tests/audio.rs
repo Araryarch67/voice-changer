@@ -19,6 +19,8 @@ fn audio_worker_starts_processes_and_stops_with_null_devices() {
         manifest: None,
         settings: Settings::default(),
         record_dir: record_dir.clone(),
+        virtual_mic: false,
+        monitor: None,
     })
     .unwrap();
     let start = Instant::now();

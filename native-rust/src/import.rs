@@ -12,6 +12,39 @@ pub fn import_voice(source: &Path) -> Result<PathBuf> {
     import_into(&root, source)
 }
 
+/// Imports a checkpoint with an index the user chose themselves, or with none.
+pub fn import_pair(checkpoint: &Path, index: Option<&Path>) -> Result<PathBuf> {
+    let root = runtime::models_root().context(
+        "No models folder with shared/contentvec.onnx and shared/rmvpe.onnx was found; add those two files first",
+    )?;
+    import_pair_into(&root, checkpoint, index)
+}
+
+fn import_pair_into(root: &Path, checkpoint: &Path, index: Option<&Path>) -> Result<PathBuf> {
+    let has = |path: &Path, wanted: &str| {
+        path.extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case(wanted))
+    };
+    anyhow::ensure!(
+        has(checkpoint, "pth"),
+        "The model must be an RVC .pth checkpoint"
+    );
+    anyhow::ensure!(
+        checkpoint.is_file(),
+        "The checkpoint does not exist: {}",
+        checkpoint.display()
+    );
+    if let Some(index) = index {
+        anyhow::ensure!(has(index, "index"), "The index must be a .index file");
+        anyhow::ensure!(
+            index.is_file(),
+            "The index does not exist: {}",
+            index.display()
+        );
+    }
+    import_checkpoint(root, checkpoint, index, false)
+}
+
 fn import_into(root: &Path, source: &Path) -> Result<PathBuf> {
     let extension = source
         .extension()
@@ -39,7 +72,7 @@ fn import_into(root: &Path, source: &Path) -> Result<PathBuf> {
 
 /// The training index beside a checkpoint: the `added_*.index` file if there is one,
 /// otherwise the only `.index` file.
-fn find_index(directory: &Path) -> Option<PathBuf> {
+pub fn find_index(directory: &Path) -> Option<PathBuf> {
     let mut indexes: Vec<PathBuf> = std::fs::read_dir(directory)
         .ok()?
         .flatten()
@@ -213,6 +246,17 @@ mod tests {
         let root = std::env::temp_dir().join(format!("vc-import-reject-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         assert!(import_into(&root, Path::new("voice.wav")).is_err());
+        let error = import_pair_into(&root, Path::new("voice.index"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(".pth"), "{error}");
+        let checkpoint = root.join("voice.pth");
+        std::fs::write(&checkpoint, b"").unwrap();
+        let error = import_pair_into(&root, &checkpoint, Some(&root.join("voice.txt")))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(".index"), "{error}");
+        std::fs::remove_file(&checkpoint).unwrap();
         let archive = root.join("empty.zip");
         let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
         zip.start_file("readme.txt", zip::write::SimpleFileOptions::default())

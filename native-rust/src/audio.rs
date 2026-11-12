@@ -57,6 +57,8 @@ pub struct Metrics {
     pub dropped_output: AtomicU64,
     pub underrun_samples: AtomicU64,
     pub stream_error: AtomicBool,
+    /// The monitor device failed; the main output keeps going.
+    pub monitor_error: AtomicBool,
     pub error: Mutex<Option<String>>,
     /// Set by the UI; the worker opens and closes the WAV pair to match.
     pub recording: AtomicBool,
@@ -71,6 +73,12 @@ pub struct AudioOptions {
     pub settings: Settings,
     /// Folder for REC files.
     pub record_dir: PathBuf,
+    /// Send the converted voice to the built-in virtual microphone (Linux) instead of
+    /// `output`.
+    pub virtual_mic: bool,
+    /// A second output that plays the converted voice, to hear yourself:
+    /// `Some(None)` is the system default device.
+    pub monitor: Option<Option<String>>,
 }
 pub struct AudioSession {
     pub metrics: Arc<Metrics>,
@@ -204,6 +212,76 @@ fn select_device(host: &cpal::Host, id: &Option<String>, input: bool) -> Result<
     .context("No default audio device available")
 }
 
+/// Opens a playback stream under its own name (Linux), so the sound server routes the
+/// voice and the monitor separately; the voice targets the virtual microphone from
+/// the start when that is on.
+fn named_output(
+    stream: OutputRole,
+    device: &cpal::Device,
+    config: cpal::SupportedStreamConfig,
+    queue: Arc<ArrayQueue<f32>>,
+    metrics: &Arc<Metrics>,
+) -> Result<cpal::Stream> {
+    let monitor = matches!(stream, OutputRole::Monitor);
+    let open = || open_output(device, config, queue, metrics, monitor);
+    #[cfg(target_os = "linux")]
+    {
+        use crate::virtual_mic::{open_stream, Stream};
+        open_stream(
+            match stream {
+                OutputRole::Voice { virtual_mic } => Stream::Output(virtual_mic),
+                OutputRole::Monitor => Stream::Monitor,
+            },
+            open,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    open()
+}
+
+#[derive(Clone, Copy)]
+enum OutputRole {
+    Voice { virtual_mic: bool },
+    Monitor,
+}
+
+/// Waits for the voice stream to reach the virtual microphone, then keeps it there
+/// until the session ends.
+fn route_to_virtual_mic(stop: Arc<AtomicBool>) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::virtual_mic::ensure_routed;
+        let mut found = false;
+        for _ in 0..40 {
+            if ensure_routed()? > 0 {
+                found = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        anyhow::ensure!(
+            found,
+            "The voice could not be sent to Voice Changer Mic; PipeWire or PulseAudio must be the default output"
+        );
+        thread::Builder::new()
+            .name("virtual-mic-route".into())
+            .spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_secs(2));
+                    if !stop.load(Ordering::Acquire) {
+                        let _ = ensure_routed();
+                    }
+                }
+            })?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = stop;
+        bail!("The built-in virtual microphone is only available on Linux")
+    }
+}
+
 fn run(
     options: AudioOptions,
     updates: mpsc::Receiver<Settings>,
@@ -226,7 +304,14 @@ fn run(
     let mut engine = Engine::new(converter);
     let host = cpal::default_host();
     let input_device = select_device(&host, &options.input, true)?;
-    let output_device = select_device(&host, &options.output, false)?;
+    // The virtual microphone is fed through the sound server, which the default
+    // device reaches; the stream is moved to it once playing.
+    let output_choice = if options.virtual_mic {
+        None
+    } else {
+        options.output.clone()
+    };
+    let output_device = select_device(&host, &output_choice, false)?;
     let input_config = input_device.default_input_config()?;
     let output_config = output_device.default_output_config()?;
     let input_rate = input_config.sample_rate();
@@ -263,33 +348,25 @@ fn run(
         )?,
         format => bail!("Unsupported input sample format: {format:?}"),
     };
-    let output_stream = match output_config.sample_format() {
-        SampleFormat::F32 => output_stream::<f32>(
-            &output_device,
-            &output_config.into(),
-            output.clone(),
-            metrics.clone(),
-        )?,
-        SampleFormat::I16 => output_stream::<i16>(
-            &output_device,
-            &output_config.into(),
-            output.clone(),
-            metrics.clone(),
-        )?,
-        SampleFormat::I32 => output_stream::<i32>(
-            &output_device,
-            &output_config.into(),
-            output.clone(),
-            metrics.clone(),
-        )?,
-        SampleFormat::U16 => output_stream::<u16>(
-            &output_device,
-            &output_config.into(),
-            output.clone(),
-            metrics.clone(),
-        )?,
-        format => bail!("Unsupported output sample format: {format:?}"),
-    };
+    let output_stream = named_output(
+        OutputRole::Voice {
+            virtual_mic: options.virtual_mic,
+        },
+        &output_device,
+        output_config,
+        output.clone(),
+        &metrics,
+    )?;
+    let mut monitor: Option<Monitor> = None;
+    // Ends the virtual microphone's route keeper with the session.
+    let routing = Arc::new(AtomicBool::new(false));
+    struct EndRouting(Arc<AtomicBool>);
+    impl Drop for EndRouting {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let _end_routing = EndRouting(routing.clone());
     let mut settings = options.settings;
     let block_size = input_rate as usize * settings.block_ms as usize / 1000;
     let mut pending = Vec::with_capacity(block_size);
@@ -369,6 +446,9 @@ fn run(
                 *metrics.recorded.lock().unwrap() = Some(format!("Recording failed: {error:#}"));
             }
         }
+        if let Some(monitor) = &mut monitor {
+            monitor.push(&processed);
+        }
         let processed = rate_converter.push(&processed);
         let max_queued = (output_rate as usize * settings.block_ms as usize / 1000) * 3;
         while output.len() > max_queued {
@@ -391,6 +471,16 @@ fn run(
         if !output_started {
             output_stream.play()?;
             output_started = true;
+            if options.virtual_mic {
+                route_to_virtual_mic(routing.clone())?;
+            }
+            if let Some(device) = &options.monitor {
+                monitor = Some(Monitor::open(&host, device, input_rate, &metrics)?);
+            }
+        }
+        if metrics.monitor_error.swap(false, Ordering::Relaxed) && monitor.take().is_some() {
+            *metrics.recorded.lock().unwrap() =
+                Some("The monitor device stopped; the voice still goes to the output.".into());
         }
         metrics
             .queued_samples
@@ -443,11 +533,33 @@ where
         None,
     )?)
 }
+/// Builds an output stream in the device's own sample format. A monitor stream does not
+/// count underruns, and its failure only stops the monitor.
+fn open_output(
+    device: &cpal::Device,
+    config: cpal::SupportedStreamConfig,
+    queue: Arc<ArrayQueue<f32>>,
+    metrics: &Arc<Metrics>,
+    monitor: bool,
+) -> Result<cpal::Stream> {
+    let format = config.sample_format();
+    let config = config.into();
+    let metrics = metrics.clone();
+    match format {
+        SampleFormat::F32 => output_stream::<f32>(device, &config, queue, metrics, monitor),
+        SampleFormat::I16 => output_stream::<i16>(device, &config, queue, metrics, monitor),
+        SampleFormat::I32 => output_stream::<i32>(device, &config, queue, metrics, monitor),
+        SampleFormat::U16 => output_stream::<u16>(device, &config, queue, metrics, monitor),
+        format => bail!("Unsupported output sample format: {format:?}"),
+    }
+}
+
 fn output_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     queue: Arc<ArrayQueue<f32>>,
     metrics: Arc<Metrics>,
+    monitor: bool,
 ) -> Result<cpal::Stream>
 where
     T: SizedSample + FromSample<f32>,
@@ -459,15 +571,71 @@ where
         move |samples: &mut [T], _| {
             for frame in samples.chunks_exact_mut(channels) {
                 let sample = queue.pop().unwrap_or_else(|| {
-                    metrics.underrun_samples.fetch_add(1, Ordering::Relaxed);
+                    if !monitor {
+                        metrics.underrun_samples.fetch_add(1, Ordering::Relaxed);
+                    }
                     0.0
                 });
                 frame.fill(T::from_sample(sample.clamp(-1.0, 1.0)));
             }
         },
         move |_| {
-            errors.stream_error.store(true, Ordering::Relaxed);
+            let flag = if monitor {
+                &errors.monitor_error
+            } else {
+                &errors.stream_error
+            };
+            flag.store(true, Ordering::Relaxed);
         },
         None,
     )?)
+}
+
+/// The second output for hearing the converted voice.
+struct Monitor {
+    stream: cpal::Stream,
+    queue: Arc<ArrayQueue<f32>>,
+    resampler: StreamResampler,
+    rate: u32,
+    started: bool,
+}
+impl Monitor {
+    fn open(
+        host: &cpal::Host,
+        device: &Option<String>,
+        input_rate: u32,
+        metrics: &Arc<Metrics>,
+    ) -> Result<Self> {
+        let device = select_device(host, device, false).context("Monitor device")?;
+        let config = device.default_output_config()?;
+        let rate = config.sample_rate();
+        let queue = Arc::new(ArrayQueue::new(rate as usize * 2));
+        let stream = named_output(OutputRole::Monitor, &device, config, queue.clone(), metrics)?;
+        stream.play()?;
+        Ok(Self {
+            stream,
+            queue,
+            resampler: StreamResampler::new(input_rate, rate),
+            rate,
+            started: false,
+        })
+    }
+    fn push(&mut self, processed: &[f32]) {
+        let _ = &self.stream;
+        if !self.started {
+            // The same lead silence as the main output.
+            for _ in 0..self.rate as usize / 40 {
+                let _ = self.queue.push(0.0);
+            }
+            self.started = true;
+        }
+        // Keep the monitor close to live; drop the oldest audio if it falls behind.
+        let limit = self.rate as usize / 2;
+        for sample in self.resampler.push(processed) {
+            while self.queue.len() > limit {
+                self.queue.pop();
+            }
+            let _ = self.queue.push(sample);
+        }
+    }
 }

@@ -12,6 +12,9 @@ mkdir -p "$stage/opt/voice-changer" "$stage/usr/bin" "$stage/usr/share/applicati
 cp -a "$payload/." "$stage/opt/voice-changer/"
 install -m 755 "$scripts_dir/voice-changer" "$stage/usr/bin/voice-changer"
 install -m 644 "$scripts_dir/voice-changer.desktop" "$stage/usr/share/applications/voice-changer.desktop"
+# Icons named after the desktop entry, which matches the window's app id.
+mkdir -p "$stage/usr/share/icons"
+cp -r "$scripts_dir/../../assets/hicolor" "$stage/usr/share/icons/"
 
 common=(
   -s dir -n voice-changer -v "$version" --iteration 1

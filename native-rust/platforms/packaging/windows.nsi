@@ -8,6 +8,10 @@ InstallDir "$LOCALAPPDATA\Programs\Voice Changer"
 InstallDirRegKey HKCU "Software\VoiceChanger" "InstallDir"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
+!ifdef ICON
+  !define MUI_ICON "${ICON}"
+  !define MUI_UNICON "${ICON}"
+!endif
 VIProductVersion "${VERSION}.0"
 VIAddVersionKey /LANG=1033 "ProductName" "Voice Changer"
 VIAddVersionKey /LANG=1033 "FileDescription" "Voice Changer installer"
@@ -31,6 +35,7 @@ Section "Voice Changer"
   WriteRegStr HKCU "Software\VoiceChanger" "InstallDir" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoiceChanger" "DisplayName" "Voice Changer"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoiceChanger" "DisplayVersion" "${VERSION}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoiceChanger" "DisplayIcon" "$INSTDIR\voice-changer-native.exe"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoiceChanger" "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoiceChanger" "QuietUninstallString" '$\"$INSTDIR\Uninstall.exe$\" /S'
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoiceChanger" "InstallLocation" "$INSTDIR"
@@ -46,6 +51,7 @@ Section "Uninstall"
   Delete "$INSTDIR\voice-changer-native.exe"
   Delete "$INSTDIR\lib\onnxruntime.dll"
   Delete "$INSTDIR\lib\onnxruntime_providers_shared.dll"
+  Delete "$INSTDIR\lib\onnxruntime_providers_cuda.dll"
   RMDir "$INSTDIR\lib"
   Delete "$INSTDIR\README.md"
   Delete "$INSTDIR\LICENSE"

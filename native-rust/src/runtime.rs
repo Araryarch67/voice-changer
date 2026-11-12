@@ -125,7 +125,32 @@ pub fn initialize() -> Result<()> {
 /// Distribution builds of the CUDA provider (Arch's `onnxruntime-cuda`) do not link
 /// cuDNN themselves, so its symbols must already be visible process-wide when the
 /// provider library is opened. Does nothing where cuDNN is absent.
+/// On Windows the CUDA provider's dependencies are found through `PATH`, which the
+/// cuDNN 9 installer does not extend, so its folders (and `lib\` beside the app, for
+/// DLLs copied there) are added for this process.
 pub fn preload_gpu_libraries() {
+    // GPUs newer than the runtime's prebuilt kernels (RTX 50 with ONNX Runtime 1.22)
+    // compile them from PTX on first use. CUDA caches the result, but its default
+    // 256 MiB cache is too small for ONNX Runtime and would recompile every launch.
+    static CACHE: std::sync::Once = std::sync::Once::new();
+    CACHE.call_once(|| {
+        if std::env::var_os("CUDA_CACHE_MAXSIZE").is_none() {
+            std::env::set_var("CUDA_CACHE_MAXSIZE", "4294967296");
+        }
+    });
+    #[cfg(target_os = "windows")]
+    {
+        static ADDED: std::sync::Once = std::sync::Once::new();
+        ADDED.call_once(|| {
+            let mut folders = cuda_folders();
+            if let Some(path) = std::env::var_os("PATH") {
+                folders.extend(std::env::split_paths(&path));
+            }
+            if let Ok(joined) = std::env::join_paths(folders) {
+                std::env::set_var("PATH", joined);
+            }
+        });
+    }
     #[cfg(target_os = "linux")]
     {
         use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
@@ -142,6 +167,54 @@ pub fn preload_gpu_libraries() {
     }
 }
 
+/// Folders that hold the CUDA and cuDNN DLLs on Windows, newest cuDNN first.
+#[cfg(target_os = "windows")]
+fn cuda_folders() -> Vec<PathBuf> {
+    let mut folders = Vec::new();
+    if let Some(lib) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|parent| parent.join("lib")))
+    {
+        folders.push(lib);
+    }
+    let program_files = std::env::var_os("ProgramFiles")
+        .map_or_else(|| PathBuf::from(r"C:\Program Files"), PathBuf::from);
+    folders.extend(cudnn_folders(&program_files.join(r"NVIDIA\CUDNN")));
+    if let Some(cuda) = std::env::var_os("CUDA_PATH") {
+        folders.push(PathBuf::from(cuda).join("bin"));
+    }
+    folders
+}
+
+/// cuDNN 9 installs as `v9.x\bin\12.x\` (or `v9.x\bin\` in early releases).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn cudnn_folders(root: &std::path::Path) -> Vec<PathBuf> {
+    let children = |dir: &std::path::Path, prefix: &str| -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(prefix))
+            })
+            .collect();
+        found.sort();
+        found.reverse();
+        found
+    };
+    let mut folders = Vec::new();
+    for version in children(root, "v9") {
+        let bin = version.join("bin");
+        folders.extend(children(&bin, "12"));
+        folders.push(bin);
+    }
+    folders
+}
+
 /// Whether the loaded ONNX Runtime offers the CUDA execution provider. Checked once.
 pub fn gpu_available() -> bool {
     #[cfg(any(feature = "onnx", feature = "onnx-static"))]
@@ -151,6 +224,7 @@ pub fn gpu_available() -> bool {
         *AVAILABLE.get_or_init(|| {
             // ort load-dynamic can panic when its shared library cannot be located.
             std::panic::catch_unwind(|| {
+                preload_gpu_libraries();
                 initialize().is_ok()
                     && CUDAExecutionProvider::default()
                         .is_available()
@@ -162,5 +236,32 @@ pub fn gpu_available() -> bool {
     #[cfg(not(any(feature = "onnx", feature = "onnx-static")))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn finds_cudnn_folders_newest_first() {
+        let root = std::env::temp_dir().join(format!("vc-cudnn-{}", std::process::id()));
+        for folder in [
+            "v9.1/bin/12.8",
+            "v9.1/bin/11.8",
+            "v9.10/bin/12.9",
+            "v8.9/bin",
+        ] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        let found = super::cudnn_folders(&root);
+        assert_eq!(
+            found,
+            vec![
+                root.join("v9.10/bin/12.9"),
+                root.join("v9.10/bin"),
+                root.join("v9.1/bin/12.8"),
+                root.join("v9.1/bin"),
+            ]
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

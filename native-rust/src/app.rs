@@ -23,6 +23,11 @@ struct Saved {
     output: Option<String>,
     slots: Vec<ModelSlot>,
     selected: usize,
+    /// Built-in virtual microphone (Linux).
+    virtual_mic: bool,
+    /// Also play the converted voice on `monitor_device`, to hear yourself.
+    monitor: bool,
+    monitor_device: Option<String>,
 }
 impl Default for Saved {
     fn default() -> Self {
@@ -38,6 +43,9 @@ impl Default for Saved {
                 })
                 .collect(),
             selected: 0,
+            virtual_mic: false,
+            monitor: false,
+            monitor_device: None,
         }
     }
 }
@@ -62,6 +70,9 @@ pub struct VoiceApp {
     edit_model: bool,
     file_dialog: bool,
     file_input: String,
+    import_dialog: bool,
+    import_checkpoint: String,
+    import_index: String,
     file_output: String,
     work: Option<mpsc::Receiver<Result<String, String>>>,
     message: Option<String>,
@@ -71,14 +82,22 @@ pub struct VoiceApp {
     devices: Vec<AudioDevice>,
     #[cfg(feature = "audio")]
     session: Option<AudioSession>,
+    /// The "Voice Changer Mic" devices, while the option is on.
+    #[cfg(all(feature = "audio", target_os = "linux"))]
+    virtual_mic: Option<crate::virtual_mic::VirtualMic>,
 }
 impl VoiceApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         m3::install(&cc.egui_ctx);
-        let mut saved: Saved = cc
+        let stored: Option<Saved> = cc
             .storage
-            .and_then(|s| eframe::get_value(s, "voice-changer"))
-            .unwrap_or_default();
+            .and_then(|s| eframe::get_value(s, "voice-changer"));
+        let first_run = stored.is_none();
+        let mut saved = stored.unwrap_or_default();
+        // An NVIDIA runtime is used from the start; the choice is kept afterwards.
+        if first_run && crate::runtime::gpu_available() {
+            saved.settings.device = Device::Gpu;
+        }
         if saved.settings.validate().is_err() {
             saved.settings = Settings::default();
         }
@@ -104,6 +123,9 @@ impl VoiceApp {
             edit_model: false,
             file_dialog: false,
             file_input: String::new(),
+            import_dialog: false,
+            import_checkpoint: String::new(),
+            import_index: String::new(),
             file_output: String::new(),
             work: None,
             message: None,
@@ -112,9 +134,13 @@ impl VoiceApp {
             devices: Vec::new(),
             #[cfg(feature = "audio")]
             session: None,
+            #[cfg(all(feature = "audio", target_os = "linux"))]
+            virtual_mic: None,
         };
         #[cfg(feature = "audio")]
         app.refresh_devices();
+        #[cfg(all(feature = "audio", target_os = "linux"))]
+        app.sync_virtual_mic();
         app
     }
     #[cfg(feature = "audio")]
@@ -122,6 +148,27 @@ impl VoiceApp {
         match audio::devices() {
             Ok(d) => self.devices = d,
             Err(e) => self.error = Some(format!("{e:#}")),
+        }
+    }
+    /// Creates or removes the virtual microphone to match the saved option. A failure
+    /// turns the option off and says why.
+    #[cfg(all(feature = "audio", target_os = "linux"))]
+    fn sync_virtual_mic(&mut self) {
+        if !self.saved.virtual_mic {
+            if self.virtual_mic.take().is_none() {
+                // Devices a crashed run left behind would still catch the voice.
+                crate::virtual_mic::remove_stale();
+            }
+            return;
+        }
+        if self.virtual_mic.is_none() {
+            match crate::virtual_mic::VirtualMic::create() {
+                Ok(mic) => self.virtual_mic = Some(mic),
+                Err(error) => {
+                    self.saved.virtual_mic = false;
+                    self.error = Some(format!("{error:#}"));
+                }
+            }
         }
     }
     fn running(&self) -> bool {
@@ -162,6 +209,11 @@ impl VoiceApp {
             },
             settings: self.saved.settings.clone(),
             record_dir: recordings_dir(),
+            virtual_mic: cfg!(target_os = "linux") && self.saved.virtual_mic,
+            monitor: self
+                .saved
+                .monitor
+                .then(|| self.saved.monitor_device.clone()),
         };
         match AudioSession::start(options) {
             Ok(s) => self.session = Some(s),
@@ -263,17 +315,151 @@ impl VoiceApp {
     }
     fn import_model(&mut self) {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter(
-                "RVC voice (.pth, .zip) or manifest (.json)",
-                &["pth", "zip", "json"],
-            )
-            .pick_file()
         {
-            self.import_file(path);
+            self.import_dialog = true;
         }
         #[cfg(any(target_os = "android", target_os = "ios"))]
         self.add_slot();
+    }
+    /// Converts the chosen checkpoint with the chosen index, or with none.
+    fn import_pair(&mut self) {
+        if self.work.is_some() {
+            self.error = Some("Wait for the current task to finish, then import again.".into());
+            return;
+        }
+        let checkpoint = PathBuf::from(self.import_checkpoint.trim());
+        let index = Some(self.import_index.trim())
+            .filter(|index| !index.is_empty())
+            .map(PathBuf::from);
+        #[cfg(feature = "export")]
+        self.begin_work(move || {
+            let manifest = crate::import::import_pair(&checkpoint, index.as_deref())?;
+            let voice = crate::config::ModelManifest::load(&manifest)?;
+            Ok(format!(
+                "Imported {}{}.",
+                voice.name,
+                if voice.feature_bank.is_some() {
+                    " with its index"
+                } else {
+                    " without an index"
+                }
+            ))
+        });
+        #[cfg(not(feature = "export"))]
+        {
+            let _ = (checkpoint, index);
+            self.error =
+                Some("This build cannot convert checkpoints; import a model.json instead.".into());
+        }
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn import_dialog(&mut self, ctx: &egui::Context) {
+        let busy = self.running() || self.work.is_some();
+        let (mut close, mut import, mut other) = (false, false, false);
+        let (_, dismissed) = m3::dialog(ctx, "import-dialog", "Import RVC voice", |ui| {
+            ui.add_enabled_ui(!busy, |ui| {
+                m3::field_label(ui, "Model (.pth)");
+                ui.horizontal(|ui| {
+                    let width = ui.available_width() - 48.0;
+                    ui.add(m3::text_edit(
+                        &mut self.import_checkpoint,
+                        "/path/to/voice.pth",
+                        width,
+                    ));
+                    if m3::icon_button(
+                        ui,
+                        icons::FOLDER_OPEN,
+                        m3::ON_SURFACE_VARIANT,
+                        "Choose model…",
+                    )
+                    .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("RVC checkpoint", &["pth"])
+                            .pick_file()
+                        {
+                            // Suggest the index beside it; the user can still change it.
+                            if self.import_index.trim().is_empty() {
+                                if let Some(index) =
+                                    path.parent().and_then(crate::import::find_index)
+                                {
+                                    self.import_index = index.to_string_lossy().into_owned();
+                                }
+                            }
+                            self.import_checkpoint = path.to_string_lossy().into_owned();
+                        }
+                    }
+                });
+                ui.label(m3::supporting(
+                    "The trained voice. It is converted to ONNX, which takes a few seconds.",
+                ));
+                m3::field_label(ui, "Index (.index, optional)");
+                ui.horizontal(|ui| {
+                    let width = ui.available_width() - 96.0;
+                    ui.add(m3::text_edit(
+                        &mut self.import_index,
+                        "/path/to/added_IVF_Flat.index",
+                        width,
+                    ));
+                    if m3::icon_button(
+                        ui,
+                        icons::FOLDER_OPEN,
+                        m3::ON_SURFACE_VARIANT,
+                        "Choose index…",
+                    )
+                    .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("RVC feature index", &["index"])
+                            .pick_file()
+                        {
+                            self.import_index = path.to_string_lossy().into_owned();
+                        }
+                    }
+                    if m3::icon_button(ui, icons::CLOSE, m3::ON_SURFACE_VARIANT, "No index")
+                        .clicked()
+                    {
+                        self.import_index.clear();
+                    }
+                });
+                ui.label(m3::supporting(
+                    "Makes the voice sound closer to the original speaker; the Index slider sets how much. Leave it empty if you have none.",
+                ));
+            });
+            if busy {
+                ui.label(m3::supporting(
+                    "Stop live audio, or wait for the current model/file task to finish.",
+                ));
+            }
+            m3::actions(ui, |ui| {
+                let ready = !busy && !self.import_checkpoint.trim().is_empty();
+                import = ui
+                    .add_enabled(ready, m3::Button::filled("Import").icon(icons::ADD))
+                    .clicked();
+                close = ui.add(m3::Button::text("Cancel")).clicked();
+                other = ui
+                    .add_enabled(!busy, m3::Button::text("Other file (.zip, .json)…"))
+                    .clicked();
+            });
+        });
+        if import {
+            self.import_pair();
+            self.import_checkpoint.clear();
+            self.import_index.clear();
+        }
+        if other {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter(
+                    "RVC voice (.pth, .zip) or manifest (.json)",
+                    &["pth", "zip", "json"],
+                )
+                .pick_file()
+            {
+                self.import_file(path);
+                close = true;
+            }
+        }
+        self.import_dialog = !(import || close || dismissed);
     }
     /// A manifest is linked as it is; an RVC checkpoint or archive is converted into a
     /// new voice folder in the background and picked up when that finishes.
@@ -913,13 +1099,57 @@ impl VoiceApp {
                 m3::card_title(ui, icons::ROUTING, "Audio routing");
                 ui.add_enabled_ui(!running, |ui| {
                     device_picker(ui, "Microphone", true, &self.devices, &mut self.saved.input);
-                    device_picker(
-                        ui,
-                        "Output / virtual cable",
-                        false,
-                        &self.devices,
-                        &mut self.saved.output,
-                    );
+                    #[cfg(target_os = "linux")]
+                    {
+                        m3::field_label(ui, "Virtual microphone");
+                        ui.horizontal(|ui| {
+                            if m3::switch(ui, &mut self.saved.virtual_mic, "Virtual microphone")
+                                .changed()
+                            {
+                                self.sync_virtual_mic();
+                            }
+                            ui.label(if self.virtual_mic.is_some() {
+                                "On: Voice Changer Mic is ready"
+                            } else {
+                                "Off"
+                            });
+                        });
+                        ui.label(m3::supporting(
+                            "Adds a \"Voice Changer Mic\" input. Pick it as the microphone in Discord, OBS or a game to send them your converted voice. No extra software to install; it is removed when you turn this off or close the app.",
+                        ));
+                    }
+                    let virtual_mic = cfg!(target_os = "linux") && self.saved.virtual_mic;
+                    ui.add_enabled_ui(!virtual_mic, |ui| {
+                        device_picker(
+                            ui,
+                            "Output / virtual cable",
+                            false,
+                            &self.devices,
+                            &mut self.saved.output,
+                        );
+                    });
+                    if virtual_mic {
+                        ui.label(m3::supporting(
+                            "The voice goes to Voice Changer Mic. Turn on Monitor below to hear it too.",
+                        ));
+                    }
+                    m3::field_label(ui, "Monitor");
+                    ui.horizontal(|ui| {
+                        m3::switch(ui, &mut self.saved.monitor, "Monitor");
+                        ui.label(if self.saved.monitor { "On" } else { "Off" });
+                    });
+                    ui.label(m3::supporting(
+                        "Plays the converted voice on a second device, usually your headphones, so you hear how you sound while the output goes to Discord or a virtual cable. Use headphones: speakers feed the voice back into the microphone.",
+                    ));
+                    if self.saved.monitor {
+                        device_picker(
+                            ui,
+                            "Monitor device",
+                            false,
+                            &self.devices,
+                            &mut self.saved.monitor_device,
+                        );
+                    }
                     ui.add_space(8.0);
                     if ui
                         .add(m3::Button::outlined("Refresh devices").icon(icons::REFRESH))
@@ -1456,6 +1686,10 @@ impl eframe::App for VoiceApp {
         }
         if self.file_dialog {
             self.file_conversion_dialog(ctx);
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if self.import_dialog {
+            self.import_dialog(ctx);
         }
         if self.running() || self.work.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));

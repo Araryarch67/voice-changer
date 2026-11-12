@@ -59,6 +59,9 @@ codegen-units = 1
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+[build-dependencies]
+winresource = "0.1"
+
 [package.metadata.android]
 package = "dev.voicechanger.nativeapp"
 apk_name = "voice-changer"

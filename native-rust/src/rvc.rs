@@ -15,7 +15,7 @@ fn open_session(file: &Path, threads: usize, device: Device) -> Result<Session> 
             .with_execution_providers([CUDAExecutionProvider::default()
                 .build()
                 .error_on_failure()])
-            .context("GPU is selected but this ONNX Runtime cannot use CUDA; install a GPU build or switch the device to CPU")?;
+            .context("GPU is selected but CUDA could not start; use the GPU (CUDA) download with CUDA 12 and cuDNN 9 installed, or switch the device to CPU")?;
     }
     Ok(builder.commit_from_file(file)?)
 }
