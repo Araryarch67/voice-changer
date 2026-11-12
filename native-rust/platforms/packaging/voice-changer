@@ -3,5 +3,10 @@ set -eu
 # Installed binaries live in /opt; user models belong in writable storage.
 data_root="${XDG_DATA_HOME:-$HOME/.local/share}/voice-changer"
 mkdir -p "$data_root/models"
+# Imported voices are written beside the shared models, so the packaged ones are
+# linked into the writable folder.
+if [ ! -e "$data_root/models/shared" ]; then
+  ln -s /opt/voice-changer/models/shared "$data_root/models/shared"
+fi
 cd "$data_root"
 exec /opt/voice-changer/voice-changer-native "$@"

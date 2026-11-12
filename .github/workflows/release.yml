@@ -158,12 +158,36 @@ jobs:
             cp "${archive}/lib/onnxruntime_providers_cuda.dll" ort-lib/
           fi
 
+      # Every imported voice needs these two, so they ship in models/shared/. They
+      # are the files the reference voice changer downloads on first start.
+      - name: Cache shared models
+        uses: actions/cache@v4
+        with:
+          path: native-rust/shared-models
+          key: shared-models-contentvec-f-4b31ed3d-rmvpe-20231006-84f05863
+
+      - name: Fetch shared models
+        run: |
+          mkdir -p shared-models
+          fetch() {
+            if [ ! -f "shared-models/$1" ]; then
+              curl -fsSL --retry 3 -o "shared-models/$1" "$2"
+            fi
+            echo "$3  shared-models/$1" | sha256sum -c -
+          }
+          weights=https://huggingface.co/wok000/weights_gpl/resolve/main
+          fetch contentvec.onnx "$weights/content-vec/contentvec-f.onnx" \
+            4b31ed3d95a568fab7952de923ff7f7d3d17128ea6fce69f665509d24c3156db
+          fetch rmvpe.onnx "$weights/rmvpe/rmvpe_20231006.onnx" \
+            84f0586308e36157f75b77c8591bf636d6719c0c4ba95f8faf3df479e7566219
+
       # The app looks for the runtime in lib/ beside its executable and for voices in
       # models/ beside it, so each archive is laid out that way.
       - name: Package (Linux, Windows)
         run: |
           app="voice-changer-${{ matrix.name }}"
-          mkdir -p "dist/${app}/lib" "dist/${app}/models"
+          mkdir -p "dist/${app}/lib" "dist/${app}/models/shared"
+          cp shared-models/contentvec.onnx shared-models/rmvpe.onnx "dist/${app}/models/shared/"
           binary=voice-changer-native
           if [ "$RUNNER_OS" = Windows ]; then binary="${binary}.exe"; fi
           cp "target/${{ matrix.target }}/release/${binary}" "dist/${app}/"
@@ -208,7 +232,7 @@ jobs:
           $installDir = Join-Path $env:RUNNER_TEMP 'voice-changer-install-test'
           $setup = Start-Process -FilePath '.\dist\voice-changer-${{ matrix.name }}-setup.exe' -ArgumentList '/S', "/D=$installDir" -Wait -PassThru
           if ($setup.ExitCode -ne 0) { throw 'Installer failed' }
-          $expected = @('voice-changer-native.exe', 'lib\onnxruntime.dll', 'Uninstall.exe')
+          $expected = @('voice-changer-native.exe', 'lib\onnxruntime.dll', 'Uninstall.exe', 'models\shared\contentvec.onnx', 'models\shared\rmvpe.onnx')
           if ('${{ matrix.cuda }}' -eq 'true') { $expected += 'lib\onnxruntime_providers_cuda.dll' }
           if ('${{ matrix.directml }}' -eq 'true') { $expected += 'DirectML.dll' }
           foreach ($file in $expected) {
@@ -220,6 +244,7 @@ jobs:
           $uninstall = Start-Process -FilePath (Join-Path $installDir 'Uninstall.exe') -ArgumentList '/S', "_?=$installDir" -Wait -PassThru
           if ($uninstall.ExitCode -ne 0) { throw 'Uninstaller failed' }
           if (Test-Path (Join-Path $installDir 'voice-changer-native.exe')) { throw 'Executable was not removed' }
+          if (Test-Path (Join-Path $installDir 'models\shared\rmvpe.onnx')) { throw 'Shared models were not removed' }
           if (!(Test-Path (Join-Path $installDir 'models\keep-user-model.txt'))) { throw 'Uninstaller deleted user model' }
 
       - uses: actions/upload-artifact@v4
