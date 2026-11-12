@@ -1,11 +1,17 @@
 name: Release native app
 
 # Builds native-rust/ for Linux, Windows and macOS. A pushed tag (v*) publishes the
-# archives to a GitHub release; a manual run only keeps them as workflow artifacts.
+# archives independently as each platform finishes. Manual runs can also publish
+# to an existing tag; without a tag they only keep workflow artifacts.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and publish (leave empty for artifacts only)
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -16,9 +22,36 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Create release if needed
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+        run: |
+          if [ -n "$RELEASE_TAG" ]; then
+            # Validate the tag before making it available to the build jobs.
+            gh api "repos/${GH_REPO}/git/ref/tags/${RELEASE_TAG}" >/dev/null
+            if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes
+            fi
+          fi
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.name }}
+    needs: prepare
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -53,6 +86,8 @@ jobs:
         working-directory: native-rust
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -132,21 +167,17 @@ jobs:
             native-rust/dist/*.zip
           if-no-files-found: error
 
-  release:
-    name: Publish release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/*
-          generate_release_notes: true
-          fail_on_unmatched_files: true
+      - name: Publish this platform
+        if: needs.prepare.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          shopt -s nullglob
+          archives=(dist/*.tar.gz dist/*.zip)
+          if [ "${#archives[@]}" -eq 0 ]; then
+            echo "No release archives found" >&2
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" "${archives[@]}" --clobber
