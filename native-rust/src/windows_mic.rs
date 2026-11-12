@@ -1,7 +1,11 @@
-//! Voice Changer Mic on Windows: the app's own virtual microphone driver
-//! (`platforms/windows/driver`). Sound played to its "Voice Changer Input" speaker comes
-//! out of its "Voice Changer Mic" microphone, so the voice changer plays there and
-//! Discord, OBS or a game record from the microphone.
+//! The virtual microphone on Windows: the voice changer plays to a virtual speaker
+//! whose sound comes out of a virtual microphone, which Discord, OBS or a game record
+//! from. Two cables are recognised:
+//!
+//! - Voice Changer Mic, the app's own driver (`platforms/windows/driver`), shipped
+//!   only once Microsoft has signed it: "Voice Changer Input" to "Voice Changer Mic".
+//! - VB-Cable by VB-Audio: "CABLE Input" to "CABLE Output". Its licence does not allow
+//!   installing it from another program, so the app opens its page instead.
 //!
 //! Installing a driver needs administrator rights: the app starts itself elevated
 //! (one UAC prompt) with `--install-mic-driver`, which creates the root-enumerated
@@ -27,12 +31,15 @@ use windows_sys::{
         },
         Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED, INVALID_HANDLE_VALUE},
         System::{
-            Registry::{RegCloseKey, RegQueryValueExW, KEY_READ},
+            Registry::{
+                RegCloseKey, RegGetValueW, RegQueryValueExW, HKEY_LOCAL_MACHINE, KEY_READ,
+                RRF_RT_REG_DWORD,
+            },
             Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE},
         },
         UI::{
             Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW},
-            WindowsAndMessaging::SW_HIDE,
+            WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL},
         },
     },
 };
@@ -51,18 +58,126 @@ pub fn packaged_inf() -> Option<PathBuf> {
     inf.is_file().then_some(inf)
 }
 
-/// Whether an audio device name belongs to the driver.
-pub fn is_endpoint(name: &str) -> bool {
-    name.contains(ENDPOINT_NAME)
+/// VB-Cable's download page.
+pub const VB_CABLE_PAGE: &str = "https://vb-audio.com/Cable/";
+
+/// A virtual cable: a speaker whose sound comes out of a microphone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Cable {
+    /// Voice Changer Mic, preferred when both are installed.
+    Own,
+    VbCable,
 }
 
-/// The "Voice Changer Input" speaker the voice is played to.
+impl Cable {
+    /// The cable whose speaker is the output device called `name`.
+    pub fn of_output(name: &str) -> Option<Self> {
+        if name.contains(ENDPOINT_NAME) {
+            Some(Self::Own)
+        } else if name.contains("CABLE Input") {
+            Some(Self::VbCable)
+        } else {
+            None
+        }
+    }
+    /// The microphone to pick in Discord, OBS or a game.
+    pub fn microphone(self) -> &'static str {
+        match self {
+            Self::Own => "Voice Changer Mic",
+            Self::VbCable => "CABLE Output",
+        }
+    }
+    /// The speaker the voice is played to.
+    pub fn speaker(self) -> &'static str {
+        match self {
+            Self::Own => "Voice Changer Input",
+            Self::VbCable => "CABLE Input",
+        }
+    }
+}
+
+/// The installed cable among output device names, preferring Voice Changer Mic.
+pub fn installed<'a>(outputs: impl IntoIterator<Item = &'a str>) -> Option<Cable> {
+    outputs.into_iter().filter_map(Cable::of_output).min()
+}
+
+/// The cable's speaker the voice is played to.
 #[cfg(feature = "audio")]
 pub fn output_device(host: &cpal::Host) -> Result<cpal::Device> {
     use cpal::traits::HostTrait;
-    host.output_devices()?
-        .find(|device| is_endpoint(&device.to_string()))
-        .context("Voice Changer Mic is not installed; install it in Settings under Audio routing")
+    let mut found: Vec<(Cable, cpal::Device)> = host
+        .output_devices()?
+        .filter_map(|device| Cable::of_output(&device.to_string()).map(|cable| (cable, device)))
+        .collect();
+    found.sort_by_key(|(cable, _)| *cable);
+    let (cable, device) = found.into_iter().next().context(
+        "No virtual microphone is installed; get VB-Cable in Settings under Audio routing",
+    )?;
+    log::info!("Virtual microphone: {}", cable.microphone());
+    Ok(device)
+}
+
+/// VB-Cable's buffer ("Max Latency" in its control panel) in samples, and its
+/// sample rate, read from its settings.
+pub fn vb_cable_buffer() -> Option<(u32, u32)> {
+    let read = |name: &str| -> Option<u32> {
+        let key = wide("SOFTWARE\\VB-Audio\\Cable");
+        let name = wide(name);
+        let mut value = 0u32;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                name.as_ptr(),
+                RRF_RT_REG_DWORD,
+                null_mut(),
+                (&mut value as *mut u32).cast(),
+                &mut size,
+            )
+        };
+        (status == 0).then_some(value)
+    };
+    let samples = read("VBAudioCableWDM_Latency")?;
+    let rate = read("VBAudioCableWDM_SR")
+        .filter(|&rate| rate > 0)
+        .unwrap_or(48000);
+    Some((samples, rate))
+}
+
+/// Opens VB-Cable's control panel, where its buffer is set; it needs
+/// administrator rights, so Windows asks first.
+pub fn open_vb_cable_settings() -> Result<()> {
+    let program = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:\\Program Files"))
+        .join("VB\\CABLE\\VBCABLE_ControlPanel.exe");
+    anyhow::ensure!(
+        program.is_file(),
+        "VB-Cable's control panel was not found at {}",
+        program.display()
+    );
+    let file = wide(&program);
+    let verb = wide("runas");
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.nShow = SW_SHOWNORMAL;
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        if unsafe { GetLastError() } == ERROR_CANCELLED {
+            bail!("Administrator permission was not given");
+        }
+        return Err(last_error("Opening VB-Cable's control panel"));
+    }
+    Ok(())
+}
+
+/// Opens `url` in the default browser.
+pub fn open_page(url: &str) {
+    if let Err(error) = std::process::Command::new("explorer").arg(url).spawn() {
+        log::warn!("Could not open {url}: {error}");
+    }
 }
 
 fn wide(text: impl AsRef<OsStr>) -> Vec<u16> {
@@ -340,4 +455,20 @@ pub fn elevated(action: impl FnOnce() -> Result<()>, report: Option<&Path>) -> R
         let _ = std::fs::write(report, format!("{error:#}"));
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognises_cables_and_prefers_our_own() {
+        let vb = "CABLE Input (VB-Audio Virtual Cable)";
+        let own = "Speakers (Voice Changer Input)";
+        assert_eq!(Cable::of_output(vb), Some(Cable::VbCable));
+        assert_eq!(Cable::of_output("Speakers (Realtek(R) Audio)"), None);
+        assert_eq!(installed([vb]), Some(Cable::VbCable));
+        assert_eq!(installed([vb, own]), Some(Cable::Own));
+        assert_eq!(installed(["Headphones"]), None);
+    }
 }

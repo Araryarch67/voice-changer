@@ -595,17 +595,22 @@ fn run(
             monitor.push(&processed);
         }
         let processed = rate_converter.push(&processed);
-        let max_queued = (output_rate as usize * settings.block_ms as usize / 1000) * 3;
-        while output.len() > max_queued {
-            if output.pop().is_some() {
-                metrics.dropped_output.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        // A quarter block of lead silence, so a block that takes longer than the
+        // first one does not run the output dry.
+        let lead = output_rate as usize * settings.block_ms as usize / 4000;
         if !output_started {
-            // A quarter block of lead silence, so a block that takes longer than the
-            // first one does not run the output dry.
-            for _ in 0..output_rate as usize * settings.block_ms as usize / 4000 {
+            for _ in 0..lead {
                 let _ = output.push(0.0);
+            }
+        } else if output.len() > lead * 2 {
+            // Just before a block is added the queue holds about the lead. More means
+            // the output fell behind: it played silence through a slow block, or the
+            // output device's clock runs slower than the microphone's. Drop the oldest
+            // audio so the delay returns to the lead instead of growing for good.
+            while output.len() > lead {
+                if output.pop().is_some() {
+                    metrics.dropped_output.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         for sample in processed {

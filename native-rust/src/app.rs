@@ -210,59 +210,113 @@ impl VoiceApp {
             }
         }
     }
-    /// Voice Changer Mic: install the driver, then send the voice to it.
+    /// Virtual microphone: send the voice to Voice Changer Mic or VB-Cable.
     #[cfg(all(windows, feature = "audio"))]
     fn windows_mic_settings(&mut self, ui: &mut egui::Ui) {
-        use crate::windows_mic;
-        let installed = self
-            .devices
-            .iter()
-            .any(|device| !device.input && windows_mic::is_endpoint(&device.name));
+        use crate::windows_mic::{self, Cable};
+        let cable = windows_mic::installed(
+            self.devices
+                .iter()
+                .filter(|device| !device.input)
+                .map(|device| device.name.as_str()),
+        );
         let idle = self.work.is_none();
         m3::field_label(ui, "Virtual microphone");
-        if installed {
+        let Some(cable) = cable else {
+            self.saved.virtual_mic = false;
+            if windows_mic::packaged_inf().is_some() {
+                if ui
+                    .add_enabled(idle, m3::Button::tonal("Install Voice Changer Mic"))
+                    .clicked()
+                {
+                    self.begin_work(|| {
+                        windows_mic::install_with_prompt()?;
+                        Ok("Voice Changer Mic is installed. Turn on Virtual microphone, then pick Voice Changer Mic in Discord or OBS.".into())
+                    });
+                }
+                ui.label(m3::supporting(
+                    "Adds a \"Voice Changer Mic\" input that Discord, OBS and games can use. Windows asks for administrator permission once.",
+                ));
+                return;
+            }
             ui.horizontal(|ui| {
-                m3::switch(ui, &mut self.saved.virtual_mic, "Virtual microphone");
-                ui.label(if self.saved.virtual_mic {
-                    "On: the voice goes to Voice Changer Mic"
-                } else {
-                    "Off"
-                });
+                if ui
+                    .add(m3::Button::tonal("Get VB-Cable"))
+                    .on_hover_text(windows_mic::VB_CABLE_PAGE)
+                    .clicked()
+                {
+                    windows_mic::open_page(windows_mic::VB_CABLE_PAGE);
+                }
+                if ui
+                    .add(m3::Button::text("Refresh devices").icon(icons::REFRESH))
+                    .clicked()
+                {
+                    self.refresh_devices();
+                }
             });
             ui.label(m3::supporting(
-                "Sends the converted voice to \"Voice Changer Mic\". Pick it as the microphone in Discord, OBS or a game. It is silent while the voice changer is stopped.",
+                "To use the converted voice in Discord or a game, install VB-Cable (free, from VB-Audio's site): unzip it, run VBCABLE_Setup_x64 as administrator, restart Windows, then press Refresh devices. The app then sends its voice there by itself. For OBS alone nothing is needed: add an Application Audio Capture source for this app.",
             ));
-            if ui
-                .add_enabled(idle, m3::Button::text("Remove Voice Changer Mic"))
-                .on_hover_text("Uninstalls the driver; Windows asks for administrator permission")
-                .clicked()
-            {
-                self.saved.virtual_mic = false;
-                self.begin_work(|| {
-                    windows_mic::uninstall_with_prompt()?;
-                    Ok("Voice Changer Mic was removed.".into())
-                });
-            }
             return;
-        }
-        self.saved.virtual_mic = false;
-        if windows_mic::packaged_inf().is_some() {
-            if ui
-                .add_enabled(idle, m3::Button::tonal("Install Voice Changer Mic"))
-                .clicked()
-            {
-                self.begin_work(|| {
-                    windows_mic::install_with_prompt()?;
-                    Ok("Voice Changer Mic is installed. Turn on Virtual microphone, then pick Voice Changer Mic in Discord or OBS.".into())
+        };
+        ui.horizontal(|ui| {
+            m3::switch(ui, &mut self.saved.virtual_mic, "Virtual microphone");
+            ui.label(if self.saved.virtual_mic {
+                format!("On: the voice goes to {}", cable.speaker())
+            } else {
+                "Off".into()
+            });
+        });
+        ui.label(m3::supporting(&format!(
+            "Pick \"{}\" as the microphone in Discord, OBS or a game. It is silent while the voice changer is stopped.",
+            cable.microphone()
+        )));
+        match cable {
+            Cable::VbCable => {
+                let buffer = windows_mic::vb_cable_buffer();
+                ui.horizontal(|ui| {
+                    if let Some((samples, rate)) = buffer {
+                        let ms = samples as f32 * 1000.0 / rate as f32;
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "VB-Cable buffer: {samples} samples, up to {ms:.0} ms"
+                            ))
+                            .color(if samples > 2048 {
+                                m3::TERTIARY
+                            } else {
+                                m3::ON_SURFACE
+                            }),
+                        );
+                    }
+                    if ui
+                        .add(m3::Button::text("VB-Cable settings"))
+                        .on_hover_text("Opens VB-Cable's control panel; Windows asks for administrator permission")
+                        .clicked()
+                    {
+                        if let Err(error) = windows_mic::open_vb_cable_settings() {
+                            self.error = Some(format!("{error:#}"));
+                        }
+                    }
                 });
+                ui.label(m3::supporting(
+                    "VB-Cable holds the voice in its buffer before Discord hears it. Its default, 7168 samples, adds about 110 ms; in VB-Cable settings set Max Latency to 2048 (or 1024 if it does not crackle). Most of the remaining delay is CHUNK in Studio: lower it as far as your computer keeps up.",
+                ));
             }
-            ui.label(m3::supporting(
-                "Adds a \"Voice Changer Mic\" input that Discord, OBS and games can use, without VB-Cable. Windows asks for administrator permission once.",
-            ));
-        } else {
-            ui.label(m3::supporting(
-                "This download does not include the Voice Changer Mic driver yet. Choose a virtual cable such as VB-Cable as the output below.",
-            ));
+            Cable::Own => {
+                if ui
+                    .add_enabled(idle, m3::Button::text("Remove Voice Changer Mic"))
+                    .on_hover_text(
+                        "Uninstalls the driver; Windows asks for administrator permission",
+                    )
+                    .clicked()
+                {
+                    self.saved.virtual_mic = false;
+                    self.begin_work(|| {
+                        windows_mic::uninstall_with_prompt()?;
+                        Ok("Voice Changer Mic was removed.".into())
+                    });
+                }
+            }
         }
     }
     fn running(&self) -> bool {
@@ -1217,7 +1271,7 @@ impl VoiceApp {
                     });
                     if virtual_mic {
                         ui.label(m3::supporting(
-                            "The voice goes to Voice Changer Mic. Turn on Monitor below to hear it too.",
+                            "The voice goes to the virtual microphone. Turn on Monitor below to hear it too.",
                         ));
                     }
                     m3::field_label(ui, "Monitor");
