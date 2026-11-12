@@ -6,9 +6,12 @@ pub mod benchmark;
 pub mod config;
 pub mod denoise;
 pub mod dsp;
+pub mod echo;
 pub mod engine;
 #[cfg(feature = "export")]
 pub mod export;
+#[cfg(feature = "export")]
+pub mod import;
 #[cfg(feature = "gui")]
 pub mod m3;
 pub mod pitch;

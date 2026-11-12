@@ -16,12 +16,13 @@ The application does not launch Python, a browser, or a server. It uses eframe/e
 - Float32 RVC ONNX inference, waveform-in ContentVec/HuBERT and RMVPE, semitone adjustment and speaker ID.
 - Context buffering, windowed-sinc resampling and SOLA/crossfade between blocks.
 - Optional nearest-neighbor retrieval with unvoiced protection, reading RVC's FAISS `IndexIVFFlat` `.index` files natively (no FAISS library) or a portable float32 feature bank.
-- RNNoise noise suppression (`Sup1` cleans the microphone; `Sup2` also mutes non-speech and cleans the output), a block noise gate, and a choice of RMVPE or built-in YIN pitch detection.
+- RNNoise noise suppression (`Sup1` cleans the microphone; `Sup2` also mutes non-speech and cleans the output), a block noise gate, and echo cancellation (WebRTC AEC3) for use with speakers.
+- Pitch detection with RMVPE, CREPE (`crepe_full.onnx` / `crepe_tiny.onnx` beside the RMVPE model), WORLD's Harvest and DIO, or built-in YIN. CREPE, Harvest and DIO reproduce the reference's output on the same audio.
 - Optional CUDA execution provider, selected in Settings when the loaded ONNX Runtime is a GPU build with matching CUDA and cuDNN libraries (on Arch: `onnxruntime-cuda` and `cudnn`, with `ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so`); a CPU runtime only offers CPU.
 - Offline WAV conversion and CLI device enumeration.
 - Android NativeActivity entry point and runtime microphone permission request; iOS entry point, permission/audio-session integration and XcodeGen project.
 
-This is **not yet feature parity** with the reference. RVC v1, no-f0 and non-standard checkpoint architectures, FAISS index types other than L2 IVF-Flat, FP16 model inputs, echo cancellation, other pitch detectors (crepe, fcpe, harvest), training, soundboard and the other VC engines are not implemented. Model import currently accepts a JSON path, rather than downloading models; checkpoints are converted with `--export-rvc` (below). The portable bank does exhaustive nearest-neighbor search and is intended for small banks; IVF indexes search the stored `nprobe` closest lists, like the reference.
+This is **not yet feature parity** with the reference. non-standard RVC checkpoint architectures (and the WebUI `params` checkpoint format), FAISS index types other than L2 IVF-Flat, FP16 model inputs, the FCPE pitch detector, training, soundboard and the other VC engines are not implemented. Model import currently accepts a JSON path, rather than downloading models; checkpoints are converted with `--export-rvc` (below). The portable bank does exhaustive nearest-neighbor search and is intended for small banks; IVF indexes search the stored `nprobe` closest lists, like the reference.
 
 ## Run on desktop
 
@@ -49,15 +50,19 @@ cargo run --release
 
 On macOS use the corresponding `.dylib`; on Windows set `ORT_DYLIB_PATH` to `onnxruntime.dll` in PowerShell (`$env:ORT_DYLIB_PATH = 'C:\path\onnxruntime.dll'`). Keep any required runtime companion libraries beside it. Packaged macOS applications need the microphone usage description supplied in `platforms/macos/Info.plist`.
 
+## Importing a voice
+
+**Import model** (or dropping a file on the window) accepts an RVC `.pth` checkpoint, a `.zip` containing one, or an existing `model.json`. A checkpoint is exported to `models/<name>/voice-realtime.onnx`, the `added_*.index` beside it (or inside the archive) is placed in the same folder, and a manifest is written that uses `models/shared/contentvec.onnx` and `models/shared/rmvpe.onnx`, which must already exist. `G_*`/`D_*` training files in an archive are ignored. A `portrait.png` (or `.jpg`, `.jpeg`, `.webp`) in a voice's folder is shown on its card; **Edit → Choose picture** copies one there.
+
 ## Model contract
 
-Copy [examples/model.json](examples/model.json), point its files to actual ONNX models and set the voice model's real sample rate. Relative paths resolve against the manifest directory. RVC v2 checkpoints with f0 at 32, 40 or 48 kHz (the standard architectures) are converted to the voice model without Python:
+Copy [examples/model.json](examples/model.json), point its files to actual ONNX models and set the voice model's real sample rate. Relative paths resolve against the manifest directory. RVC v1 (256-channel) and v2 (768-channel) checkpoints, with or without f0, at 32, 40 or 48 kHz (the standard architectures) are converted to the voice model without Python:
 
 ```sh
 cargo run --release -- --export-rvc voice.pth models/myvoice/voice-realtime.onnx --realtime
 ```
 
-`--realtime` exports the context-cropping decoder that the realtime pipeline uses (input `convert_length`); omit it for the plain decoder. The exporter reads the PyTorch zip checkpoint natively (a data-only pickle reader, nothing in the file is executed) and fills one of the graph templates in `templates/`, compiled into the binary. Those templates are the reference PyTorch exporter's graphs with weights removed; graph, inputs and outputs are identical to the export of the former Python `tools/export_rvc.py` (now removed) and weights match it to within float rounding (≤2.4e-7, weight-norm products). Only maintainers regenerating templates need Python (`tools/dev/make_rvc_templates.py`). ContentVec and RMVPE ONNX files are still obtained separately.
+`--realtime` exports the context-cropping decoder that the realtime pipeline uses (input `convert_length`); omit it for the plain decoder. The exporter reads the PyTorch zip checkpoint natively (a data-only pickle reader, nothing in the file is executed) and fills one of the 24 graph templates in `templates/` (zlib-compressed, 1.4 MB in total, compiled into the binary). The template is chosen by version, f0, sample rate and `--realtime`. The metadata follows the reference: v1 is marked as layer 9 with final projection, v2 as layer 12. A v1 manifest therefore needs `channels: 256` and a ContentVec export with the projected layer-9 output, and a no-f0 voice needs `use_f0: false`. Those templates are the reference PyTorch exporter's graphs with weights removed; graph, inputs and outputs are identical to the export of the former Python `tools/export_rvc.py` (now removed) and weights match it to within float rounding (≤2.4e-7, weight-norm products). Only maintainers regenerating templates need Python (`tools/dev/make_rvc_templates.py`). ContentVec and RMVPE ONNX files are still obtained separately.
 
 | Component | Supported interface |
 | --- | --- |

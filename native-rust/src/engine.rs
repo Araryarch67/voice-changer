@@ -2,6 +2,7 @@ use crate::{
     config::{Device, Noise, Settings},
     denoise::Denoiser,
     dsp,
+    echo::EchoCanceller,
 };
 use anyhow::{bail, Result};
 
@@ -16,6 +17,9 @@ pub struct Engine {
     was_bypass: bool,
     input_denoise: Denoiser,
     output_denoise: Denoiser,
+    echo: Option<EchoCanceller>,
+    /// The previous block as it was sent to the output: the echo canceller's reference.
+    played: Vec<f32>,
 }
 impl Engine {
     pub fn reset(&mut self) {
@@ -24,6 +28,8 @@ impl Engine {
         }
         self.input_denoise.reset();
         self.output_denoise.reset();
+        self.echo = None;
+        self.played.clear();
     }
     pub fn new(converter: Option<Box<dyn Converter>>) -> Self {
         Self {
@@ -31,12 +37,23 @@ impl Engine {
             was_bypass: true,
             input_denoise: Denoiser::default(),
             output_denoise: Denoiser::default(),
+            echo: None,
+            played: Vec::new(),
         }
     }
     pub fn process(&mut self, audio: &[f32], rate: u32, settings: &Settings) -> Result<Vec<f32>> {
         settings.validate()?;
         anyhow::ensure!(rate > 0, "Sample rate must be positive");
         let mut input: Vec<_> = audio.iter().map(|s| s * settings.input_gain).collect();
+        if settings.echo {
+            if self.echo.is_none() {
+                self.echo = Some(EchoCanceller::new(rate)?);
+            }
+            let canceller = self.echo.as_mut().expect("created above");
+            input = canceller.process(&input, &self.played, rate)?;
+        } else {
+            self.echo = None;
+        }
         match settings.noise {
             Noise::Off => self.input_denoise.reset(),
             mode => {
@@ -76,6 +93,9 @@ impl Engine {
         );
         for s in &mut out {
             *s = (*s * settings.output_gain).clamp(-1.0, 1.0);
+        }
+        if settings.echo {
+            self.played.clone_from(&out);
         }
         Ok(out)
     }

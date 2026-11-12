@@ -65,6 +65,8 @@ pub struct VoiceApp {
     file_output: String,
     work: Option<mpsc::Receiver<Result<String, String>>>,
     message: Option<String>,
+    /// Voice pictures by manifest path; `None` once a voice is known to have none.
+    portraits: std::collections::HashMap<String, Option<egui::TextureHandle>>,
     #[cfg(feature = "audio")]
     devices: Vec<AudioDevice>,
     #[cfg(feature = "audio")]
@@ -88,26 +90,7 @@ impl VoiceApp {
             .slots
             .iter()
             .all(|slot| slot.manifest.trim().is_empty());
-        for (name, path) in crate::runtime::discover_models() {
-            let manifest = path.to_string_lossy().into_owned();
-            if saved.slots.iter().any(|s| s.manifest == manifest) {
-                continue;
-            }
-            let slot = ModelSlot {
-                name,
-                manifest,
-                favorite: false,
-            };
-            if let Some(empty) = saved
-                .slots
-                .iter_mut()
-                .find(|s| s.manifest.trim().is_empty())
-            {
-                *empty = slot;
-            } else {
-                saved.slots.push(slot);
-            }
-        }
+        adopt_models(&mut saved);
         if was_empty && !saved.slots[0].manifest.is_empty() {
             saved.selected = 0;
             saved.settings.bypass = false;
@@ -124,6 +107,7 @@ impl VoiceApp {
             file_output: String::new(),
             work: None,
             message: None,
+            portraits: Default::default(),
             #[cfg(feature = "audio")]
             devices: Vec::new(),
             #[cfg(feature = "audio")]
@@ -223,6 +207,51 @@ impl VoiceApp {
             }
         });
     }
+    /// The picture for a voice: `portrait.png` (or jpg, jpeg, webp) beside its manifest.
+    fn portrait(&mut self, ctx: &egui::Context, index: usize) -> Option<egui::TextureHandle> {
+        let manifest = self.saved.slots[index].manifest.trim();
+        if manifest.is_empty() {
+            return None;
+        }
+        if let Some(known) = self.portraits.get(manifest) {
+            return known.clone();
+        }
+        let texture = portrait_file(std::path::Path::new(manifest)).and_then(|file| {
+            // Scaled down once; cards never show it larger than this.
+            let picture = image::open(&file).ok()?.thumbnail(640, 640).to_rgba8();
+            let size = [picture.width() as usize, picture.height() as usize];
+            let pixels = egui::ColorImage::from_rgba_unmultiplied(size, &picture);
+            Some(ctx.load_texture(file.to_string_lossy(), pixels, egui::TextureOptions::LINEAR))
+        });
+        self.portraits.insert(manifest.to_owned(), texture.clone());
+        texture
+    }
+    /// Copies a picture into the selected voice's folder as its portrait.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn set_portrait(&mut self, picked: PathBuf) {
+        let manifest = self.saved.slots[self.saved.selected]
+            .manifest
+            .trim()
+            .to_owned();
+        let Some(folder) = std::path::Path::new(&manifest).parent() else {
+            return;
+        };
+        let extension = picked
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let target = folder.join(format!("portrait.{extension}"));
+        if picked.canonicalize().ok() != target.canonicalize().ok() {
+            for old in PORTRAIT_TYPES {
+                let _ = std::fs::remove_file(folder.join(format!("portrait.{old}")));
+            }
+            if let Err(error) = std::fs::copy(&picked, &target) {
+                self.error = Some(format!("Could not save the picture: {error}"));
+                return;
+            }
+        }
+        self.portraits.remove(&manifest);
+    }
     fn add_slot(&mut self) {
         self.saved.slots.push(ModelSlot {
             name: format!("Voice {:02}", self.saved.slots.len() + 1),
@@ -235,8 +264,23 @@ impl VoiceApp {
     fn import_model(&mut self) {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Voice model manifest", &["json"])
+            .add_filter(
+                "RVC voice (.pth, .zip) or manifest (.json)",
+                &["pth", "zip", "json"],
+            )
             .pick_file()
+        {
+            self.import_file(path);
+        }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        self.add_slot();
+    }
+    /// A manifest is linked as it is; an RVC checkpoint or archive is converted into a
+    /// new voice folder in the background and picked up when that finishes.
+    fn import_file(&mut self, path: PathBuf) {
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("json"))
         {
             match crate::config::ModelManifest::load(&path) {
                 Ok(model) => {
@@ -251,9 +295,31 @@ impl VoiceApp {
                 }
                 Err(error) => self.error = Some(format!("{error:#}")),
             }
+            return;
         }
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        self.add_slot();
+        if self.work.is_some() {
+            self.error = Some("Wait for the current task to finish, then import again.".into());
+            return;
+        }
+        #[cfg(feature = "export")]
+        self.begin_work(move || {
+            let manifest = crate::import::import_voice(&path)?;
+            let voice = crate::config::ModelManifest::load(&manifest)?;
+            Ok(format!(
+                "Imported {}{}.",
+                voice.name,
+                if voice.feature_bank.is_some() {
+                    " with its index"
+                } else {
+                    " (no index found)"
+                }
+            ))
+        });
+        #[cfg(not(feature = "export"))]
+        {
+            self.error =
+                Some("This build cannot convert checkpoints; import a model.json instead.".into());
+        }
     }
     fn begin_work<F>(&mut self, work: F)
     where
@@ -290,7 +356,7 @@ impl VoiceApp {
         header(
             ui,
             "Voices",
-            "Pick a voice, then press Start. Double-click a card to connect its model.",
+            "Pick a voice, then press Start. Import an RVC .pth or .zip, or drop one on the window.",
         );
         let total = ui.available_width();
         let side = 320.0;
@@ -445,11 +511,12 @@ impl VoiceApp {
         let index = self.saved.selected;
         m3::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
+            let image = self.portrait(ui.ctx(), index);
             let slot = &self.saved.slots[index];
             let configured = !slot.manifest.trim().is_empty();
             let (tile, _) = ui
                 .allocate_exact_size(Vec2::new(ui.available_width(), 132.0), egui::Sense::hover());
-            m3::avatar(ui, tile, 12.0, index, &slot.name, configured);
+            paint_portrait(ui, tile, 12.0, image.as_ref(), index, &slot.name, configured);
             ui.add_space(4.0);
             ui.add(
                 egui::Label::new(RichText::new(&slot.name).size(22.0).color(m3::ON_SURFACE))
@@ -508,6 +575,7 @@ impl VoiceApp {
     fn voice_card(&mut self, ui: &mut egui::Ui, index: usize, width: f32, running: bool) {
         let (rect, response) =
             ui.allocate_exact_size(Vec2::new(width, 164.0), egui::Sense::click());
+        let image = self.portrait(ui.ctx(), index);
         let slot = &self.saved.slots[index];
         let selected = self.saved.selected == index;
         let configured = !slot.manifest.trim().is_empty();
@@ -535,7 +603,7 @@ impl VoiceApp {
         }
         let tile =
             egui::Rect::from_min_size(rect.min + Vec2::splat(8.0), Vec2::new(width - 16.0, 92.0));
-        let content = m3::avatar(ui, tile, 8.0, index, &slot.name, configured);
+        let content = paint_portrait(ui, tile, 8.0, image.as_ref(), index, &slot.name, configured);
         let name = m3::elided(
             ui,
             &slot.name,
@@ -579,6 +647,13 @@ impl VoiceApp {
                 } else {
                     "Add to favorites"
                 });
+            if image.is_some() {
+                ui.painter().circle_filled(
+                    heart.center(),
+                    16.0,
+                    egui::Color32::from_black_alpha(110),
+                );
+            }
             if toggle.hovered() {
                 ui.painter()
                     .circle_filled(heart.center(), 18.0, content.gamma_multiply(0.12));
@@ -605,11 +680,20 @@ impl VoiceApp {
     }
     fn voice_controls(&mut self, ui: &mut egui::Ui) {
         header(ui, "Voice Studio", "Shape the voice and tune latency.");
-        m3::chip(
-            ui,
-            icons::VOICE,
-            &self.saved.slots[self.saved.selected].name,
-        );
+        ui.horizontal_wrapped(|ui| {
+            m3::chip(
+                ui,
+                icons::VOICE,
+                &self.saved.slots[self.saved.selected].name,
+            );
+            if ui
+                .add(m3::Button::outlined("Reset to defaults").icon(icons::REFRESH))
+                .on_hover_text("Put every option on this page back to its original value")
+                .clicked()
+            {
+                self.reset_settings();
+            }
+        });
         ui.add_space(8.0);
         ui.spacing_mut().item_spacing = Vec2::splat(12.0);
         let width = ui.available_width();
@@ -630,6 +714,28 @@ impl VoiceApp {
             self.level_settings(ui);
             self.buffer_settings(ui);
         }
+    }
+    /// Restores the Studio options. Bypass and the device are not Studio options, and
+    /// buffer durations cannot change while audio runs, so those are kept.
+    fn reset_settings(&mut self) {
+        let current = &self.saved.settings;
+        let mut fresh = Settings {
+            bypass: current.bypass,
+            device: current.device,
+            ..Settings::default()
+        };
+        if self.running() {
+            fresh.block_ms = current.block_ms;
+            fresh.context_ms = current.context_ms;
+            fresh.overlap_ms = current.overlap_ms;
+            fresh.search_ms = current.search_ms;
+        }
+        self.saved.settings = fresh;
+        self.message = Some(if self.running() {
+            "Options reset to defaults. Buffering is kept until audio is stopped.".into()
+        } else {
+            "Options reset to defaults.".into()
+        });
     }
     fn voice_settings(&mut self, ui: &mut egui::Ui) {
         m3::card().show(ui, |ui| {
@@ -663,9 +769,17 @@ impl VoiceApp {
             );
             choice(
                 ui,
-                "F0 detector", "How your pitch is measured. RMVPE is the most accurate; YIN needs no model run.",
+                "F0 detector",
+                "How your pitch is measured. RMVPE is the best all-rounder. CREPE full and Harvest are accurate but heavy; CREPE tiny, DIO and YIN are light.",
                 &mut s.f0_detector,
-                &[(F0Detector::Rmvpe, "RMVPE"), (F0Detector::Yin, "YIN")],
+                &[
+                    (F0Detector::Rmvpe, "RMVPE"),
+                    (F0Detector::CrepeFull, "CREPE full"),
+                    (F0Detector::CrepeTiny, "CREPE tiny"),
+                    (F0Detector::Harvest, "Harvest"),
+                    (F0Detector::Dio, "DIO"),
+                    (F0Detector::Yin, "YIN"),
+                ],
             );
             ui.allocate_ui_with_layout(
                 Vec2::new(ui.available_width(), 40.0),
@@ -725,7 +839,7 @@ impl VoiceApp {
             }
             choice(
                 ui,
-                "Noise suppression", "Removes background noise. Sup1 cleans the microphone; Sup2 also mutes non-speech and cleans the output.",
+                "Noise suppression", "Removes background noise. Sup1 cleans the microphone. Sup2 also fades out everything that is not speech and cleans the output; it adds a little delay.",
                 &mut s.noise,
                 &[
                     (Noise::Off, "Off"),
@@ -733,6 +847,14 @@ impl VoiceApp {
                     (Noise::Sup2, "Sup2"),
                 ],
             );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                m3::switch(ui, &mut s.echo, "Echo cancellation");
+                ui.label("Echo cancellation");
+            });
+            ui.label(m3::supporting(
+                "Removes your converted voice from the microphone when you listen on speakers. Leave it off with headphones.",
+            ));
         });
     }
     fn buffer_settings(&mut self, ui: &mut egui::Ui) {
@@ -949,15 +1071,17 @@ impl VoiceApp {
                     Vec2::new(ui.available_width(), 56.0),
                     egui::Sense::hover(),
                 );
+                let image = self.portrait(ui.ctx(), index);
                 let slot = &self.saved.slots[index];
                 let circle = egui::Rect::from_center_size(
                     egui::pos2(rect.left() + 20.0, rect.center().y),
                     Vec2::splat(40.0),
                 );
-                m3::avatar(
+                paint_portrait(
                     ui,
                     circle,
                     20.0,
+                    image.as_ref(),
                     index,
                     &slot.name,
                     !slot.manifest.trim().is_empty(),
@@ -1019,6 +1143,8 @@ impl VoiceApp {
         let running = self.running();
         let removable = self.saved.slots.len() > 1;
         let (mut remove, mut done) = (false, false);
+        #[allow(unused_mut)]
+        let mut picture: Option<PathBuf> = None;
         let (_, dismissed) = m3::dialog(ctx, "model-dialog", "Configure voice", |ui| {
             ui.add_enabled_ui(!running, |ui| {
                 let slot = &mut self.saved.slots[self.saved.selected];
@@ -1055,6 +1181,24 @@ impl VoiceApp {
                     m3::switch(ui, &mut slot.favorite, "Favorite");
                     ui.label("Favorite");
                 });
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                {
+                    m3::field_label(ui, "Picture");
+                    if ui
+                        .add_enabled(
+                            !slot.manifest.trim().is_empty(),
+                            m3::Button::outlined("Choose picture").icon(icons::FOLDER_OPEN),
+                        )
+                        .clicked()
+                    {
+                        picture = rfd::FileDialog::new()
+                            .add_filter("Picture", &PORTRAIT_TYPES)
+                            .pick_file();
+                    }
+                    ui.label(m3::supporting(
+                        "Shown on the voice card. It is copied into the voice's folder as portrait.*",
+                    ));
+                }
                 ui.label(m3::supporting(
                     "The manifest connects RVC, ContentVec and RMVPE. See examples/model.json.",
                 ));
@@ -1073,6 +1217,10 @@ impl VoiceApp {
                 }
             });
         });
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if let Some(picked) = picture {
+            self.set_portrait(picked);
+        }
         if remove {
             self.saved.slots.remove(self.saved.selected);
             self.saved.selected = self.saved.selected.min(self.saved.slots.len() - 1);
@@ -1200,7 +1348,16 @@ impl eframe::App for VoiceApp {
         if let Some(result) = completed {
             self.work = None;
             match result {
-                Ok(message) => self.message = Some(message),
+                Ok(message) => {
+                    // An import leaves a new voice folder behind; select it.
+                    if let Some(added) = adopt_models(&mut self.saved) {
+                        if !self.running() {
+                            self.saved.selected = added;
+                            self.saved.settings.bypass = false;
+                        }
+                    }
+                    self.message = Some(message);
+                }
                 Err(error) => self.error = Some(error),
             }
         }
@@ -1220,6 +1377,19 @@ impl eframe::App for VoiceApp {
         if !ctx.input(|i| i.focused) {
             if let Some(session) = &self.session {
                 session.stop();
+            }
+        }
+        // Dropping a checkpoint, archive or manifest on the window imports it.
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if !self.running() {
+            for path in dropped {
+                self.import_file(path);
             }
         }
         let compact = ctx.screen_rect().width() < 650.0;
@@ -1356,6 +1526,71 @@ fn choice<T: Copy + PartialEq>(
         }
     });
     ui.label(m3::supporting(hint));
+}
+const PORTRAIT_TYPES: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
+fn portrait_file(manifest: &std::path::Path) -> Option<PathBuf> {
+    let folder = manifest.parent()?;
+    PORTRAIT_TYPES
+        .iter()
+        .map(|extension| folder.join(format!("portrait.{extension}")))
+        .find(|file| file.is_file())
+}
+/// Paints a voice's picture cropped to cover `rect`, or its monogram tile when it has
+/// none. Returns the colour for anything drawn on top.
+fn paint_portrait(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    radius: f32,
+    image: Option<&egui::TextureHandle>,
+    index: usize,
+    name: &str,
+    configured: bool,
+) -> egui::Color32 {
+    let Some(texture) = image else {
+        return m3::avatar(ui, rect, radius, index, name, configured);
+    };
+    let size = texture.size_vec2();
+    let scale = (rect.width() / size.x).max(rect.height() / size.y);
+    let shown = rect.size() / scale;
+    // Centred sideways, biased to the top where a character's face usually is.
+    let corner = egui::pos2((size.x - shown.x) / 2.0, (size.y - shown.y) * 0.12);
+    let uv = egui::Rect::from_min_size(
+        egui::pos2(corner.x / size.x, corner.y / size.y),
+        Vec2::new(shown.x / size.x, shown.y / size.y),
+    );
+    egui::Image::from_texture(texture)
+        .uv(uv)
+        .corner_radius(radius)
+        .paint_at(ui, rect);
+    egui::Color32::WHITE
+}
+/// Gives every discovered voice that has no slot yet one, reusing empty slots first.
+/// Returns the slot of the last voice added.
+fn adopt_models(saved: &mut Saved) -> Option<usize> {
+    let mut added = None;
+    for (name, path) in crate::runtime::discover_models() {
+        let manifest = path.to_string_lossy().into_owned();
+        if saved.slots.iter().any(|s| s.manifest == manifest) {
+            continue;
+        }
+        let slot = ModelSlot {
+            name,
+            manifest,
+            favorite: false,
+        };
+        if let Some(empty) = saved
+            .slots
+            .iter()
+            .position(|s| s.manifest.trim().is_empty())
+        {
+            saved.slots[empty] = slot;
+            added = Some(empty);
+        } else {
+            saved.slots.push(slot);
+            added = Some(saved.slots.len() - 1);
+        }
+    }
+    added
 }
 fn header(ui: &mut egui::Ui, title: &str, detail: &str) {
     ui.label(m3::headline(title));

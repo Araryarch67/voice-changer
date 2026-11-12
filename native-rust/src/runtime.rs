@@ -28,6 +28,15 @@ pub fn model_directories() -> Vec<PathBuf> {
     directories
 }
 
+/// The models folder that holds the shared embedder and pitch models; imported voices
+/// are created beside them.
+pub fn models_root() -> Option<PathBuf> {
+    model_directories().into_iter().find(|directory| {
+        directory.join("shared/contentvec.onnx").is_file()
+            && directory.join("shared/rmvpe.onnx").is_file()
+    })
+}
+
 pub fn discover_models() -> Vec<(String, PathBuf)> {
     let mut models = Vec::new();
     let mut seen = std::collections::HashSet::new();

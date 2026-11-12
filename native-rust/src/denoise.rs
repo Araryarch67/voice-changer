@@ -4,12 +4,21 @@ use nnnoiseless::DenoiseState;
 use std::collections::VecDeque;
 
 const FRAME: usize = DenoiseState::FRAME_SIZE;
-/// Frames the voice gate stays open after speech was last detected (300 ms).
-const HOLD_FRAMES: u32 = 30;
+/// RNNoise voice probability that opens the gate.
+const VOICE: f32 = 0.5;
+/// Frames the gate looks ahead, so it is already open when a word starts (30 ms).
+const LOOKAHEAD: usize = 3;
+/// Frames the gate stays open after speech was last detected (500 ms).
+const HOLD_FRAMES: u32 = 50;
+/// Frames the gate takes to close (100 ms); it opens within one frame.
+const RELEASE_FRAMES: f32 = 10.0;
 
 pub struct Denoiser {
     state: Box<DenoiseState<'static>>,
+    gate: bool,
     pending: Vec<f32>,
+    /// Cleaned frames with their voice probability, waiting out the gate's lookahead.
+    held: VecDeque<([f32; FRAME], f32)>,
     ready: VecDeque<f32>,
     gain: f32,
     hold: u32,
@@ -17,47 +26,67 @@ pub struct Denoiser {
 }
 impl Default for Denoiser {
     fn default() -> Self {
+        Self::new(false)
+    }
+}
+impl Denoiser {
+    fn new(gate: bool) -> Self {
+        let lookahead = if gate { LOOKAHEAD } else { 0 };
         Self {
             state: DenoiseState::new(),
+            gate,
             pending: Vec::new(),
-            // One frame of lead so every call can return as many samples as it was given.
-            ready: std::iter::repeat_n(0.0, FRAME).collect(),
+            held: VecDeque::new(),
+            // Enough lead that every call can return as many samples as it was given.
+            ready: std::iter::repeat_n(0.0, FRAME * (1 + lookahead)).collect(),
             gain: 1.0,
             hold: HOLD_FRAMES,
             fresh: true,
         }
     }
-}
-impl Denoiser {
     pub fn reset(&mut self) {
         if !self.fresh {
-            *self = Self::default();
+            *self = Self::new(self.gate);
         }
     }
-    /// Returns `audio.len()` cleaned samples, delayed by one 10 ms frame. With `gate`,
-    /// frames RNNoise classifies as non-speech are faded out entirely.
+    /// Returns `audio.len()` cleaned samples, delayed by 10 ms. With `gate`, stretches
+    /// RNNoise classifies as non-speech are also faded out, at 30 ms more delay.
     pub fn process(&mut self, audio: &[f32], rate: u32, gate: bool) -> Vec<f32> {
+        if gate != self.gate {
+            *self = Self::new(gate);
+        }
         self.fresh = false;
+        let lookahead = if gate { LOOKAHEAD } else { 0 };
         let wide = dsp::resample(audio, rate, 48000);
         // RNNoise works on 48 kHz frames in 16-bit sample scale.
         self.pending.extend(wide.iter().map(|s| s * 32768.0));
-        let mut clean = [0.0; FRAME];
         let mut consumed = 0;
         for frame in self.pending.as_chunks::<FRAME>().0 {
+            let mut clean = [0.0; FRAME];
             let voice = self.state.process_frame(&mut clean, frame);
-            if voice >= 0.5 {
+            self.held.push_back((clean, voice));
+            consumed += FRAME;
+            if self.held.len() <= lookahead {
+                continue;
+            }
+            let speaking = self.held.iter().any(|(_, voice)| *voice >= VOICE);
+            let (clean, _) = self.held.pop_front().expect("longer than the lookahead");
+            if speaking {
                 self.hold = HOLD_FRAMES;
             } else {
                 self.hold = self.hold.saturating_sub(1);
             }
-            let target = if gate && self.hold == 0 { 0.0 } else { 1.0 };
+            let target = if !gate || self.hold > 0 {
+                1.0
+            } else {
+                (self.gain - 1.0 / RELEASE_FRAMES).max(0.0)
+            };
             let step = (target - self.gain) / FRAME as f32;
             for sample in clean {
                 self.gain += step;
                 self.ready.push_back(sample / 32768.0 * self.gain);
             }
             self.gain = target;
-            consumed += FRAME;
         }
         self.pending.drain(..consumed);
         let available = wide.len().min(self.ready.len());

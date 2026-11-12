@@ -13,11 +13,18 @@ pub enum Noise {
     Sup2,
 }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum F0Detector {
     /// The RMVPE model named by the manifest.
     #[default]
     Rmvpe,
+    /// CREPE ONNX models, `crepe_full.onnx` or `crepe_tiny.onnx` beside the RMVPE file.
+    CrepeFull,
+    CrepeTiny,
+    /// WORLD's Harvest: accurate and slow.
+    Harvest,
+    /// WORLD's DIO: fast and rough.
+    Dio,
     /// Built-in YIN: no model run, less robust than RMVPE.
     Yin,
 }
@@ -47,6 +54,8 @@ pub struct Settings {
     pub index_ratio: f32,
     pub protect: f32,
     pub noise: Noise,
+    /// Acoustic echo cancellation for use with speakers instead of headphones.
+    pub echo: bool,
     pub f0_detector: F0Detector,
     pub device: Device,
 }
@@ -66,6 +75,7 @@ impl Default for Settings {
             index_ratio: 0.0,
             protect: 0.5,
             noise: Noise::Off,
+            echo: false,
             f0_detector: F0Detector::Rmvpe,
             device: Device::Cpu,
         }

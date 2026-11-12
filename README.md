@@ -26,9 +26,10 @@ Voice Changer converts your microphone into another voice as you speak, using [R
 
 - **Real-time conversion** with RVC v2 models, pitch shifting (Tune) and speaker selection.
 - **Index retrieval** that reads RVC's FAISS `IndexIVFFlat` `.index` files directly, without the FAISS library.
-- **Noise handling**: RNNoise suppression in two strengths (Sup1, Sup2) and a noise gate.
+- **Noise handling**: RNNoise suppression in two strengths (Sup1, Sup2), a noise gate and echo cancellation.
+- **Pitch detectors**: RMVPE, CREPE, Harvest, DIO and YIN.
 - **GPU or CPU**: CUDA through ONNX Runtime where available, CPU everywhere else.
-- **Checkpoint export**: turn an RVC `.pth` into ONNX from the command line, no Python needed.
+- **One-step import**: pick an RVC `.pth` or `.zip` and the app converts it to ONNX, finds its index and adds the voice, no Python needed. Each voice can have its own picture.
 - **Recording** of the microphone and the converted voice to WAV, and offline WAV file conversion.
 - **Material 3 interface** with a plain-language hint under every option.
 
@@ -48,14 +49,14 @@ Each archive bundles the CPU build of ONNX Runtime 1.22. Voice models are not in
 ## Quick start
 
 1. Extract the archive and run `voice-changer-native` (on macOS, open `Voice Changer.app`).
-2. Add a voice: put a model folder with a `model.json` manifest in `models/` beside the executable, or use **Import model** in the app.
+2. Add a voice: press **Import model** and pick an RVC `.pth` checkpoint or a `.zip` that contains one, or drop the file on the window. The app converts it, attaches the `.index` it finds beside it, and adds the voice. This needs `contentvec.onnx` and `rmvpe.onnx` in `models/shared/`.
 3. Put on headphones, pick the voice, and press **Start**.
 
 To send the converted voice to another app such as Discord or OBS, choose a virtual audio device as the output in **Settings**. The app does not install one.
 
 ### Preparing a voice
 
-A voice is a small JSON manifest that points at three ONNX files: the RVC voice, a ContentVec embedder and an RMVPE pitch model. Convert an RVC v2 checkpoint with:
+Importing does this for you. By hand, a voice is a small JSON manifest that points at three ONNX files: the RVC voice, a ContentVec embedder and an RMVPE pitch model. Convert a checkpoint with:
 
 ```sh
 voice-changer-native --export-rvc voice.pth models/myvoice/voice-realtime.onnx --realtime
@@ -90,15 +91,15 @@ Then choose **GPU (CUDA)** under **Settings → Processing**. As a rough guide f
 
 | Area | State |
 |---|---|
-| RVC v2 with f0 (32, 40, 48 kHz) | Supported |
+| RVC v1 and v2, with and without f0 (32, 40, 48 kHz) | Supported |
 | Tune, index ratio, protect, gain, chunk, extra, crossfade | Supported |
 | Noise suppression and noise gate | Supported |
-| Pitch detection | RMVPE and built-in YIN |
+| Pitch detection | RMVPE, CREPE (full, tiny), Harvest, DIO and built-in YIN |
 | CUDA GPU | Supported with a GPU build of ONNX Runtime |
 | Recording and WAV file conversion | Supported |
-| Echo cancellation | Not yet |
-| Other pitch detectors (crepe, fcpe, harvest) | Not yet |
-| Checkpoint export for RVC v1 and models without f0 | Not yet |
+| Echo cancellation | Supported (WebRTC AEC3) |
+| FCPE pitch detector | Not yet |
+| Checkpoint export for RVC v1 and v2, with and without f0 | Supported |
 | Other engines (MMVC, so-vits-svc, DDSP-SVC, Beatrice), training | Not planned for now |
 
 Linux is the platform this is developed and tested on. Windows and macOS builds are produced by CI and are less exercised; Android and iOS entry points exist but are experimental.

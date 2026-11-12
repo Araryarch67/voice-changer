@@ -70,6 +70,131 @@ pub fn yin(audio: &[f32], frames: usize) -> Vec<f32> {
     pitch
 }
 
+const CREPE_WINDOW: usize = 1024;
+const CREPE_BINS: usize = 360;
+/// CREPE's bin 0 in cents above 10 Hz; bins are 20 cents apart.
+const CREPE_CENTS_OFFSET: f64 = 1_997.379_408_437_619;
+
+/// CREPE model input for 16 kHz audio: one centred 1024-sample frame per 10 ms, as a
+/// flat `[count, 1024]` matrix. The ONNX graph normalises the frames itself.
+pub fn crepe_frames(audio: &[f32]) -> (Vec<f32>, usize) {
+    let mut padded = vec![0.0; CREPE_WINDOW / 2];
+    padded.extend_from_slice(audio);
+    padded.resize(padded.len() + CREPE_WINDOW / 2, 0.0);
+    let count = 1 + (padded.len() - CREPE_WINDOW) / HOP;
+    let frames = (0..count)
+        .flat_map(|frame| {
+            padded[frame * HOP..frame * HOP + CREPE_WINDOW]
+                .iter()
+                .copied()
+        })
+        .collect();
+    (frames, count)
+}
+
+/// Decodes CREPE's `[count, 360]` output as the reference does: weighted average
+/// around the strongest bin within 50 Hz to 1100 Hz, a three-frame median, and
+/// unvoiced (0) where the peak activation is under 0.1.
+pub fn crepe_decode(activations: &[f32]) -> Vec<f32> {
+    let bin_of = |hz: f64| (1200.0 * (hz / 10.0).log2() - CREPE_CENTS_OFFSET) / 20.0;
+    let (low, high) = (
+        bin_of(50.0).floor() as usize,
+        bin_of(1100.0).ceil() as usize,
+    );
+    let (mut pitch, mut confidence) = (Vec::new(), Vec::new());
+    for frame in activations.as_chunks::<CREPE_BINS>().0 {
+        let peak = (low..high)
+            .max_by(|a, b| frame[*a].total_cmp(&frame[*b]))
+            .unwrap_or(low);
+        let (mut weighted, mut total) = (0.0_f64, 0.0_f64);
+        let window = peak.saturating_sub(4).max(low)..(peak + 5).min(high);
+        for (bin, activation) in frame.iter().enumerate().take(window.end).skip(window.start) {
+            let weight = f64::from(activation.max(0.0));
+            weighted += (20.0 * bin as f64 + CREPE_CENTS_OFFSET) * weight;
+            total += weight;
+        }
+        pitch.push(if total > 0.0 {
+            (10.0 * 2.0_f64.powf(weighted / total / 1200.0)) as f32
+        } else {
+            0.0
+        });
+        confidence.push(frame[peak]);
+    }
+    let (pitch, confidence) = (median3(&pitch, false), median3(&confidence, false));
+    pitch
+        .iter()
+        .zip(&confidence)
+        .map(|(hz, sure)| if *sure < 0.1 { 0.0 } else { *hz })
+        .collect()
+}
+
+/// Three-point median. Edges either use the two values there are, or are padded
+/// with zeros like `scipy.signal.medfilt`.
+fn median3(values: &[f32], zero_padded: bool) -> Vec<f32> {
+    (0..values.len())
+        .map(|i| {
+            let before = i.checked_sub(1).map(|j| values[j]);
+            let after = values.get(i + 1).copied();
+            match (before, after) {
+                (Some(a), Some(b)) => {
+                    let mut window = [a, values[i], b];
+                    window.sort_by(f32::total_cmp);
+                    window[1]
+                }
+                (edge, other) if zero_padded => {
+                    let mut window = [0.0, values[i], edge.or(other).unwrap_or(0.0)];
+                    window.sort_by(f32::total_cmp);
+                    window[1]
+                }
+                (edge, other) => match edge.or(other) {
+                    Some(neighbour) => (values[i] + neighbour) / 2.0,
+                    None => values[i],
+                },
+            }
+        })
+        .collect()
+}
+
+/// WORLD's Harvest with StoneMask refinement and a three-frame median, on 16 kHz
+/// audio: one value per 10 ms frame, 0 for unvoiced. Accurate and slow.
+#[cfg(feature = "world")]
+pub fn harvest(audio: &[f32]) -> Vec<f32> {
+    let Some(samples) = world_input(audio) else {
+        return vec![0.0; audio.len() / HOP + 1];
+    };
+    let mut option = rsworld_sys::HarvestOption::new();
+    option.f0_ceil = 1100.0;
+    option.frame_period = 10.0;
+    let (times, coarse) = rsworld::harvest(&samples, RATE as i32, &option);
+    let refined = rsworld::stonemask(&samples, RATE as i32, &times, &coarse);
+    let refined: Vec<f32> = refined.iter().map(|hz| *hz as f32).collect();
+    median3(&refined, true)
+}
+
+/// WORLD's DIO with StoneMask refinement, on 16 kHz audio. Fast and rough.
+#[cfg(feature = "world")]
+pub fn dio(audio: &[f32]) -> Vec<f32> {
+    let Some(samples) = world_input(audio) else {
+        return vec![0.0; audio.len() / HOP + 1];
+    };
+    let mut option = rsworld_sys::DioOption::new();
+    option.f0_floor = 50.0;
+    option.f0_ceil = 1100.0;
+    option.channels_in_octave = 2.0;
+    option.frame_period = 10.0;
+    let (times, coarse) = rsworld::dio(&samples, RATE as i32, &option);
+    rsworld::stonemask(&samples, RATE as i32, &times, &coarse)
+        .iter()
+        .map(|hz| *hz as f32)
+        .collect()
+}
+
+/// WORLD needs a few analysis periods of signal; shorter input is treated as unvoiced.
+#[cfg(feature = "world")]
+fn world_input(audio: &[f32]) -> Option<Vec<f64>> {
+    (audio.len() >= 1600).then(|| audio.iter().map(|s| f64::from(*s)).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +214,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Harvest returns nothing for a pure sine (so does the reference library), so the
+    /// WORLD test uses a tone with harmonics, like a voice.
+    #[cfg(feature = "world")]
+    #[test]
+    fn world_detectors_track_a_harmonic_tone() {
+        for frequency in [110.0_f32, 220.0, 440.0] {
+            let tone: Vec<f32> = (0..16000)
+                .map(|i| {
+                    let phase = 2.0 * std::f32::consts::PI * frequency * i as f32 / RATE;
+                    (1..=8)
+                        .map(|k| (phase * k as f32).sin() / k as f32)
+                        .sum::<f32>()
+                        * 0.2
+                })
+                .collect();
+            for (name, pitch) in [("harvest", harvest(&tone)), ("dio", dio(&tone))] {
+                assert_eq!(pitch.len(), 101, "{name}");
+                for value in &pitch[10..90] {
+                    assert!(
+                        (value - frequency).abs() < frequency * 0.02,
+                        "{name}: {value} vs {frequency}"
+                    );
+                }
+            }
+        }
+        assert!(harvest(&[0.0; 100]).iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn crepe_decoding_matches_the_bin_scale() {
+        let (frames, count) = crepe_frames(&[0.0; 16000]);
+        assert_eq!((count, frames.len()), (101, 101 * CREPE_WINDOW));
+        // Bin 120 is 20 * 120 + 1997.38 cents above 10 Hz, about 126.8 Hz.
+        let expected = 10.0 * 2.0_f32.powf((20.0 * 120.0 + 1_997.379_4) / 1200.0);
+        let mut frame = vec![0.0; CREPE_BINS];
+        frame[119] = 0.5;
+        frame[120] = 1.0;
+        frame[121] = 0.5;
+        let voiced: Vec<f32> = frame.iter().copied().cycle().take(CREPE_BINS * 5).collect();
+        for value in crepe_decode(&voiced) {
+            assert!((value - expected).abs() < 0.01, "{value} vs {expected}");
+        }
+        // Weak activations are unvoiced, and peaks outside 50..1100 Hz are ignored.
+        let mut weak = vec![0.0; CREPE_BINS];
+        weak[120] = 0.05;
+        weak[350] = 1.0;
+        assert_eq!(crepe_decode(&weak), vec![0.0]);
     }
 
     #[test]

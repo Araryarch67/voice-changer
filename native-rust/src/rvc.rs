@@ -8,12 +8,29 @@ use anyhow::{bail, Context, Result};
 use ort::{execution_providers::CUDAExecutionProvider, session::Session, value::Tensor};
 use std::path::Path;
 
+fn open_session(file: &Path, threads: usize, device: Device) -> Result<Session> {
+    let mut builder = Session::builder()?.with_intra_threads(threads)?;
+    if device == Device::Gpu {
+        builder = builder
+            .with_execution_providers([CUDAExecutionProvider::default()
+                .build()
+                .error_on_failure()])
+            .context("GPU is selected but this ONNX Runtime cannot use CUDA; install a GPU build or switch the device to CPU")?;
+    }
+    Ok(builder.commit_from_file(file)?)
+}
+
 /// RVC ONNX with waveform-in ContentVec and waveform-in RMVPE exports.
 pub struct Rvc {
     manifest: ModelManifest,
     voice: Session,
     embedder: Session,
     pitch: Option<Session>,
+    /// Loaded on first use of a CREPE detector, with the detector it was loaded for.
+    crepe: Option<(F0Detector, Session)>,
+    /// Blocks still converted after the input fell under the noise gate.
+    gate_hold: u32,
+    device: Device,
     history: Vec<f32>,
     sola: Sola,
     geometry: Option<(u32, u32, u32, u32, u32)>,
@@ -35,17 +52,7 @@ impl Rvc {
         if device == Device::Gpu {
             crate::runtime::preload_gpu_libraries();
         }
-        let session = |file: &Path| -> Result<Session> {
-            let mut builder = Session::builder()?.with_intra_threads(manifest.intra_threads)?;
-            if device == Device::Gpu {
-                builder = builder
-                    .with_execution_providers([CUDAExecutionProvider::default()
-                        .build()
-                        .error_on_failure()])
-                    .context("GPU is selected but this ONNX Runtime cannot use CUDA; install a GPU build or switch the device to CPU")?;
-            }
-            Ok(builder.commit_from_file(file)?)
-        };
+        let session = |file: &Path| open_session(file, manifest.intra_threads, device);
         let voice = session(&manifest.model).context("Load RVC ONNX")?;
         let embedder = session(&manifest.embedder).context("Load ContentVec/HuBERT ONNX")?;
         for required in ["feats", "p_len", "sid"] {
@@ -102,6 +109,9 @@ impl Rvc {
             voice,
             embedder,
             pitch,
+            crepe: None,
+            gate_hold: 0,
+            device,
             history: Vec::new(),
             sola: Sola::default(),
             geometry: None,
@@ -152,12 +162,53 @@ impl Rvc {
         semitones: f32,
         detector: F0Detector,
     ) -> Result<(Vec<i64>, Vec<f32>)> {
-        let Some(model) = &mut self.pitch else {
+        if self.pitch.is_none() {
             return Ok((Vec::new(), Vec::new()));
-        };
+        }
         let detected = match detector {
             F0Detector::Yin => crate::pitch::yin(audio, frames),
+            #[cfg(feature = "world")]
+            F0Detector::Harvest => crate::pitch::harvest(audio),
+            #[cfg(feature = "world")]
+            F0Detector::Dio => crate::pitch::dio(audio),
+            #[cfg(not(feature = "world"))]
+            F0Detector::Harvest | F0Detector::Dio => {
+                bail!("This build does not include the Harvest and DIO detectors")
+            }
+            F0Detector::CrepeFull | F0Detector::CrepeTiny => {
+                if self
+                    .crepe
+                    .as_ref()
+                    .is_none_or(|(loaded, _)| *loaded != detector)
+                {
+                    let name = if detector == F0Detector::CrepeFull {
+                        "crepe_full.onnx"
+                    } else {
+                        "crepe_tiny.onnx"
+                    };
+                    let file = self.manifest.pitch.with_file_name(name);
+                    anyhow::ensure!(
+                        file.is_file(),
+                        "CREPE model not found: {}. Put {name} beside the RMVPE model, or choose another F0 detector",
+                        file.display()
+                    );
+                    let model = open_session(&file, self.manifest.intra_threads, self.device)
+                        .context("Load CREPE ONNX")?;
+                    anyhow::ensure!(
+                        model.inputs.iter().any(|i| i.name == "frames"),
+                        "CREPE model must take a `frames` input of [N,1024]"
+                    );
+                    self.crepe = Some((detector, model));
+                }
+                let (_, model) = self.crepe.as_mut().expect("loaded above");
+                let (input, count) = crate::pitch::crepe_frames(audio);
+                let input = Tensor::from_array(([count, 1024], input.into_boxed_slice()))?;
+                let output = model.run(ort::inputs! { "frames" => input })?;
+                let (_, activations) = output[0].try_extract_tensor::<f32>()?;
+                crate::pitch::crepe_decode(activations)
+            }
             F0Detector::Rmvpe => {
+                let model = self.pitch.as_mut().expect("checked above");
                 let waveform =
                     Tensor::from_array(([1, audio.len()], audio.to_vec().into_boxed_slice()))?;
                 let output = if model.inputs.iter().any(|i| i.name == "threshold") {
@@ -232,7 +283,18 @@ impl Converter for Rvc {
         } else if self.history.len() > required {
             self.history.drain(..self.history.len() - required);
         }
-        if dsp::rms(input) < settings.silence_threshold {
+        // Gate on the loudest 20 ms rather than the block average, so a word that
+        // starts or ends inside the block is kept, and convert one more block after
+        // the last loud one so trailing sounds are not cut.
+        let loudest = input
+            .chunks((rate as usize / 50).max(1))
+            .map(dsp::rms)
+            .fold(0.0, f32::max);
+        if loudest >= settings.silence_threshold {
+            self.gate_hold = 1;
+        } else if self.gate_hold > 0 {
+            self.gate_hold -= 1;
+        } else {
             self.sola.reset();
             return Ok(vec![0.0; input.len()]);
         }
@@ -312,5 +374,6 @@ impl Converter for Rvc {
         self.history.clear();
         self.sola.reset();
         self.geometry = None;
+        self.gate_hold = 0;
     }
 }
