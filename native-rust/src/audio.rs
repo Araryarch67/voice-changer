@@ -74,8 +74,8 @@ pub struct AudioOptions {
     pub settings: Settings,
     /// Folder for REC files.
     pub record_dir: PathBuf,
-    /// Send the converted voice to the built-in virtual microphone (Linux) instead of
-    /// `output`.
+    /// Send the converted voice to the built-in virtual microphone (Linux, or the
+    /// Voice Changer Mic driver on Windows) instead of `output`.
     pub virtual_mic: bool,
     /// A second output that plays the converted voice, to hear yourself:
     /// `Some(None)` is the system default device.
@@ -250,6 +250,24 @@ impl Recorder {
     }
 }
 
+/// Where the converted voice plays.
+fn voice_output(host: &cpal::Host, options: &AudioOptions) -> Result<cpal::Device> {
+    if !options.virtual_mic {
+        return select_device(host, &options.output, false);
+    }
+    // Windows: the Voice Changer Mic driver's speaker, which feeds its microphone.
+    #[cfg(windows)]
+    {
+        crate::windows_mic::output_device(host)
+    }
+    // Linux: the sound server's default device; the stream moves to the virtual
+    // microphone once playing.
+    #[cfg(not(windows))]
+    {
+        select_device(host, &None, false)
+    }
+}
+
 fn select_device(host: &cpal::Host, id: &Option<String>, input: bool) -> Result<cpal::Device> {
     if let Some(id) = id {
         return host
@@ -330,10 +348,16 @@ fn route_to_virtual_mic(stop: Arc<AtomicBool>) -> Result<()> {
             })?;
         Ok(())
     }
-    #[cfg(not(target_os = "linux"))]
+    // Windows: the voice already plays into the driver's speaker, which feeds its mic.
+    #[cfg(windows)]
     {
         let _ = stop;
-        bail!("The built-in virtual microphone is only available on Linux")
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = stop;
+        bail!("The built-in virtual microphone is only available on Linux and Windows")
     }
 }
 
@@ -359,14 +383,7 @@ fn run(
     let mut engine = Engine::new(converter);
     let host = cpal::default_host();
     let input_device = select_device(&host, &options.input, true)?;
-    // The virtual microphone is fed through the sound server, which the default
-    // device reaches; the stream is moved to it once playing.
-    let output_choice = if options.virtual_mic {
-        None
-    } else {
-        options.output.clone()
-    };
-    let output_device = select_device(&host, &output_choice, false)?;
+    let output_device = voice_output(&host, &options)?;
     let input_config = input_device.default_input_config()?;
     let output_config = output_device.default_output_config()?;
     let input_rate = input_config.sample_rate();

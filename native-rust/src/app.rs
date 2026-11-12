@@ -210,6 +210,61 @@ impl VoiceApp {
             }
         }
     }
+    /// Voice Changer Mic: install the driver, then send the voice to it.
+    #[cfg(all(windows, feature = "audio"))]
+    fn windows_mic_settings(&mut self, ui: &mut egui::Ui) {
+        use crate::windows_mic;
+        let installed = self
+            .devices
+            .iter()
+            .any(|device| !device.input && windows_mic::is_endpoint(&device.name));
+        let idle = self.work.is_none();
+        m3::field_label(ui, "Virtual microphone");
+        if installed {
+            ui.horizontal(|ui| {
+                m3::switch(ui, &mut self.saved.virtual_mic, "Virtual microphone");
+                ui.label(if self.saved.virtual_mic {
+                    "On: the voice goes to Voice Changer Mic"
+                } else {
+                    "Off"
+                });
+            });
+            ui.label(m3::supporting(
+                "Sends the converted voice to \"Voice Changer Mic\". Pick it as the microphone in Discord, OBS or a game. It is silent while the voice changer is stopped.",
+            ));
+            if ui
+                .add_enabled(idle, m3::Button::text("Remove Voice Changer Mic"))
+                .on_hover_text("Uninstalls the driver; Windows asks for administrator permission")
+                .clicked()
+            {
+                self.saved.virtual_mic = false;
+                self.begin_work(|| {
+                    windows_mic::uninstall_with_prompt()?;
+                    Ok("Voice Changer Mic was removed.".into())
+                });
+            }
+            return;
+        }
+        self.saved.virtual_mic = false;
+        if windows_mic::packaged_inf().is_some() {
+            if ui
+                .add_enabled(idle, m3::Button::tonal("Install Voice Changer Mic"))
+                .clicked()
+            {
+                self.begin_work(|| {
+                    windows_mic::install_with_prompt()?;
+                    Ok("Voice Changer Mic is installed. Turn on Virtual microphone, then pick Voice Changer Mic in Discord or OBS.".into())
+                });
+            }
+            ui.label(m3::supporting(
+                "Adds a \"Voice Changer Mic\" input that Discord, OBS and games can use, without VB-Cable. Windows asks for administrator permission once.",
+            ));
+        } else {
+            ui.label(m3::supporting(
+                "This download does not include the Voice Changer Mic driver yet. Choose a virtual cable such as VB-Cable as the output below.",
+            ));
+        }
+    }
     fn running(&self) -> bool {
         #[cfg(feature = "audio")]
         {
@@ -256,7 +311,7 @@ impl VoiceApp {
             },
             settings: self.saved.settings.clone(),
             record_dir: recordings_dir(),
-            virtual_mic: cfg!(target_os = "linux") && self.saved.virtual_mic,
+            virtual_mic: cfg!(any(target_os = "linux", windows)) && self.saved.virtual_mic,
             monitor: self
                 .saved
                 .monitor
@@ -1147,7 +1202,10 @@ impl VoiceApp {
                             "Adds a \"Voice Changer Mic\" input. Pick it as the microphone in Discord, OBS or a game to send them your converted voice. No extra software to install. It stays while you are logged in, even with the app closed, so those apps keep it selected; it carries silence while the voice changer is off, never your own voice. Turning this off removes it.",
                         ));
                     }
-                    let virtual_mic = cfg!(target_os = "linux") && self.saved.virtual_mic;
+                    #[cfg(windows)]
+                    self.windows_mic_settings(ui);
+                    let virtual_mic =
+                        cfg!(any(target_os = "linux", windows)) && self.saved.virtual_mic;
                     ui.add_enabled_ui(!virtual_mic, |ui| {
                         device_picker(
                             ui,
@@ -1718,6 +1776,9 @@ impl eframe::App for VoiceApp {
         });
         if let Some(result) = completed {
             self.work = None;
+            // Installing or removing Voice Changer Mic changes the device list.
+            #[cfg(all(windows, feature = "audio"))]
+            self.refresh_devices();
             #[cfg(feature = "catalog")]
             {
                 self.browse.download = None;

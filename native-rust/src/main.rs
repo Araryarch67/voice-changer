@@ -232,6 +232,19 @@ fn main() -> Result<()> {
             #[cfg(not(feature = "export"))]
             bail!("Build with the export feature");
         }
+        // Run elevated by the app (one UAC prompt) to add or remove Voice Changer Mic.
+        #[cfg(windows)]
+        Some("--install-mic-driver") if (2..=3).contains(&args.len()) => {
+            use voice_changer_native::windows_mic;
+            let report = args.get(2).map(Path::new);
+            windows_mic::elevated(|| windows_mic::install(Path::new(&args[1])), report)?;
+        }
+        #[cfg(windows)]
+        Some("--uninstall-mic-driver") if args.len() <= 2 => {
+            use voice_changer_native::windows_mic;
+            let report = args.get(1).map(Path::new);
+            windows_mic::elevated(windows_mic::uninstall, report)?;
+        }
         Some("--devices") => {
             #[cfg(feature = "audio")]
             for device in voice_changer_native::audio::devices()? { println!("{}\t{}\t{}", if device.input { "input" } else { "output" }, device.id, device.name); }

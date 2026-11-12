@@ -32,6 +32,8 @@ pub mod setup;
 #[cfg(all(feature = "audio", target_os = "linux"))]
 pub mod virtual_mic;
 pub mod wav;
+#[cfg(windows)]
+pub mod windows_mic;
 
 #[cfg(feature = "gui")]
 pub fn run(options: eframe::NativeOptions) -> eframe::Result {

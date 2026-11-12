@@ -172,6 +172,14 @@ jobs:
           cp README.md "dist/${app}/"
           cp ../LICENSE "dist/${app}/"
           cp examples/model.json "dist/${app}/models/example-model.json.txt"
+          # Voice Changer Mic: only a package Microsoft has signed loads on Windows, so
+          # the driver ships once its signed files are in platforms/windows/driver/signed.
+          signed=platforms/windows/driver/signed
+          if [ "$RUNNER_OS" = Windows ] && [ -f "$signed/VoiceChangerMic.inf" ]; then
+            mkdir -p "dist/${app}/driver"
+            cp "$signed/VoiceChangerMic.inf" "$signed/VoiceChangerMic.sys" "$signed/voicechangermic.cat" "dist/${app}/driver/"
+            cp platforms/windows/driver/LICENSE platforms/windows/driver/THIRD_PARTY_NOTICES.md "dist/${app}/driver/"
+          fi
           cd dist
           if [ "$RUNNER_OS" = Windows ]; then
             7z a -tzip "${app}.zip" "${app}" >/dev/null

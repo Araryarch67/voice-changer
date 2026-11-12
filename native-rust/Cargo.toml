@@ -49,6 +49,17 @@ jni = "0.21"
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 rfd = { version = "=0.16.0", optional = true }
 
+[target.'cfg(windows)'.dependencies]
+# Installs the Voice Changer Mic driver (SetupAPI) after a UAC prompt (ShellExecuteExW).
+windows-sys = { version = "0.61", features = [
+  "Win32_Devices_DeviceAndDriverInstallation",
+  "Win32_Foundation",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libloading = "0.8"
 
