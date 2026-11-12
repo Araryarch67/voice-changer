@@ -15,6 +15,7 @@ pub trait Converter: Send {
 pub struct Engine {
     converter: Option<Box<dyn Converter>>,
     was_bypass: bool,
+    high_pass: Option<(u32, dsp::HighPass)>,
     input_denoise: Denoiser,
     output_denoise: Denoiser,
     echo: Option<EchoCanceller>,
@@ -26,6 +27,9 @@ impl Engine {
         if let Some(converter) = &mut self.converter {
             converter.reset();
         }
+        if let Some((_, hp)) = &mut self.high_pass {
+            hp.reset();
+        }
         self.input_denoise.reset();
         self.output_denoise.reset();
         self.echo = None;
@@ -35,6 +39,7 @@ impl Engine {
         Self {
             converter,
             was_bypass: true,
+            high_pass: None,
             input_denoise: Denoiser::default(),
             output_denoise: Denoiser::default(),
             echo: None,
@@ -53,6 +58,19 @@ impl Engine {
             input = canceller.process(&input, &self.played, rate)?;
         } else {
             self.echo = None;
+            self.played.clear();
+        }
+        if !settings.bypass {
+            let hp = match &mut self.high_pass {
+                Some((hp_rate, hp)) if *hp_rate == rate => hp,
+                slot => {
+                    *slot = Some((rate, dsp::HighPass::default_voice(rate)));
+                    &mut slot.as_mut().expect("initialized above").1
+                }
+            };
+            hp.process(&mut input);
+        } else if let Some((_, hp)) = &mut self.high_pass {
+            hp.reset();
         }
         match settings.noise {
             Noise::Off => self.input_denoise.reset(),
@@ -74,6 +92,9 @@ impl Engine {
                 if let Some(converter) = &mut self.converter {
                     converter.reset();
                 }
+                if let Some((_, hp)) = &mut self.high_pass {
+                    hp.reset();
+                }
             }
             let Some(converter) = &mut self.converter else {
                 bail!("Load a model or enable bypass before starting");
@@ -92,7 +113,12 @@ impl Engine {
             "Model produced non-finite audio"
         );
         for s in &mut out {
-            *s = (*s * settings.output_gain).clamp(-1.0, 1.0);
+            let gained = *s * settings.output_gain;
+            *s = if settings.bypass {
+                gained.clamp(-1.0, 1.0)
+            } else {
+                soft_limit(gained)
+            };
         }
         if settings.echo {
             self.played.clone_from(&out);
@@ -101,6 +127,19 @@ impl Engine {
     }
     pub fn input_level(audio: &[f32]) -> f32 {
         dsp::rms(audio)
+    }
+}
+
+/// Transparent soft-knee limiter above 0.9 to prevent harsh digital clipping on loud transients.
+fn soft_limit(sample: f32) -> f32 {
+    const KNEE: f32 = 0.9;
+    let abs = sample.abs();
+    if abs <= KNEE {
+        sample
+    } else {
+        let head = 1.0 - KNEE;
+        let shaped = KNEE + head * ((abs - KNEE) / head).tanh();
+        (sample.signum() * shaped).clamp(-1.0, 1.0)
     }
 }
 
@@ -116,5 +155,52 @@ pub fn load_converter_on(path: &std::path::Path, device: Device) -> Result<Box<d
     {
         let _ = (path, device);
         bail!("This build does not include the onnx feature")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct PassthroughConverter;
+    impl Converter for PassthroughConverter {
+        fn process(&mut self, audio: &[f32], _: u32, _: &Settings) -> Result<Vec<f32>> {
+            Ok(audio.to_vec())
+        }
+        fn reset(&mut self) {}
+    }
+
+    #[test]
+    fn active_path_applies_high_pass_and_soft_limits_peaks() {
+        let mut engine = Engine::new(Some(Box::new(PassthroughConverter)));
+        let settings = Settings {
+            bypass: false,
+            output_gain: 1.5,
+            ..Settings::default()
+        };
+
+        // Pure DC input should settle near zero after the 80 Hz high-pass filter.
+        let dc = vec![0.4; 4800];
+        let filtered = engine.process(&dc, 48000, &settings).unwrap();
+        assert!(dsp::rms(&filtered[2400..]) < 1e-3);
+
+        // Normal speech band (220 Hz) passes through and hot peaks are soft-limited inside [-1, 1].
+        engine.reset();
+        let speech: Vec<f32> = (0..4800)
+            .map(|i| 0.8 * (2.0 * std::f32::consts::PI * 220.0 * i as f32 / 48000.0).sin())
+            .collect();
+        let out = engine.process(&speech, 48000, &settings).unwrap();
+        assert!(out
+            .iter()
+            .all(|s| s.is_finite() && (-1.0..=1.0).contains(s)));
+        assert!(dsp::rms(&out[2400..]) > 0.5);
+
+        // Soft limiter is linear within [-0.9, 0.9] and smooth above 0.9.
+        assert_eq!(soft_limit(0.5), 0.5);
+        assert_eq!(soft_limit(-0.9), -0.9);
+        assert!(soft_limit(1.0) < 1.0 && soft_limit(1.0) > 0.95);
+        assert!(soft_limit(-1.0) > -1.0 && soft_limit(-1.0) < -0.95);
+        assert!(soft_limit(2.0) <= 1.0 && soft_limit(2.0) > 0.99);
+        assert!(soft_limit(-2.0) >= -1.0 && soft_limit(-2.0) < -0.99);
     }
 }

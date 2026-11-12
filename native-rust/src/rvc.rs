@@ -54,6 +54,8 @@ pub struct Rvc {
     crepe: Option<(F0Detector, Session)>,
     /// Blocks still converted after the input fell under the noise gate.
     gate_hold: u32,
+    /// Whether the noise gate is currently open (needs a smooth fade-out before muting).
+    gate_open: bool,
     device: Device,
     history: Vec<f32>,
     sola: Sola,
@@ -167,6 +169,7 @@ impl Rvc {
             pitch,
             crepe: None,
             gate_hold: 0,
+            gate_open: false,
             device,
             history: Vec::new(),
             sola: Sola::default(),
@@ -268,7 +271,7 @@ impl Rvc {
                 let waveform =
                     Tensor::from_array(([1, audio.len()], audio.to_vec().into_boxed_slice()))?;
                 let output = if model.inputs.iter().any(|i| i.name == "threshold") {
-                    let threshold = Tensor::from_array(([1], vec![0.3_f32].into_boxed_slice()))?;
+                    let threshold = Tensor::from_array(([1], vec![0.03_f32].into_boxed_slice()))?;
                     model.run(ort::inputs! { "waveform" => waveform, "threshold" => threshold })?
                 } else {
                     model.run(ort::inputs! { "waveform" => waveform })?
@@ -280,9 +283,10 @@ impl Rvc {
             !detected.is_empty() && detected.iter().all(|v| v.is_finite() && *v >= 0.0),
             "Invalid pitch detector output"
         );
+        let stabilized = crate::pitch::stabilize_f0(&detected);
         let shift = 2.0_f32.powf(semitones / 12.0);
         let pitchf: Vec<_> = (0..frames)
-            .map(|i| detected[(i * detected.len() / frames).min(detected.len() - 1)] * shift)
+            .map(|i| stabilized[(i * stabilized.len() / frames).min(stabilized.len() - 1)] * shift)
             .collect();
         let pitch = pitchf.iter().map(|v| dsp::coarse_pitch(*v)).collect();
         Ok((pitch, pitchf))
@@ -297,8 +301,8 @@ impl Rvc {
             .as_ref()
             .context("Index ratio is nonzero but no feature_bank is configured")?;
         let channels = self.manifest.channels;
+        let mut retrieved = vec![0.0_f32; channels];
         for (i, frame) in features.chunks_exact_mut(channels).enumerate() {
-            let best = bank.nearest(frame);
             let unvoiced = !pitch.is_empty() && pitch[i] <= 0.0;
             let protection = if unvoiced && settings.protect < 0.5 {
                 settings.protect
@@ -306,8 +310,12 @@ impl Rvc {
                 1.0
             };
             let ratio = settings.index_ratio * protection;
-            for (sample, retrieved) in frame.iter_mut().zip(best) {
-                *sample = *sample * (1.0 - ratio) + retrieved * ratio;
+            if ratio <= 0.0 {
+                continue;
+            }
+            bank.blend_nearest(frame, 8, &mut retrieved);
+            for (sample, &blended) in frame.iter_mut().zip(&retrieved) {
+                *sample = *sample * (1.0 - ratio) + blended * ratio;
             }
         }
         Ok(())
@@ -346,10 +354,15 @@ impl Converter for Rvc {
             .chunks((rate as usize / 50).max(1))
             .map(dsp::rms)
             .fold(0.0, f32::max);
+        let mut closing = false;
         if loudest >= settings.silence_threshold {
             self.gate_hold = 1;
+            self.gate_open = true;
         } else if self.gate_hold > 0 {
             self.gate_hold -= 1;
+        } else if self.gate_open {
+            closing = true;
+            self.gate_open = false;
         } else {
             self.sola.reset();
             return Ok(vec![0.0; input.len()]);
@@ -417,17 +430,24 @@ impl Converter for Rvc {
             voice_start.elapsed().as_secs_f64() * 1000.0
         );
         let converted = dsp::resample(&values, self.manifest.sample_rate, rate);
-        self.sola.process(
+        let mut out = self.sola.process(
             &converted,
             input.len(),
             settings.overlap_ms as usize * rate as usize / 1000,
             settings.search_ms as usize * rate as usize / 1000,
-        )
+        )?;
+        if closing {
+            // Smoothly fade the tail block to zero before muting, avoiding a click.
+            dsp::fade(&mut out, 1.0, 0.0);
+            self.sola.reset();
+        }
+        Ok(out)
     }
     fn reset(&mut self) {
         self.history.clear();
         self.sola.reset();
         self.geometry = None;
         self.gate_hold = 0;
+        self.gate_open = false;
     }
 }

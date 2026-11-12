@@ -84,6 +84,7 @@ pub struct VoiceApp {
     import_checkpoint: String,
     import_index: String,
     file_output: String,
+    file_analyze: bool,
     work: Option<mpsc::Receiver<Result<String, String>>>,
     message: Option<String>,
     /// The error and message last written to the terminal, so each is logged once.
@@ -161,6 +162,7 @@ impl VoiceApp {
             import_checkpoint: String::new(),
             import_index: String::new(),
             file_output: String::new(),
+            file_analyze: true,
             work: None,
             message: None,
             logged: (None, None),
@@ -1304,9 +1306,9 @@ impl VoiceApp {
                             m3::ON_SURFACE_VARIANT
                         },
                         if recording {
-                            "Stop recording"
+                            "Stop recording and save WAV + diagnostic report"
                         } else {
-                            "Record the microphone and the converted voice to WAV files"
+                            "Record microphone and converted voice to WAV files with pitch/spectrogram diagnostics"
                         },
                     )
                     .clicked()
@@ -1619,6 +1621,14 @@ impl VoiceApp {
                     -24.0..=24.0,
                     0.1,
                 );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    m3::switch(ui, &mut self.file_analyze, "Save diagnostic report");
+                    ui.label("Save diagnostic report (.json + .png)");
+                });
+                ui.label(m3::supporting(
+                    "Writes pitch, spectrogram, and artifact diagnostics beside the converted WAV.",
+                ));
             });
             ui.label(m3::supporting(if busy {
                 "Stop live audio, or wait for the current model/file task to finish."
@@ -1638,6 +1648,7 @@ impl VoiceApp {
                 let manifest = PathBuf::from(&self.saved.slots[self.saved.selected].manifest);
                 let input = PathBuf::from(self.file_input.trim());
                 let output = PathBuf::from(self.file_output.trim());
+                let with_report = self.file_analyze;
                 let settings = Settings {
                     bypass: false,
                     ..self.saved.settings.clone()
@@ -1651,7 +1662,34 @@ impl VoiceApp {
                     let converter = crate::engine::load_converter_on(&manifest, settings.device)?;
                     let mut engine = crate::engine::Engine::new(Some(converter));
                     crate::wav::convert(&mut engine, &input, &output, &settings)?;
-                    Ok(format!("Conversion complete: {}", output.display()))
+                    if with_report {
+                        let stem = output.file_stem().unwrap_or_default().to_string_lossy();
+                        let prefix = output.with_file_name(stem.as_ref());
+                        let model_label = manifest.display().to_string();
+                        let (report, json, png) = crate::analyze::analyze_wavs_with_context(
+                            &input,
+                            Some(&output),
+                            &prefix,
+                            Some(&model_label),
+                            Some(&settings),
+                        )?;
+                        let plot = png
+                            .map(|p| format!(" and {}", p.display()))
+                            .unwrap_or_default();
+                        let headline = crate::analyze::format_summary(&report)
+                            .lines()
+                            .take(3)
+                            .collect::<Vec<_>>()
+                            .join(" | ");
+                        Ok(format!(
+                            "Conversion complete: {} (report: {}{} — {headline})",
+                            output.display(),
+                            json.display(),
+                            plot
+                        ))
+                    } else {
+                        Ok(format!("Conversion complete: {}", output.display()))
+                    }
                 });
             }
         });

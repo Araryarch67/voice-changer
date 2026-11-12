@@ -10,6 +10,12 @@ fn engine() -> Engine {
     Engine::new(Some(load_converter(&manifest).unwrap()))
 }
 
+fn sine_input(samples: usize) -> Vec<f32> {
+    (0..samples)
+        .map(|i| 0.2 * (2.0 * std::f32::consts::PI * 220.0 * i as f32 / 48000.0).sin())
+        .collect()
+}
+
 #[test]
 #[ignore = "requires ONNX Runtime 1.22; set ORT_DYLIB_PATH"]
 fn onnx_pipeline_preserves_duration_and_pitch_controls_reach_model() {
@@ -18,7 +24,7 @@ fn onnx_pipeline_preserves_duration_and_pitch_controls_reach_model() {
         bypass: false,
         ..Settings::default()
     };
-    let input = vec![0.2; 7680];
+    let input = sine_input(7680);
     let first = engine.process(&input, 48000, &settings).unwrap();
     assert_eq!(first.len(), input.len());
     assert!(first.iter().all(|v| v.is_finite() && *v > 0.1));
@@ -47,7 +53,7 @@ fn silence_and_missing_retrieval_bank_are_handled_explicitly() {
     );
     settings.index_ratio = 0.5;
     let error = engine
-        .process(&vec![0.2; 7680], 48000, &settings)
+        .process(&sine_input(7680), 48000, &settings)
         .unwrap_err();
     assert!(error.to_string().contains("feature_bank"));
 }

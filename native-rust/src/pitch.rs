@@ -155,6 +155,61 @@ fn median3(values: &[f32], zero_padded: bool) -> Vec<f32> {
         .collect()
 }
 
+/// Stabilizes an F0 contour in Hz (`0.0` = unvoiced): preserves all unvoiced
+/// `0.0` frames, suppresses isolated interior 1-frame voiced noise blips, and
+/// smooths spurious single/double-frame pitch spikes and octave jumps without
+/// blurring monotonic pitch slides or normal vibrato.
+pub fn stabilize_f0(f0: &[f32]) -> Vec<f32> {
+    let len = f0.len();
+    let mut out = Vec::with_capacity(len);
+    for (i, &cur) in f0.iter().enumerate() {
+        if !cur.is_finite() || cur <= 0.0 {
+            out.push(0.0);
+            continue;
+        }
+        let start = i.saturating_sub(2);
+        let end = (i + 3).min(len);
+        let mut voiced = [0.0_f32; 5];
+        let mut n = 0;
+        for &v in &f0[start..end] {
+            if v.is_finite() && v > 0.0 {
+                voiced[n] = v;
+                n += 1;
+            }
+        }
+        // Mute isolated interior 1-frame voiced blips surrounded by silence/unvoiced.
+        if n == 1 && i > 0 && i + 1 < len {
+            out.push(0.0);
+            continue;
+        }
+        let mut fixed = cur;
+        let prev = i
+            .checked_sub(1)
+            .map(|j| f0[j])
+            .filter(|v| v.is_finite() && *v > 0.0);
+        let next = f0.get(i + 1).copied().filter(|v| v.is_finite() && *v > 0.0);
+        if let (Some(a), Some(b)) = (prev, next) {
+            let mut w3 = [a, cur, b];
+            w3.sort_by(f32::total_cmp);
+            let med3 = w3[1];
+            let ratio3 = (cur / med3).max(med3 / cur);
+            if ratio3 > 1.15 {
+                fixed = med3;
+            }
+        }
+        if n >= 3 {
+            voiced[..n].sort_by(f32::total_cmp);
+            let med5 = voiced[n / 2];
+            let ratio5 = (fixed / med5).max(med5 / fixed);
+            if ratio5 > 1.4 {
+                fixed = med5;
+            }
+        }
+        out.push(fixed);
+    }
+    out
+}
+
 /// WORLD's Harvest with StoneMask refinement and a three-frame median, on 16 kHz
 /// audio: one value per 10 ms frame, 0 for unvoiced. Accurate and slow.
 #[cfg(feature = "world")]
@@ -269,5 +324,39 @@ mod tests {
     fn silence_is_unvoiced() {
         assert!(yin(&[0.0; 16000], 100).iter().all(|v| *v == 0.0));
         assert_eq!(yin(&[], 3), vec![0.0; 3]);
+    }
+
+    #[test]
+    fn stabilize_f0_removes_spikes_while_preserving_unvoiced_and_slides() {
+        assert!(stabilize_f0(&[]).is_empty());
+        assert_eq!(stabilize_f0(&[220.0]), vec![220.0]);
+
+        // Unvoiced 0.0 frames are preserved, and isolated interior 1-frame voiced blips are muted.
+        let blips = [0.0, 0.0, 320.0, 0.0, 0.0, 200.0, 202.0, 0.0];
+        assert_eq!(
+            stabilize_f0(&blips),
+            vec![0.0, 0.0, 0.0, 0.0, 0.0, 200.0, 202.0, 0.0]
+        );
+
+        // Single-frame and double-frame octave spikes are snapped without blurring monotonic slides.
+        let spiked = [
+            0.0, 200.0, 205.0, 410.0, 210.0, 215.0, 430.0, 434.0, 220.0, 225.0, 0.0,
+        ];
+        let fixed = stabilize_f0(&spiked);
+        assert_eq!(fixed[0], 0.0);
+        assert_eq!(fixed[10], 0.0);
+        assert!((fixed[3] - 210.0).abs() < 1e-3, "1-frame spike: {fixed:?}");
+        assert!(
+            fixed[6] < 230.0 && fixed[7] < 230.0,
+            "2-frame spike: {fixed:?}"
+        );
+
+        // Monotonic pitch slide is preserved unchanged.
+        let slide = [0.0, 180.0, 195.0, 210.0, 228.0, 246.0, 265.0, 0.0];
+        assert_eq!(stabilize_f0(&slide), slide);
+
+        // Gentle vibrato is preserved unchanged.
+        let vibrato = [200.0, 208.0, 216.0, 208.0, 200.0, 192.0, 200.0];
+        assert_eq!(stabilize_f0(&vibrato), vibrato);
     }
 }

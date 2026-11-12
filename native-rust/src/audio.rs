@@ -187,15 +187,66 @@ impl Recorder {
         }
         Ok(())
     }
-    fn finish(self) -> Result<String> {
+    fn finish(
+        self,
+        metrics: Arc<Metrics>,
+        jobs: &mut Vec<thread::JoinHandle<()>>,
+        model: Option<String>,
+        settings: Settings,
+    ) -> Result<String> {
         self.input.finalize()?;
         self.output.finalize()?;
-        Ok(format!(
-            "Recording saved in {}: {} and {}",
-            self.stem.parent().unwrap_or(Path::new(".")).display(),
-            Self::name(&self.stem, "in"),
-            Self::name(&self.stem, "out")
-        ))
+        let dir = self.stem.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let in_name = Self::name(&self.stem, "in");
+        let out_name = Self::name(&self.stem, "out");
+        let in_path = self.stem.with_file_name(&in_name);
+        let out_path = self.stem.with_file_name(&out_name);
+        let stem = self.stem;
+        let base = format!(
+            "Recording saved in {}: {in_name} and {out_name}",
+            dir.display()
+        );
+        let fallback = base.clone();
+
+        jobs.retain(|handle| !handle.is_finished());
+        if let Ok(handle) = thread::Builder::new()
+            .name("voice-analyze".into())
+            .spawn(move || {
+                let message = match crate::analyze::analyze_wavs_with_context(
+                    &in_path,
+                    Some(&out_path),
+                    &stem,
+                    model.as_deref(),
+                    Some(&settings),
+                ) {
+                    Ok((report, json_path, png_path)) => {
+                        let json_name = json_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
+                        let plot = png_path
+                            .and_then(|p| {
+                                p.file_name().map(|n| format!(", {}", n.to_string_lossy()))
+                            })
+                            .unwrap_or_default();
+                        let summary = crate::analyze::format_summary(&report)
+                            .lines()
+                            .take(3)
+                            .collect::<Vec<_>>()
+                            .join(" | ");
+                        format!("{fallback} (report: {json_name}{plot} — {summary})")
+                    }
+                    Err(_) => fallback,
+                };
+                *metrics.recorded.lock().unwrap() = Some(message);
+            })
+        {
+            jobs.push(handle);
+            Ok(format!("{base} (analyzing…)"))
+        } else {
+            Ok(base)
+        }
     }
 }
 
@@ -390,6 +441,7 @@ fn run(
         }
     }
     let _end_routing = EndRouting(routing.clone());
+    let model_label = options.manifest.as_ref().map(|p| p.display().to_string());
     let mut settings = options.settings;
     let block_size = input_rate as usize * settings.block_ms as usize / 1000;
     let mut pending = Vec::with_capacity(block_size);
@@ -398,6 +450,7 @@ fn run(
     // Output begins when the first processed block is available.
     let mut output_started = false;
     let mut recorder: Option<Recorder> = None;
+    let mut analysis_jobs: Vec<thread::JoinHandle<()>> = Vec::new();
     metrics.ready.store(true, Ordering::Release);
     log::info!(
         "Live: block {} ms, extra {} ms, crossfade {} ms, pitch {:?}, tune {:+.1}, index {:.0}%, noise {:?}, echo {}{}",
@@ -498,7 +551,13 @@ fn run(
                         Some(format!("Recording failed: {error:#}"));
                 }
             },
-            (false, true) => finish_recording(&mut recorder, &metrics),
+            (false, true) => finish_recording(
+                &mut recorder,
+                &metrics,
+                &mut analysis_jobs,
+                model_label.clone(),
+                settings.clone(),
+            ),
             _ => {}
         }
         if let Some(active) = &mut recorder {
@@ -557,18 +616,35 @@ fn run(
             .store(output.len() as u64, Ordering::Relaxed);
         pending.clear();
     }
-    finish_recording(&mut recorder, &metrics);
+    finish_recording(
+        &mut recorder,
+        &metrics,
+        &mut analysis_jobs,
+        model_label,
+        settings,
+    );
+    for job in analysis_jobs {
+        let _ = job.join();
+    }
     metrics.recording.store(false, Ordering::Release);
     log::info!("Audio stopped");
     Ok(())
 }
 
-fn finish_recording(recorder: &mut Option<Recorder>, metrics: &Metrics) {
+fn finish_recording(
+    recorder: &mut Option<Recorder>,
+    metrics: &Arc<Metrics>,
+    jobs: &mut Vec<thread::JoinHandle<()>>,
+    model: Option<String>,
+    settings: Settings,
+) {
     if let Some(active) = recorder.take() {
-        *metrics.recorded.lock().unwrap() = Some(match active.finish() {
-            Ok(saved) => saved,
-            Err(error) => format!("Recording failed: {error:#}"),
-        });
+        *metrics.recorded.lock().unwrap() = Some(
+            match active.finish(metrics.clone(), jobs, model, settings) {
+                Ok(saved) => saved,
+                Err(error) => format!("Recording failed: {error:#}"),
+            },
+        );
     }
 }
 

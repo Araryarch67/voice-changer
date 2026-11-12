@@ -1,3 +1,4 @@
+pub mod analyze;
 #[cfg(feature = "gui")]
 pub mod app;
 #[cfg(feature = "audio")]
