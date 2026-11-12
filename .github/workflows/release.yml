@@ -1,0 +1,152 @@
+name: Release native app
+
+# Builds native-rust/ for Linux, Windows and macOS. A pushed tag (v*) publishes the
+# archives to a GitHub release; a manual run only keeps them as workflow artifacts.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Must match the ONNX Runtime the pinned ort crate targets.
+  ORT_VERSION: "1.22.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            ort_archive: onnxruntime-linux-x64
+            ort_ext: tgz
+            ort_lib: libonnxruntime.so
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ort_archive: onnxruntime-win-x64
+            ort_ext: zip
+            ort_lib: onnxruntime.dll
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            ort_archive: onnxruntime-osx-arm64
+            ort_ext: tgz
+            ort_lib: libonnxruntime.dylib
+          - name: macos-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            ort_archive: onnxruntime-osx-x86_64
+            ort_ext: tgz
+            ort_lib: libonnxruntime.dylib
+    defaults:
+      run:
+        shell: bash
+        working-directory: native-rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native-rust
+          key: ${{ matrix.target }}
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev libxkbcommon-dev libwayland-dev libudev-dev
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Fetch ONNX Runtime
+        run: |
+          archive="${{ matrix.ort_archive }}-${ORT_VERSION}"
+          curl -fsSL -o "ort.${{ matrix.ort_ext }}" \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${archive}.${{ matrix.ort_ext }}"
+          if [ "${{ matrix.ort_ext }}" = zip ]; then
+            7z x -y ort.zip >/dev/null
+          else
+            tar -xzf ort.tgz
+          fi
+          mkdir -p ort-lib
+          # -L: the Unix archives ship the library as a versioned file plus symlinks.
+          cp -L "${archive}/lib/${{ matrix.ort_lib }}" ort-lib/
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp "${archive}/lib/onnxruntime_providers_shared.dll" ort-lib/
+          fi
+
+      # The app looks for the runtime in lib/ beside its executable and for voices in
+      # models/ beside it, so each archive is laid out that way.
+      - name: Package (Linux, Windows)
+        if: runner.os != 'macOS'
+        run: |
+          app="voice-changer-${{ matrix.name }}"
+          mkdir -p "dist/${app}/lib" "dist/${app}/models"
+          binary=voice-changer-native
+          if [ "$RUNNER_OS" = Windows ]; then binary="${binary}.exe"; fi
+          cp "target/${{ matrix.target }}/release/${binary}" "dist/${app}/"
+          cp ort-lib/* "dist/${app}/lib/"
+          cp README.md "dist/${app}/"
+          cp examples/model.json "dist/${app}/models/example-model.json.txt"
+          cd dist
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a -tzip "${app}.zip" "${app}" >/dev/null
+          else
+            tar -czf "${app}.tar.gz" "${app}"
+          fi
+
+      - name: Package (macOS app bundle)
+        if: runner.os == 'macOS'
+        run: |
+          app="voice-changer-${{ matrix.name }}"
+          bundle="dist/Voice Changer.app"
+          mkdir -p "${bundle}/Contents/MacOS/lib" "${bundle}/Contents/MacOS/models"
+          cp "target/${{ matrix.target }}/release/voice-changer-native" "${bundle}/Contents/MacOS/"
+          cp ort-lib/* "${bundle}/Contents/MacOS/lib/"
+          # The plist carries the microphone usage description macOS requires.
+          cp platforms/macos/Info.plist "${bundle}/Contents/Info.plist"
+          # Ad-hoc signature only: the app is not notarized, so Gatekeeper still warns.
+          codesign --force --deep --sign - "${bundle}"
+          cd dist
+          ditto -c -k --keepParent "Voice Changer.app" "${app}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-changer-${{ matrix.name }}
+          path: |
+            native-rust/dist/*.tar.gz
+            native-rust/dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
