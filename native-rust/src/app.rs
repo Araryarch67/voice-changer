@@ -1849,8 +1849,11 @@ impl eframe::App for VoiceApp {
             self.browse_dialog(ctx);
         }
         #[cfg(feature = "catalog")]
-        if self.setup.open {
-            self.setup_dialog(ctx);
+        {
+            self.poll_setup(ctx);
+            if self.setup.open {
+                self.setup_dialog(ctx);
+            }
         }
         if self.running() || self.work.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
@@ -1863,6 +1866,8 @@ impl eframe::App for VoiceApp {
 impl VoiceApp {
     /// Progress, result and error strips above the page content.
     fn notices(&mut self, ui: &mut egui::Ui) {
+        #[cfg(feature = "catalog")]
+        self.setup_notice(ui);
         if self.work.is_some() {
             egui::Frame::new()
                 .fill(m3::SURFACE_CONTAINER_HIGH)

@@ -20,8 +20,15 @@ impl Setup {
             ..Default::default()
         }
     }
-    fn downloading(&self) -> bool {
+    pub fn downloading(&self) -> bool {
         self.done.is_some()
+    }
+    /// Bytes received, the total, and the fraction done.
+    fn amounts(&self) -> Option<(u64, u64, f32)> {
+        let progress = self.progress.as_ref()?;
+        let received = progress.received.load(Ordering::Relaxed);
+        let total = progress.total.load(Ordering::Relaxed).max(1);
+        Some((received, total, received as f32 / total as f32))
     }
 }
 
@@ -63,29 +70,43 @@ impl VoiceApp {
         }
     }
 
-    pub(super) fn setup_dialog(&mut self, ctx: &egui::Context) {
-        if let Some(result) = self.setup.done.as_ref().and_then(|rx| rx.try_recv().ok()) {
-            self.setup.done = None;
-            self.setup.progress = None;
-            match result {
-                Ok(()) if crate::runtime::models_root().is_some() => {
-                    self.setup.open = false;
-                    self.message = Some(
-                        "Setup finished. Import a voice or press Find online to add one.".into(),
-                    );
-                    return;
+    /// Runs every frame, so the download finishes while the dialog is hidden too.
+    pub(super) fn poll_setup(&mut self, ctx: &egui::Context) {
+        if !self.setup.downloading() {
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        let Some(result) = self.setup.done.as_ref().and_then(|rx| rx.try_recv().ok()) else {
+            return;
+        };
+        self.setup.done = None;
+        self.setup.progress = None;
+        match result {
+            Ok(()) if crate::runtime::models_root().is_some() => {
+                self.setup.open = false;
+                self.message =
+                    Some("Setup finished. Import a voice or press Find online to add one.".into());
+            }
+            Ok(()) => {
+                self.setup.problem = Some(format!(
+                    "The models were saved to {}, but the app does not look there. Start it from its install folder.",
+                    setup::target_root().display()
+                ));
+            }
+            Err(problem) => {
+                if !self.setup.open {
+                    self.error = Some(format!(
+                        "The voice engine download stopped: {problem}. Try again in Settings under Processing."
+                    ));
                 }
-                Ok(()) => {
-                    self.setup.problem = Some(format!(
-                        "The models were saved to {}, but the app does not look there. Start it from its install folder.",
-                        setup::target_root().display()
-                    ))
-                }
-                Err(problem) => self.setup.problem = Some(problem),
+                self.setup.problem = Some(problem);
             }
         }
+    }
+
+    pub(super) fn setup_dialog(&mut self, ctx: &egui::Context) {
         let downloading = self.setup.downloading();
-        let (mut start, mut later, mut cancel) = (false, false, false);
+        let (mut start, mut later, mut cancel, mut hide) = (false, false, false, false);
         let (_, dismissed) = m3::dialog(ctx, "setup-dialog", "Set up the voice engine", |ui| {
             ui.add(
                 egui::Label::new(
@@ -103,10 +124,7 @@ impl VoiceApp {
                 model_row(ui, glyph, model, ready);
             }
             ui.add_space(8.0);
-            if let Some(progress) = &self.setup.progress {
-                let received = progress.received.load(Ordering::Relaxed);
-                let total = progress.total.load(Ordering::Relaxed).max(1);
-                let fraction = received as f32 / total as f32;
+            if let Some((received, total, fraction)) = self.setup.amounts() {
                 linear_progress(ui, fraction);
                 ui.horizontal(|ui| {
                     ui.label(m3::supporting(&format!(
@@ -144,6 +162,10 @@ impl VoiceApp {
             }
             m3::actions(ui, |ui| {
                 if downloading {
+                    hide = ui
+                        .add(m3::Button::tonal("Hide"))
+                        .on_hover_text("Keep downloading while you use the app")
+                        .clicked();
                     cancel = ui.add(m3::Button::text("Cancel")).clicked();
                 } else {
                     let label = if self.setup.problem.is_some() {
@@ -167,10 +189,48 @@ impl VoiceApp {
                 progress.cancel.store(true, Ordering::Relaxed);
             }
         }
-        if downloading {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
-        } else if later || dismissed {
+        if later || hide || dismissed {
             self.setup.open = false;
+        }
+    }
+
+    /// Progress strip above the page while the download runs with the dialog hidden.
+    pub(super) fn setup_notice(&mut self, ui: &mut egui::Ui) {
+        if self.setup.open {
+            return;
+        }
+        let Some((received, total, fraction)) = self.setup.amounts() else {
+            return;
+        };
+        let mut show = false;
+        egui::Frame::new()
+            .fill(m3::SURFACE_CONTAINER_HIGH)
+            .corner_radius(12)
+            .inner_margin(egui::Margin {
+                left: 16,
+                right: 8,
+                top: 4,
+                bottom: 12,
+            })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(m3::icon(icons::GRAPHIC_EQ, 20.0, m3::PRIMARY));
+                    ui.label(format!(
+                        "Downloading the voice engine… {} of {} ({:.0}%)",
+                        megabytes(received),
+                        megabytes(total),
+                        fraction * 100.0
+                    ));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        show = ui.add(m3::Button::text("Show")).clicked();
+                    });
+                });
+                linear_progress(ui, fraction);
+            });
+        ui.add_space(4.0);
+        if show {
+            self.setup.open = true;
         }
     }
 
@@ -182,6 +242,12 @@ impl VoiceApp {
             if ready {
                 ui.label(m3::icon(icons::CHECK_CIRCLE, 20.0, m3::SUCCESS));
                 ui.label("ContentVec and RMVPE are installed");
+            } else if let Some((_, _, fraction)) = self.setup.amounts() {
+                ui.add(egui::Spinner::new().color(m3::PRIMARY));
+                ui.label(format!("Downloading… {:.0}%", fraction * 100.0));
+                if ui.add(m3::Button::text("Show")).clicked() {
+                    self.setup.open = true;
+                }
             } else {
                 ui.label(m3::icon(icons::ERROR, 20.0, m3::ERROR));
                 ui.label("Not installed");
