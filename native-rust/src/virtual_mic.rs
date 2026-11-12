@@ -8,11 +8,6 @@ use std::process::Command;
 pub const SINK: &str = "voice_changer_output";
 pub const SOURCE: &str = "voice_changer_mic";
 
-/// The sink and source exist while this lives; dropping it removes them.
-pub struct VirtualMic {
-    modules: Vec<u32>,
-}
-
 fn pactl(args: &[&str]) -> Result<String> {
     let output = Command::new("pactl")
         .args(args)
@@ -38,56 +33,67 @@ fn description(kind: &str, text: &str) -> String {
     format!("{kind}_properties=\"device.description=\\\"{text}\\\"\"")
 }
 
-impl VirtualMic {
-    pub fn create() -> Result<Self> {
-        // Modules left by a run that did not exit cleanly are replaced.
-        for id in stale_modules(&pactl(&["list", "short", "modules"])?) {
-            let _ = pactl(&["unload-module", &id.to_string()]);
-        }
-        let mut mic = Self {
-            modules: Vec::new(),
-        };
-        mic.load(&[
-            "module-null-sink",
-            &format!("sink_name={SINK}"),
-            &description("sink", "Voice Changer Output"),
-        ])?;
-        mic.load(&[
-            "module-remap-source",
-            &format!("master={SINK}.monitor"),
-            &format!("source_name={SOURCE}"),
-            &description("source", "Voice Changer Mic"),
-        ])?;
-        Ok(mic)
+/// Makes sure Voice Changer Output and Voice Changer Mic exist. Devices already there
+/// are kept: they stay after the app closes, because an app such as Discord that loses
+/// its chosen microphone falls back to the real one and does not switch back.
+pub fn ensure() -> Result<()> {
+    let modules = pactl(&["list", "short", "modules"])?;
+    let has = |arg: String| modules.lines().any(|line| line.contains(&arg));
+    let (sink, source) = (
+        has(format!("sink_name={SINK}")),
+        has(format!("source_name={SOURCE}")),
+    );
+    if sink && source {
+        return Ok(());
     }
-    fn load(&mut self, args: &[&str]) -> Result<()> {
-        let mut command = vec!["load-module"];
-        command.extend_from_slice(args);
-        let id = pactl(&command)?;
-        self.modules.push(
-            id.trim()
-                .parse()
-                .with_context(|| format!("pactl returned no module id: {id}"))?,
-        );
-        Ok(())
-    }
+    // Half a pair is rebuilt whole, so the microphone always reads this sink.
+    remove();
+    load(&[
+        "module-null-sink",
+        &format!("sink_name={SINK}"),
+        &description("sink", "Voice Changer Output"),
+    ])?;
+    load(&[
+        "module-remap-source",
+        &format!("master={SINK}.monitor"),
+        &format!("source_name={SOURCE}"),
+        &description("source", "Voice Changer Mic"),
+    ])
 }
-impl Drop for VirtualMic {
-    fn drop(&mut self) {
-        for id in self.modules.iter().rev() {
+
+fn load(args: &[&str]) -> Result<()> {
+    let mut command = vec!["load-module"];
+    command.extend_from_slice(args);
+    let id = pactl(&command)?;
+    id.trim()
+        .parse::<u32>()
+        .with_context(|| format!("pactl returned no module id: {id}"))?;
+    Ok(())
+}
+
+/// Removes both devices: when the option is turned off, or left over while it is off.
+pub fn remove() {
+    if let Ok(list) = pactl(&["list", "short", "modules"]) {
+        for id in removal_order(&list) {
             let _ = pactl(&["unload-module", &id.to_string()]);
         }
     }
 }
 
-fn stale_modules(list: &str) -> Vec<u32> {
-    list.lines()
-        .filter(|line| {
-            line.contains(&format!("sink_name={SINK}"))
-                || line.contains(&format!("source_name={SOURCE}"))
+/// The microphone first: while it exists without its sink, the sound server would
+/// connect it to the real microphone. Module ids do not say which was loaded first.
+fn removal_order(list: &str) -> Vec<u32> {
+    let mut ids: Vec<(bool, u32)> = list
+        .lines()
+        .filter_map(|line| {
+            let id = line.split('\t').next()?.trim().parse().ok()?;
+            let ours = line.contains(&format!("sink_name={SINK}"))
+                || line.contains(&format!("source_name={SOURCE}"));
+            ours.then(|| (!line.contains("module-remap-source"), id))
         })
-        .filter_map(|line| line.split('\t').next()?.trim().parse().ok())
-        .collect()
+        .collect();
+    ids.sort_unstable();
+    ids.into_iter().map(|(_, id)| id).collect()
 }
 
 /// Names the app's playback streams carry, so the sound server keeps their routes
@@ -158,7 +164,102 @@ pub fn ensure_routed() -> Result<usize> {
             pactl(&["move-sink-input", &index.to_string(), SINK])?;
         }
     }
+    keep_mic_on_sink()?;
     Ok(streams.len())
+}
+
+/// Checks Voice Changer Mic every second while it lives, so it never carries another
+/// source even when no session is running. Dropping it stops the checks.
+pub struct Guard {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The latest problem, taken by the UI.
+    pub error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+impl Guard {
+    pub fn start() -> Result<Self> {
+        use std::sync::{atomic::AtomicBool, Arc, Mutex};
+        let stop = Arc::new(AtomicBool::new(false));
+        let error = Arc::new(Mutex::new(None));
+        let (thread_stop, thread_error) = (stop.clone(), error.clone());
+        std::thread::Builder::new()
+            .name("virtual-mic-guard".into())
+            .spawn(move || {
+                let mut reported = false;
+                while !thread_stop.load(std::sync::atomic::Ordering::Acquire) {
+                    match keep_mic_on_sink() {
+                        Ok(()) => reported = false,
+                        Err(problem) if !reported => {
+                            reported = true;
+                            *thread_error.lock().unwrap() = Some(format!("{problem:#}"));
+                        }
+                        Err(_) => {}
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            })?;
+        Ok(Self { stop, error })
+    }
+}
+impl Drop for Guard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// On PipeWire the microphone is a loopback whose capture side is an ordinary stream.
+/// If the sound server re-links it, it lands on the default (real) microphone, and
+/// Voice Changer Mic would carry the raw voice; it is put back on the sink's monitor.
+pub fn keep_mic_on_sink() -> Result<()> {
+    static MUTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    use std::sync::atomic::Ordering;
+    let monitor = format!("{SINK}.monitor");
+    let monitor_index = pactl(&["list", "short", "sources"])?
+        .lines()
+        .find(|line| line.split('\t').nth(1) == Some(monitor.as_str()))
+        .and_then(|line| line.split('\t').next()?.parse::<u32>().ok());
+    let mut result = Ok(());
+    for (index, source) in loopback_captures(&pactl(&["list", "source-outputs"])?) {
+        // Not yet linked (no source) is harmless; any other source is not.
+        if source == u32::MAX || Some(source) == monitor_index {
+            continue;
+        }
+        let moved = match monitor_index {
+            Some(_) => pactl(&["move-source-output", &index.to_string(), &monitor]).map(drop),
+            None => Err(anyhow::anyhow!("Voice Changer Output is missing")),
+        };
+        if let Err(error) = moved {
+            // Last resort: a silent microphone rather than the real voice.
+            let _ = pactl(&["set-source-mute", SOURCE, "1"]);
+            MUTED.store(true, Ordering::Release);
+            result = Err(error
+                .context("Voice Changer Mic was connected to another source and has been muted"));
+        }
+    }
+    if result.is_ok() && MUTED.swap(false, Ordering::AcqRel) {
+        let _ = pactl(&["set-source-mute", SOURCE, "0"]);
+    }
+    result
+}
+
+/// (source-output, source) for Voice Changer Mic's loopback capture streams.
+fn loopback_captures(list: &str) -> Vec<(u32, u32)> {
+    let wanted = "media.name = \"Voice Changer Mic input\"";
+    let mut found = Vec::new();
+    let (mut index, mut source) = (None, None);
+    for line in list.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Source Output #") {
+            index = rest.parse().ok();
+            source = None;
+        } else if let Some(rest) = line.strip_prefix("Source: ") {
+            source = rest.parse().ok();
+        } else if line == wanted {
+            if let (Some(index), Some(source)) = (index.take(), source) {
+                found.push((index, source));
+            }
+        }
+    }
+    found
 }
 
 /// (sink-input, sink) for the converted-voice streams in `pactl list sink-inputs`.
@@ -182,15 +283,6 @@ fn voice_streams(list: &str) -> Vec<(u32, u32)> {
     found
 }
 
-/// Removes devices left by a run that did not exit cleanly, while the option is off.
-pub fn remove_stale() {
-    if let Ok(list) = pactl(&["list", "short", "modules"]) {
-        for id in stale_modules(&list) {
-            let _ = pactl(&["unload-module", &id.to_string()]);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,8 +294,22 @@ mod tests {
     }
 
     #[test]
+    fn finds_the_mic_loopback_capture() {
+        let list = "Source Output #194\n\tSource: 66\n\tProperties:\n\t\tmedia.name = \"RecordStream\"\n\nSource Output #1842\n\tSource: 66\n\tProperties:\n\t\tmedia.name = \"Voice Changer Mic input\"\n";
+        assert_eq!(loopback_captures(list), vec![(1842, 66)]);
+    }
+
+    #[test]
+    fn removes_the_microphone_before_its_sink() {
+        let list = "536870916\tmodule-remap-source\tmaster=voice_changer_output.monitor source_name=voice_changer_mic\n536870917\tmodule-null-sink\tsink_name=voice_changer_output\n536870918\tmodule-null-sink\tsink_name=other\n";
+        assert_eq!(removal_order(list), vec![536870916, 536870917]);
+        let list = "7\tmodule-null-sink\tsink_name=voice_changer_output\n9\tmodule-remap-source\tsource_name=voice_changer_mic\n";
+        assert_eq!(removal_order(list), vec![9, 7]);
+    }
+
+    #[test]
     fn finds_leftover_modules() {
         let list = "536870913\tmodule-null-sink\tsink_name=voice_changer_output sink_properties=x\n536870914\tmodule-remap-source\tmaster=voice_changer_output.monitor source_name=voice_changer_mic\n536870915\tmodule-null-sink\tsink_name=other\n";
-        assert_eq!(stale_modules(list), vec![536870913, 536870914]);
+        assert_eq!(removal_order(list), vec![536870914, 536870913]);
     }
 }

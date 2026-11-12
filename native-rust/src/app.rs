@@ -82,9 +82,9 @@ pub struct VoiceApp {
     devices: Vec<AudioDevice>,
     #[cfg(feature = "audio")]
     session: Option<AudioSession>,
-    /// The "Voice Changer Mic" devices, while the option is on.
+    /// Watches the "Voice Changer Mic" devices while they exist.
     #[cfg(all(feature = "audio", target_os = "linux"))]
-    virtual_mic: Option<crate::virtual_mic::VirtualMic>,
+    virtual_mic: Option<crate::virtual_mic::Guard>,
 }
 impl VoiceApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -155,19 +155,20 @@ impl VoiceApp {
     #[cfg(all(feature = "audio", target_os = "linux"))]
     fn sync_virtual_mic(&mut self) {
         if !self.saved.virtual_mic {
-            if self.virtual_mic.take().is_none() {
-                // Devices a crashed run left behind would still catch the voice.
-                crate::virtual_mic::remove_stale();
-            }
+            self.virtual_mic = None;
+            crate::virtual_mic::remove();
             return;
         }
-        if self.virtual_mic.is_none() {
-            match crate::virtual_mic::VirtualMic::create() {
-                Ok(mic) => self.virtual_mic = Some(mic),
-                Err(error) => {
-                    self.saved.virtual_mic = false;
-                    self.error = Some(format!("{error:#}"));
-                }
+        let ready = crate::virtual_mic::ensure().and_then(|()| match self.virtual_mic.take() {
+            Some(guard) => Ok(guard),
+            None => crate::virtual_mic::Guard::start(),
+        });
+        match ready {
+            Ok(guard) => self.virtual_mic = Some(guard),
+            Err(error) => {
+                self.saved.virtual_mic = false;
+                crate::virtual_mic::remove();
+                self.error = Some(format!("{error:#}"));
             }
         }
     }
@@ -195,6 +196,14 @@ impl VoiceApp {
             }
             Err(error) => {
                 self.error = Some(format!("{error:#}"));
+                return;
+            }
+        }
+        // Recreate Voice Changer Mic if something removed it since it was turned on.
+        #[cfg(target_os = "linux")]
+        if self.saved.virtual_mic {
+            self.sync_virtual_mic();
+            if !self.saved.virtual_mic {
                 return;
             }
         }
@@ -1115,7 +1124,7 @@ impl VoiceApp {
                             });
                         });
                         ui.label(m3::supporting(
-                            "Adds a \"Voice Changer Mic\" input. Pick it as the microphone in Discord, OBS or a game to send them your converted voice. No extra software to install; it is removed when you turn this off or close the app.",
+                            "Adds a \"Voice Changer Mic\" input. Pick it as the microphone in Discord, OBS or a game to send them your converted voice. No extra software to install. It stays while you are logged in, even with the app closed, so those apps keep it selected; it carries silence while the voice changer is off, never your own voice. Turning this off removes it.",
                         ));
                     }
                     let virtual_mic = cfg!(target_os = "linux") && self.saved.virtual_mic;
@@ -1590,6 +1599,14 @@ impl eframe::App for VoiceApp {
                 }
                 Err(error) => self.error = Some(error),
             }
+        }
+        #[cfg(all(feature = "audio", target_os = "linux"))]
+        if let Some(problem) = self
+            .virtual_mic
+            .as_ref()
+            .and_then(|guard| guard.error.lock().unwrap().take())
+        {
+            self.error = Some(problem);
         }
         #[cfg(feature = "audio")]
         if let Some(session) = &self.session {

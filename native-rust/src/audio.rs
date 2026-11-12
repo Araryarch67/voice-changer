@@ -446,6 +446,13 @@ fn run(
                 *metrics.recorded.lock().unwrap() = Some(format!("Recording failed: {error:#}"));
             }
         }
+        // With the voice changer off, a virtual microphone carries silence rather
+        // than the raw voice, so nobody hears the real voice by surprise.
+        let processed = if options.virtual_mic && settings.bypass {
+            vec![0.0; processed.len()]
+        } else {
+            processed
+        };
         if let Some(monitor) = &mut monitor {
             monitor.push(&processed);
         }
