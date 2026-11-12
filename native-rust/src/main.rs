@@ -1,0 +1,50 @@
+use anyhow::{bail, Context, Result};
+use std::path::Path;
+use voice_changer_native::{
+    config::Settings,
+    engine::{self, Engine},
+};
+
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--benchmark") if (2..=4).contains(&args.len()) => {
+            let block_ms = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(Settings::default().block_ms);
+            let blocks = args.get(3).map(|s| s.parse()).transpose()?.unwrap_or(6);
+            let settings = Settings { block_ms, ..Settings::default() };
+            println!("{}", serde_json::to_string_pretty(&voice_changer_native::benchmark::run(Path::new(&args[1]), &settings, blocks)?)?);
+        }
+        Some("--help" | "-h") => println!("Voice Changer\n  (no arguments)              Open egui app\n  --devices                   List audio device IDs\n  --convert MODEL.json IN.wav OUT.wav [SEMITONES [INDEX_RATIO]]\n  --bypass IN.wav OUT.wav      Test audio pipeline without models\n  --export-rvc MODEL.pth OUT.onnx [--realtime]  Convert an RVC v2 checkpoint to ONNX\n\nONNX: set ORT_DYLIB_PATH to ONNX Runtime 1.22 shared library."),
+        Some("--export-rvc") if args.len() == 3 || (args.len() == 4 && args[3] == "--realtime") => {
+            #[cfg(feature = "export")]
+            println!("{}", serde_json::to_string(&voice_changer_native::export::export_rvc(Path::new(&args[1]), Path::new(&args[2]), args.len() == 4)?)?);
+            #[cfg(not(feature = "export"))]
+            bail!("Build with the export feature");
+        }
+        Some("--devices") => {
+            #[cfg(feature = "audio")]
+            for device in voice_changer_native::audio::devices()? { println!("{}\t{}\t{}", if device.input { "input" } else { "output" }, device.id, device.name); }
+            #[cfg(not(feature = "audio"))]
+            bail!("Build with the audio feature");
+        }
+        Some("--bypass") if args.len() == 3 => {
+            voice_changer_native::wav::convert(&mut Engine::new(None), Path::new(&args[1]), Path::new(&args[2]), &Settings::default())?;
+        }
+        Some("--convert") if (4..=6).contains(&args.len()) => {
+            let converter = engine::load_converter(Path::new(&args[1]))?;
+            let settings = Settings { bypass: false, semitones: args.get(4).map(|s| s.parse()).transpose().context("Invalid semitones")?.unwrap_or(0.0), index_ratio: args.get(5).map(|s| s.parse()).transpose().context("Invalid index ratio")?.unwrap_or(0.0), ..Settings::default() };
+            voice_changer_native::wav::convert(&mut Engine::new(Some(converter)), Path::new(&args[2]), Path::new(&args[3]), &settings)?;
+        }
+        None => {
+            #[cfg(feature = "gui")]
+            voice_changer_native::run(eframe::NativeOptions {
+                viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1060.0, 760.0]).with_min_inner_size([360.0, 540.0]),
+                ..Default::default()
+            }).map_err(|e| anyhow::anyhow!("{e}"))?;
+            #[cfg(not(feature = "gui"))]
+            bail!("GUI disabled; use --help for CLI options");
+        }
+        _ => bail!("Unknown arguments; use --help"),
+    }
+    Ok(())
+}

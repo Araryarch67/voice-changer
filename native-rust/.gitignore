@@ -1,0 +1,13 @@
+/target/
+*.wav
+*.onnx
+*.f32
+/models/
+/runtime/
+/dist/
+/output/
+!/tests/fixtures/*.onnx
+!/templates/*.template.onnx
+/platforms/android/runtime-libs/**/*.so
+/platforms/ios/vendor/
+/platforms/ios/*.xcodeproj/

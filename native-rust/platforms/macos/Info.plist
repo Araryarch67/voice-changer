@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>dev.voicechanger.nativeapp</string>
+  <key>CFBundleName</key><string>Voice Changer</string>
+  <key>CFBundleExecutable</key><string>voice-changer-native</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>NSMicrophoneUsageDescription</key><string>Convert your microphone audio into the selected voice locally.</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict></plist>

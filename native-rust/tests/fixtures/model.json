@@ -1,0 +1,1 @@
+{"name": "Synthetic test model (not a voice model)", "model": "voice.onnx", "embedder": "embedder.onnx", "pitch": "pitch.onnx", "sample_rate": 16000, "channels": 768, "use_f0": true}

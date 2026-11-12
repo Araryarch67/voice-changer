@@ -1,0 +1,36 @@
+name: VoiceChanger
+options:
+  deploymentTarget:
+    iOS: "15.0"
+targets:
+  VoiceChanger:
+    type: application
+    platform: iOS
+    sources:
+      - main.m
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.voicechanger.nativeapp
+        INFOPLIST_FILE: Info.plist
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ENABLE_BITCODE: NO
+        OTHER_LDFLAGS: "$(inherited) -lc++ -liconv"
+        LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../../target/ios"
+    preBuildScripts:
+      - name: Build Rust static library
+        script: 'bash "${SRCROOT}/build-rust.sh"'
+        basedOnDependencyAnalysis: false
+    dependencies:
+      - library: ../../target/ios/libvoice_changer_native.a
+      - sdk: UIKit.framework
+      - sdk: Foundation.framework
+      - sdk: CoreFoundation.framework
+      - sdk: CoreGraphics.framework
+      - sdk: QuartzCore.framework
+      - sdk: Metal.framework
+      - sdk: AVFoundation.framework
+      - sdk: AVFAudio.framework
+      - sdk: AudioToolbox.framework
+      - sdk: CoreAudio.framework
+      - sdk: Security.framework
+      - sdk: SystemConfiguration.framework

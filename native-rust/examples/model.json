@@ -1,0 +1,13 @@
+{
+  "name": "My RVC v2 voice",
+  "model": "../models/voice.onnx",
+  "embedder": "../models/contentvec-layer12-768.onnx",
+  "pitch": "../models/rmvpe-waveform.onnx",
+  "sample_rate": 40000,
+  "channels": 768,
+  "use_f0": true,
+  "embedder_input": "source",
+  "embedder_output": "",
+  "output_scale": 1.0,
+  "feature_bank": null
+}
