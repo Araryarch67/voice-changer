@@ -99,7 +99,7 @@ jobs:
       - name: Read application version
         id: version
         run: |
-          version=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          version=$(python -c 'import re; print(re.search(r"^version = \"([^\"]+)\"", open("Cargo.toml").read(), re.M).group(1))')
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable
