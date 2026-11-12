@@ -7,7 +7,7 @@
 /dist/
 /output/
 !/tests/fixtures/*.onnx
-!/templates/*.template.onnx
+!/templates/*.template.onnx.zz
 /platforms/android/runtime-libs/**/*.so
 /platforms/ios/vendor/
 /platforms/ios/*.xcodeproj/

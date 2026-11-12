@@ -10,38 +10,152 @@ use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 use std::{collections::HashMap, path::Path};
 
-const TEMPLATES: [(u32, bool, &[u8]); 6] = [
+/// One template per standard architecture, zlib-compressed: (version, sample rate, f0, realtime).
+macro_rules! templates {
+    ($(($version:literal, $rate:literal, $f0:literal, $realtime:literal, $file:literal)),* $(,)?) => {
+        [$(($version, $rate, $f0, $realtime, include_bytes!(concat!("../templates/", $file)).as_slice())),*]
+    };
+}
+type TemplateEntry = (&'static str, u32, bool, bool, &'static [u8]);
+const TEMPLATES: [TemplateEntry; 24] = templates![
+    ("v1", 32000, true, false, "rvc-v1-32000.template.onnx.zz"),
     (
+        "v1",
+        32000,
+        true,
+        true,
+        "rvc-v1-32000-realtime.template.onnx.zz"
+    ),
+    (
+        "v1",
         32000,
         false,
-        include_bytes!("../templates/rvc-v2-32000.template.onnx"),
+        false,
+        "rvc-v1-32000-nof0.template.onnx.zz"
     ),
     (
+        "v1",
+        32000,
+        false,
+        true,
+        "rvc-v1-32000-nof0-realtime.template.onnx.zz"
+    ),
+    ("v1", 40000, true, false, "rvc-v1-40000.template.onnx.zz"),
+    (
+        "v1",
+        40000,
+        true,
+        true,
+        "rvc-v1-40000-realtime.template.onnx.zz"
+    ),
+    (
+        "v1",
+        40000,
+        false,
+        false,
+        "rvc-v1-40000-nof0.template.onnx.zz"
+    ),
+    (
+        "v1",
+        40000,
+        false,
+        true,
+        "rvc-v1-40000-nof0-realtime.template.onnx.zz"
+    ),
+    ("v1", 48000, true, false, "rvc-v1-48000.template.onnx.zz"),
+    (
+        "v1",
+        48000,
+        true,
+        true,
+        "rvc-v1-48000-realtime.template.onnx.zz"
+    ),
+    (
+        "v1",
+        48000,
+        false,
+        false,
+        "rvc-v1-48000-nof0.template.onnx.zz"
+    ),
+    (
+        "v1",
+        48000,
+        false,
+        true,
+        "rvc-v1-48000-nof0-realtime.template.onnx.zz"
+    ),
+    ("v2", 32000, true, false, "rvc-v2-32000.template.onnx.zz"),
+    (
+        "v2",
         32000,
         true,
-        include_bytes!("../templates/rvc-v2-32000-realtime.template.onnx"),
+        true,
+        "rvc-v2-32000-realtime.template.onnx.zz"
     ),
     (
-        40000,
+        "v2",
+        32000,
         false,
-        include_bytes!("../templates/rvc-v2-40000.template.onnx"),
+        false,
+        "rvc-v2-32000-nof0.template.onnx.zz"
     ),
     (
+        "v2",
+        32000,
+        false,
+        true,
+        "rvc-v2-32000-nof0-realtime.template.onnx.zz"
+    ),
+    ("v2", 40000, true, false, "rvc-v2-40000.template.onnx.zz"),
+    (
+        "v2",
         40000,
         true,
-        include_bytes!("../templates/rvc-v2-40000-realtime.template.onnx"),
+        true,
+        "rvc-v2-40000-realtime.template.onnx.zz"
     ),
     (
-        48000,
+        "v2",
+        40000,
         false,
-        include_bytes!("../templates/rvc-v2-48000.template.onnx"),
+        false,
+        "rvc-v2-40000-nof0.template.onnx.zz"
     ),
     (
+        "v2",
+        40000,
+        false,
+        true,
+        "rvc-v2-40000-nof0-realtime.template.onnx.zz"
+    ),
+    ("v2", 48000, true, false, "rvc-v2-48000.template.onnx.zz"),
+    (
+        "v2",
         48000,
         true,
-        include_bytes!("../templates/rvc-v2-48000-realtime.template.onnx"),
+        true,
+        "rvc-v2-48000-realtime.template.onnx.zz"
+    ),
+    (
+        "v2",
+        48000,
+        false,
+        false,
+        "rvc-v2-48000-nof0.template.onnx.zz"
+    ),
+    (
+        "v2",
+        48000,
+        false,
+        true,
+        "rvc-v2-48000-nof0-realtime.template.onnx.zz"
     ),
 ];
+
+fn inflate(compressed: &[u8]) -> Result<Vec<u8>> {
+    miniz_oxide::inflate::decompress_to_vec_zlib(compressed)
+        .map_err(|e| anyhow::anyhow!("Corrupt embedded template: {e:?}"))
+}
 /// Config entries that do not change the inference graph: spec channels and segment size
 /// (training-only posterior encoder) and the speaker count (embedding rows).
 const GRAPH_INDEPENDENT_CONFIG: [usize; 3] = [0, 1, 15];
@@ -50,24 +164,30 @@ const GRAPH_INDEPENDENT_CONFIG: [usize; 3] = [0, 1, 15];
 struct Template {
     format: u32,
     config: Vec<serde_json::Value>,
+    channels: usize,
+    f0: bool,
     initializers: Vec<(String, String, String)>,
     state_keys: Vec<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
 pub struct Exported {
+    pub version: String,
+    pub f0: bool,
     pub sample_rate: u32,
     pub channels: usize,
     pub speakers: usize,
 }
 
-/// Exports an f0-enabled RVC v2 checkpoint, like the former `tools/export_rvc.py`.
+/// Exports an RVC v1 (256-channel) or v2 (768-channel) checkpoint, with or without f0,
+/// at the standard 32/40/48 kHz architectures, like the reference `onnxExporter` classes.
 pub fn export_rvc(checkpoint: &Path, output: &Path, realtime: bool) -> Result<Exported> {
     let root = pth::load(checkpoint)?;
+    // Matches RVCModelSlotGenerator: a missing or None version is v1.
     let version = root.get("version").and_then(Value::as_str).unwrap_or("v1");
     let f0 = root.get("f0").and_then(Value::as_int).unwrap_or(1) != 0;
-    if !f0 || version != "v2" {
-        bail!("Export currently accepts f0-enabled RVC v2 checkpoints (found {version}, f0={f0})");
+    if version != "v1" && version != "v2" {
+        bail!("Unsupported RVC checkpoint version {version}; v1 and v2 are supported");
     }
     let config = root
         .get("config")
@@ -92,18 +212,20 @@ pub fn export_rvc(checkpoint: &Path, output: &Path, realtime: bool) -> Result<Ex
         .map(|t| t.shape[0])
         .context("Checkpoint has no speaker embedding")?;
 
-    let (_, _, bytes) = TEMPLATES
+    let (.., compressed) = TEMPLATES
         .iter()
-        .find(|(rate, rt, _)| *rate == sample_rate && *rt == realtime)
-        .with_context(|| format!("No RVC v2 template for {sample_rate} Hz"))?;
+        .find(|t| (t.0, t.1, t.2, t.3) == (version, sample_rate, f0, realtime))
+        .with_context(|| format!("No RVC {version} template for {sample_rate} Hz; standard rates are 32000, 40000 and 48000"))?;
+    let bytes = &inflate(compressed)?;
     let template = read_template(bytes)?;
     ensure!(template.format == 1, "Unsupported template format");
+    ensure!(template.f0 == f0, "Template f0 mismatch");
     ensure!(
         template.config.len() == config.len()
             && (0..config.len())
                 .filter(|i| !GRAPH_INDEPENDENT_CONFIG.contains(i))
                 .all(|i| template.config[i] == config[i]),
-        "Checkpoint architecture {config:?} differs from the standard {sample_rate} Hz RVC v2 configuration"
+        "Checkpoint architecture {config:?} differs from the standard {sample_rate} Hz RVC {version} configuration"
     );
     let missing: Vec<_> = template
         .state_keys
@@ -139,10 +261,12 @@ pub fn export_rvc(checkpoint: &Path, output: &Path, realtime: bool) -> Result<Ex
         );
         initializers.insert(name.as_str(), tensor);
     }
+    // v1 uses the projected layer-9 embedding, v2 layer 12 (RVCModelSlotGenerator).
+    let v1 = version == "v1";
     let metadata = serde_json::json!({
         "application": "VC_CLIENT", "version": "2.1", "samplingRate": sample_rate,
-        "f0": true, "embChannels": 768, "embOutputLayer": 12, "useFinalProj": false,
-        "embedder": "contentvec", "speakers": speakers, "realtimeDecoder": realtime,
+        "f0": f0, "embChannels": template.channels, "embOutputLayer": if v1 { 9 } else { 12 },
+        "useFinalProj": v1, "embedder": "contentvec", "speakers": speakers, "realtimeDecoder": realtime,
     });
     let model = fill_model(bytes, &initializers, &metadata.to_string())?;
     if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -152,8 +276,10 @@ pub fn export_rvc(checkpoint: &Path, output: &Path, realtime: bool) -> Result<Ex
     std::fs::write(&temporary, model).with_context(|| format!("Write {}", temporary.display()))?;
     std::fs::rename(&temporary, output)?;
     Ok(Exported {
+        version: version.to_owned(),
+        f0,
         sample_rate,
-        channels: 768,
+        channels: template.channels,
         speakers,
     })
 }
@@ -367,10 +493,28 @@ mod tests {
 
     #[test]
     fn every_template_has_a_complete_recipe() {
-        for (rate, realtime, bytes) in TEMPLATES {
+        for (version, rate, f0, realtime, compressed) in TEMPLATES {
+            let bytes = &inflate(compressed).unwrap();
             let template = read_template(bytes).unwrap();
-            assert_eq!(template.config.last().unwrap().as_u64(), Some(rate as u64));
-            assert_eq!(template.initializers.len(), 353, "{rate} {realtime}");
+            let variant = format!("{version} {rate} f0={f0} realtime={realtime}");
+            assert_eq!(
+                template.config.last().unwrap().as_u64(),
+                Some(rate as u64),
+                "{variant}"
+            );
+            assert_eq!(template.f0, f0, "{variant}");
+            assert_eq!(
+                template.channels,
+                if version == "v1" { 256 } else { 768 },
+                "{variant}"
+            );
+            assert!(template.initializers.len() > 300, "{variant}");
+            // No-f0 graphs have no pitch embedding or NSF source module.
+            let has_pitch = template
+                .initializers
+                .iter()
+                .any(|(_, _, key)| key == "enc_p.emb_pitch.weight");
+            assert_eq!(has_pitch, f0, "{variant}");
             let weights: HashMap<&str, Tensor> = template
                 .initializers
                 .iter()
