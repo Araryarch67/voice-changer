@@ -553,36 +553,119 @@ pub fn slider<N: Numeric>(
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// A labelled slider row: name on the left, formatted value on the right, the slider,
-/// then a plain-language hint for people who do not know the term.
+/// How a setting's number reads and is typed: the stored value times `scale`, with
+/// `decimals` places and a `suffix` ("ms", "%", ...).
+#[derive(Clone, Copy)]
+pub struct Format {
+    scale: f64,
+    decimals: usize,
+    suffix: &'static str,
+    signed: bool,
+    off_at_min: bool,
+}
+impl Format {
+    pub const fn new(suffix: &'static str) -> Self {
+        Self {
+            scale: 1.0,
+            decimals: 0,
+            suffix,
+            signed: false,
+            off_at_min: false,
+        }
+    }
+    /// Shown and typed as the value times `scale` (0.5 as 50 %).
+    pub const fn scale(mut self, scale: f64) -> Self {
+        self.scale = scale;
+        self
+    }
+    pub const fn decimals(mut self, decimals: usize) -> Self {
+        self.decimals = decimals;
+        self
+    }
+    /// Positive values get a "+".
+    pub const fn signed(mut self) -> Self {
+        self.signed = true;
+        self
+    }
+    /// The lowest value reads "Off", and typing "off" sets it.
+    pub const fn off_at_min(mut self) -> Self {
+        self.off_at_min = true;
+        self
+    }
+    fn show(self, value: f64, min: f64) -> String {
+        if self.off_at_min && value <= min {
+            return "Off".into();
+        }
+        let shown = value * self.scale;
+        if self.signed {
+            format!("{shown:+.*}{}", self.decimals, self.suffix)
+        } else {
+            format!("{shown:.*}{}", self.decimals, self.suffix)
+        }
+    }
+    /// Reads a typed value: units and spaces are ignored and a comma works as the
+    /// decimal point, so "320", "320 ms" and "0,5" all parse.
+    fn parse(self, text: &str, min: f64) -> Option<f64> {
+        let text = text.trim().to_lowercase();
+        if self.off_at_min && (text == "off" || text == "mati") {
+            return Some(min);
+        }
+        let number: String = text
+            .replace(',', ".")
+            .chars()
+            .filter(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+'))
+            .collect();
+        number.parse::<f64>().ok().map(|value| value / self.scale)
+    }
+}
+
+/// A labelled slider row: the name on the left, an editable number on the right
+/// (click to type, or drag sideways), the slider, then a plain-language hint for
+/// people who do not know the term.
 pub fn setting<N: Numeric>(
     ui: &mut Ui,
     label: &str,
     hint: &str,
-    shown: String,
+    format: Format,
     value: &mut N,
     range: RangeInclusive<N>,
     step: f64,
 ) -> Response {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
-        let (rect, _) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::hover());
-        ui.painter().text(
-            rect.left_center(),
-            Align2::LEFT_CENTER,
-            label,
-            FontId::proportional(14.0),
-            ON_SURFACE,
-        );
-        ui.painter().text(
-            rect.right_center(),
-            Align2::RIGHT_CENTER,
-            shown,
-            FontId::new(14.0, medium()),
-            ON_SURFACE_VARIANT,
-        );
-        let response = slider(ui, value, range, step);
+        let (low, high) = (range.start().to_f64(), range.end().to_f64());
+        let typed = ui
+            .allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), 30.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.label(RichText::new(label).size(14.0).color(ON_SURFACE));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().interact_size = Vec2::new(64.0, 26.0);
+                        ui.spacing_mut().button_padding = egui::vec2(8.0, 2.0);
+                        ui.style_mut().override_font_id = Some(FontId::new(14.0, medium()));
+                        ui.add(
+                            egui::DragValue::new(value)
+                                .range(range.clone())
+                                .speed(step)
+                                .custom_formatter(move |n, _| format.show(n, low))
+                                .custom_parser(move |text| {
+                                    format
+                                        .parse(text, low)
+                                        .map(|n| ((n / step).round() * step).clamp(low, high))
+                                }),
+                        )
+                        .on_hover_text("Click to type a value, or drag sideways")
+                    })
+                    .inner
+                },
+            )
+            .inner;
+        ui.add_space(2.0);
+        let mut response = slider(ui, value, range, step);
+        if typed.changed() {
+            response.mark_changed();
+        }
         if !hint.is_empty() {
             ui.label(supporting(hint));
             ui.add_space(4.0);
@@ -942,4 +1025,25 @@ pub fn text_edit<'a>(text: &'a mut String, hint: &str, width: f32) -> egui::Text
         .desired_width(width - 28.0)
         .margin(Margin::symmetric(14, 10))
         .background_color(Color32::TRANSPARENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Format;
+
+    #[test]
+    fn numbers_read_and_type_in_their_units() {
+        let percent = Format::new(" %").scale(100.0);
+        assert_eq!(percent.show(0.5, 0.0), "50 %");
+        assert_eq!(percent.parse("75%", 0.0), Some(0.75));
+        let tune = Format::new(" semitones").decimals(1).signed();
+        assert_eq!(tune.show(3.0, -24.0), "+3.0 semitones");
+        assert_eq!(tune.parse(" -7,5 ", -24.0), Some(-7.5));
+        let gate = Format::new(" dB").off_at_min();
+        assert_eq!(gate.show(-100.0, -100.0), "Off");
+        assert_eq!(gate.show(-50.0, -100.0), "-50 dB");
+        assert_eq!(gate.parse("off", -100.0), Some(-100.0));
+        assert_eq!(Format::new(" ms").parse("320 ms", 20.0), Some(320.0));
+        assert_eq!(Format::new(" ms").parse("abc", 20.0), None);
+    }
 }

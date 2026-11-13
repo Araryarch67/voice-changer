@@ -933,7 +933,7 @@ impl VoiceApp {
                 m3::setting(
                     ui,
                     "Tune", "Makes the voice higher or lower. +12 is one octave up, -12 one octave down. Male to female voice: about +8 to +12; female to male: about -8 to -12. A natural range sounds most real.",
-                    format!("{:+.1} semitones", s.semitones),
+                    m3::Format::new(" semitones").decimals(1).signed(),
                     &mut s.semitones,
                     -24.0..=24.0,
                     0.1,
@@ -941,7 +941,7 @@ impl VoiceApp {
                 m3::setting(
                     ui,
                     "Index", "How much of the model's accent and tone to copy from its .index file. 50-75% usually sounds most like the character; higher can add a metallic edge. No effect on voices without an index.",
-                    format!("{:.0} %", s.index_ratio * 100.0),
+                    m3::Format::new(" %").scale(100.0),
                     &mut s.index_ratio,
                     0.0..=1.0,
                     0.01,
@@ -1142,7 +1142,7 @@ impl VoiceApp {
             m3::setting(
                 ui,
                 "Tune", "Makes the voice higher or lower. +12 is one octave up, -12 one octave down. Male to female voice: about +8 to +12; female to male: about -8 to -12. A natural range sounds most real.",
-                format!("{:+.1} semitones", s.semitones),
+                m3::Format::new(" semitones").decimals(1).signed(),
                 &mut s.semitones,
                 -24.0..=24.0,
                 0.1,
@@ -1150,7 +1150,7 @@ impl VoiceApp {
             m3::setting(
                 ui,
                 "Index", "How much of the model's accent and tone to copy from its .index file. 50-75% usually sounds most like the character; higher can add a metallic edge. No effect on voices without an index.",
-                format!("{:.0} %", s.index_ratio * 100.0),
+                m3::Format::new(" %").scale(100.0),
                 &mut s.index_ratio,
                 0.0..=1.0,
                 0.01,
@@ -1158,7 +1158,7 @@ impl VoiceApp {
             m3::setting(
                 ui,
                 "Protect", "Keeps breaths and s, t, k sounds natural when Index is on. Around 0.33 if they sound lispy or robotic; lower protects more; 0.50 turns it off.",
-                format!("{:.2}", s.protect),
+                m3::Format::new("").decimals(2),
                 &mut s.protect,
                 0.0..=0.5,
                 0.01,
@@ -1201,7 +1201,7 @@ impl VoiceApp {
             m3::setting(
                 ui,
                 "Input gain", "Microphone volume before conversion. Raise it if you sound too quiet.",
-                format!("{:.2}×", s.input_gain),
+                m3::Format::new("×").decimals(2),
                 &mut s.input_gain,
                 0.0..=4.0,
                 0.01,
@@ -1209,22 +1209,17 @@ impl VoiceApp {
             m3::setting(
                 ui,
                 "Output gain", "Volume of the converted voice.",
-                format!("{:.2}×", s.output_gain),
+                m3::Format::new("×").decimals(2),
                 &mut s.output_gain,
                 0.0..=4.0,
                 0.01,
             );
             // The engine gates on block RMS; show it in dBFS, where -100 is effectively off.
             let mut gate = (20.0 * s.silence_threshold.max(0.00001).log10()).round();
-            let shown = if gate <= -100.0 {
-                "Off".to_owned()
-            } else {
-                format!("{gate:.0} dB")
-            };
             if m3::setting(
                 ui,
                 "Noise gate (S.Thresh)", "Below this nothing is converted, so room noise stays out and the GPU rests while you are silent. -50 dB suits most microphones; lower it if quiet words are cut. The pink tick on the microphone meter shows it.",
-                shown,
+                m3::Format::new(" dB").off_at_min(),
                 &mut gate,
                 -100.0..=-20.0,
                 1.0,
@@ -1264,7 +1259,7 @@ impl VoiceApp {
                 m3::setting(
                     ui,
                     "Chunk", "How much audio is converted at once, and most of the delay. Lower it while Load at the bottom stays under about 70%; raise it if the voice stutters. 160-250 ms suits a good GPU, 320 ms or more the CPU.",
-                    format!("{} ms", s.block_ms),
+                    m3::Format::new(" ms"),
                     &mut s.block_ms,
                     20..=500,
                     1.0,
@@ -1273,7 +1268,7 @@ impl VoiceApp {
                 m3::setting(
                     ui,
                     "Extra", "Past audio the model hears for context, so chunk edges sound continuous. It costs little: about 500 ms is a good default; lower it only if Load is too high.",
-                    format!("{} ms", s.context_ms),
+                    m3::Format::new(" ms"),
                     &mut s.context_ms,
                     0..=2000,
                     1.0,
@@ -1282,7 +1277,7 @@ impl VoiceApp {
                 m3::setting(
                     ui,
                     "Crossfade", "Blends each chunk into the next to hide the seams. Raise it to 60-80 ms if you hear a flutter every chunk.",
-                    format!("{} ms", s.overlap_ms),
+                    m3::Format::new(" ms"),
                     &mut s.overlap_ms,
                     1..=max_overlap,
                     1.0,
@@ -1290,7 +1285,7 @@ impl VoiceApp {
                 m3::setting(
                     ui,
                     "SOLA search", "How far to look for the best place to join chunks. Leave it unless you hear clicks.",
-                    format!("{} ms", s.search_ms),
+                    m3::Format::new(" ms"),
                     &mut s.search_ms,
                     0..=40,
                     1.0,
@@ -1931,7 +1926,7 @@ impl VoiceApp {
                     ui,
                     "Tune",
                     "Makes the voice higher or lower. +12 is one octave up, -12 one octave down.",
-                    format!("{:+.1} semitones", s.semitones),
+                    m3::Format::new(" semitones").decimals(1).signed(),
                     &mut s.semitones,
                     -24.0..=24.0,
                     0.1,
