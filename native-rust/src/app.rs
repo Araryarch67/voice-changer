@@ -105,7 +105,15 @@ impl Default for Saved {
 enum Page {
     Voices,
     Studio,
+    Convert,
     Settings,
+}
+/// What a voice card's menu does with its slot.
+#[derive(Clone, Copy)]
+enum SlotAction {
+    Earlier,
+    Later,
+    Remove,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Filter {
@@ -120,7 +128,6 @@ pub struct VoiceApp {
     filter: Filter,
     search: String,
     edit_model: bool,
-    file_dialog: bool,
     file_input: String,
     import_dialog: bool,
     #[cfg(feature = "catalog")]
@@ -207,7 +214,6 @@ impl VoiceApp {
             filter: Filter::All,
             search: String::new(),
             edit_model: false,
-            file_dialog: false,
             file_input: String::new(),
             import_dialog: false,
             #[cfg(feature = "catalog")]
@@ -442,6 +448,16 @@ impl VoiceApp {
                 return;
             }
         }
+        self.start_session();
+    }
+    /// A build without live audio still offers file conversion; Start says so.
+    #[cfg(not(feature = "audio"))]
+    fn start_session(&mut self) {
+        self.error =
+            Some(t("This build has no live audio; use Convert a WAV file instead.").into());
+    }
+    #[cfg(feature = "audio")]
+    fn start_session(&mut self) {
         let manifest = self.saved.slots[self.saved.selected].manifest.trim();
         let devices = self.chosen_devices();
         let options = AudioOptions {
@@ -474,6 +490,7 @@ impl VoiceApp {
         let pages = [
             (Page::Voices, icons::GRAPHIC_EQ, t("Voices")),
             (Page::Studio, icons::TUNE, t("Studio")),
+            (Page::Convert, icons::AUDIO_FILE, t("Convert")),
             (Page::Settings, icons::SETTINGS, t("Settings")),
         ];
         if compact {
@@ -584,6 +601,8 @@ impl VoiceApp {
     /// Puts a checkpoint in the import dialog, with the index beside it if the index
     /// field is still empty.
     fn choose_checkpoint(&mut self, path: PathBuf) {
+        // Importing needs the exporter; a build without it only loads model.json files.
+        #[cfg(feature = "export")]
         if self.import_index.trim().is_empty() {
             if let Some(index) = path.parent().and_then(crate::import::find_index) {
                 self.import_index = index.to_string_lossy().into_owned();
@@ -591,7 +610,8 @@ impl VoiceApp {
         }
         self.import_checkpoint = path.to_string_lossy().into_owned();
     }
-    /// A dropped `.pth` or `.index` opens the import dialog with it filled in.
+    /// A dropped `.pth` or `.index` opens the import dialog with it filled in; a
+    /// `.wav` opens Convert with it as the input.
     fn drop_file(&mut self, path: PathBuf) {
         let extension = path
             .extension()
@@ -600,8 +620,17 @@ impl VoiceApp {
         match extension.as_str() {
             "pth" => self.choose_checkpoint(path),
             "index" => self.import_index = path.to_string_lossy().into_owned(),
+            "wav" => {
+                self.choose_input_wav(&path);
+                self.error = None;
+                self.page = Page::Convert;
+                return;
+            }
             _ => {
-                self.error = Some(t("Drop an RVC .pth checkpoint or its .index file.").into());
+                self.error = Some(
+                    t("Drop an RVC .pth checkpoint or its .index file, or a .wav file to convert.")
+                        .into(),
+                );
                 return;
             }
         }
@@ -921,7 +950,7 @@ impl VoiceApp {
         }
         ui.add_space(16.0);
         ui.label(m3::supporting(t(
-            "Empty cards are model slots; pretrained character voices are not bundled.",
+            "Empty cards are model slots; pretrained character voices are not bundled. Right-click a card, or press and hold it, to move or remove it.",
         )));
     }
     /// The selected voice: portrait, model file and the controls used most while live.
@@ -1104,6 +1133,60 @@ impl VoiceApp {
         if response.double_clicked() && !running && !empty {
             self.saved.selected = index;
             self.edit_model = true;
+        }
+        // Right-click, or press and hold on a touch screen: move or remove the slot.
+        let last = self.saved.slots.len() - 1;
+        let mut action = None;
+        response.context_menu(|ui| {
+            ui.set_min_width(200.0);
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            for (label, enabled, chosen) in [
+                (t("Move earlier"), index > 0, SlotAction::Earlier),
+                (t("Move later"), index < last, SlotAction::Later),
+                (t("Remove slot"), !running && last > 0, SlotAction::Remove),
+            ] {
+                if ui
+                    .add_enabled_ui(enabled, |ui| m3::menu_item(ui, label, false))
+                    .inner
+                    .clicked()
+                {
+                    action = Some(chosen);
+                    ui.close();
+                }
+            }
+        });
+        match action {
+            Some(SlotAction::Earlier) => self.move_slot(index, index - 1),
+            Some(SlotAction::Later) => self.move_slot(index, index + 1),
+            Some(SlotAction::Remove) => self.remove_slot(index),
+            None => {}
+        }
+    }
+    /// Moves slot `from` to position `to`, keeping the same voice selected.
+    fn move_slot(&mut self, from: usize, to: usize) {
+        let selected = self.saved.selected;
+        let slot = self.saved.slots.remove(from);
+        self.saved.slots.insert(to, slot);
+        self.saved.selected = index_after_move(selected, from, to);
+        self.tuned_slot = index_after_move(self.tuned_slot, from, to);
+    }
+    /// Removes slot `index` from the gallery; its files stay on disk.
+    fn remove_slot(&mut self, index: usize) {
+        if self.saved.slots.len() < 2 {
+            return;
+        }
+        self.saved.slots.remove(index);
+        let selected = self.saved.selected;
+        self.saved.selected = if selected > index {
+            selected - 1
+        } else {
+            selected.min(self.saved.slots.len() - 1)
+        };
+        if self.tuned_slot == index {
+            // The tuned voice is gone: the newly selected one brings back its own.
+            self.tuned_slot = usize::MAX;
+        } else if self.tuned_slot > index {
+            self.tuned_slot -= 1;
         }
     }
     fn voice_controls(&mut self, ui: &mut egui::Ui) {
@@ -1620,6 +1703,17 @@ impl VoiceApp {
                 {
                     self.start();
                 }
+                // Without live audio Start stays, and says to convert a file instead.
+                #[cfg(not(feature = "audio"))]
+                if ui
+                    .add_enabled(
+                        self.work.is_none(),
+                        m3::Button::fab(if compact { "" } else { t("Start") }).icon(icons::PLAY),
+                    )
+                    .clicked()
+                {
+                    self.start();
+                }
                 ui.add_space(4.0);
                 if m3::icon_button(
                     ui,
@@ -1629,7 +1723,7 @@ impl VoiceApp {
                 )
                 .clicked()
                 {
-                    self.file_dialog = true;
+                    self.page = Page::Convert;
                 }
                 if m3::icon_button(ui, icons::ROUTING, m3::ON_SURFACE_VARIANT, t("Audio routing"))
                     .clicked()
@@ -1947,20 +2041,65 @@ impl VoiceApp {
             }
         }
         if remove {
-            self.saved.slots.remove(self.saved.selected);
-            self.saved.selected = self.saved.selected.min(self.saved.slots.len() - 1);
+            self.remove_slot(self.saved.selected);
         }
         self.edit_model = !(remove || done || dismissed);
     }
-    fn file_conversion_dialog(&mut self, ctx: &egui::Context) {
+    /// Uses `path` as the input and puts the output beside it.
+    fn choose_input_wav(&mut self, path: &std::path::Path) {
+        self.file_input = path.to_string_lossy().into_owned();
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+        self.file_output = path
+            .with_file_name(format!("{stem}-converted.wav"))
+            .to_string_lossy()
+            .into_owned();
+    }
+    /// Converts a recorded WAV file with the selected voice.
+    fn convert_page(&mut self, ui: &mut egui::Ui) {
+        header(
+            ui,
+            t("Convert a WAV file"),
+            t("Changes the voice in a recording with one of your voices and saves the result as a new WAV file. Drop a .wav on the window to start here."),
+        );
         let busy = self.running() || self.work.is_some();
-        let mut close = false;
-        let (_, dismissed) = m3::dialog(ctx, "file-dialog", t("Convert a WAV file"), |ui| {
-            m3::chip(
-                ui,
-                icons::VOICE,
-                &self.saved.slots[self.saved.selected].name,
-            );
+        m3::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing = Vec2::splat(8.0);
+            m3::field_label(ui, t("Voice"));
+            let ready: Vec<usize> = (0..self.saved.slots.len())
+                .filter(|&i| !self.saved.slots[i].manifest.trim().is_empty())
+                .collect();
+            let mut picked = None;
+            ui.add_enabled_ui(!busy && !ready.is_empty(), |ui| {
+                let width = ui.available_width().min(440.0);
+                let current = &self.saved.slots[self.saved.selected];
+                let name = if current.manifest.trim().is_empty() {
+                    t("Choose a voice")
+                } else {
+                    current.name.as_str()
+                };
+                m3::select(ui, name, width, |ui| {
+                    for &index in &ready {
+                        let slot = &self.saved.slots[index];
+                        if m3::menu_item(ui, &slot.name, index == self.saved.selected).clicked() {
+                            picked = Some(index);
+                        }
+                    }
+                });
+            });
+            if let Some(index) = picked {
+                self.saved.selected = index;
+            }
+            ui.label(m3::supporting(if ready.is_empty() {
+                t("Import a voice first; the file is converted with it.")
+            } else {
+                t("The voice the whole file is converted with. It is also the voice selected for live use.")
+            }));
+            self.file_conversion(ui, busy);
+        });
+    }
+    fn file_conversion(&mut self, ui: &mut egui::Ui, busy: bool) {
+        {
             let browse = cfg!(not(any(target_os = "android", target_os = "ios")));
             let trailing = if browse { 48.0 } else { 0.0 };
             let mut convert = false;
@@ -1982,12 +2121,7 @@ impl VoiceApp {
                             .add_filter(t("WAV audio"), &["wav"])
                             .pick_file()
                         {
-                            self.file_input = path.to_string_lossy().into_owned();
-                            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-                            self.file_output = path
-                                .with_file_name(format!("{stem}-converted.wav"))
-                                .to_string_lossy()
-                                .into_owned();
+                            self.choose_input_wav(&path);
                         }
                     }
                 });
@@ -2044,6 +2178,10 @@ impl VoiceApp {
             }));
             m3::actions(ui, |ui| {
                 let ready = !busy
+                    && !self.saved.slots[self.saved.selected]
+                        .manifest
+                        .trim()
+                        .is_empty()
                     && !self.file_input.trim().is_empty()
                     && !self.file_output.trim().is_empty();
                 convert = ui
@@ -2052,7 +2190,6 @@ impl VoiceApp {
                         m3::Button::filled(t("Convert")).icon(icons::AUDIO_FILE),
                     )
                     .clicked();
-                close = ui.add(m3::Button::text(t("Close"))).clicked();
             });
             if convert {
                 let manifest = PathBuf::from(&self.saved.slots[self.saved.selected].manifest);
@@ -2100,8 +2237,7 @@ impl VoiceApp {
                     }
                 });
             }
-        });
-        self.file_dialog = !(close || dismissed);
+        }
     }
 }
 impl eframe::App for VoiceApp {
@@ -2246,6 +2382,7 @@ impl eframe::App for VoiceApp {
                                 match self.page {
                                     Page::Voices => self.gallery(ui),
                                     Page::Studio => self.voice_controls(ui),
+                                    Page::Convert => self.convert_page(ui),
                                     Page::Settings => self.settings(ui),
                                 }
                             });
@@ -2253,9 +2390,6 @@ impl eframe::App for VoiceApp {
             });
         if self.edit_model {
             self.model_dialog(ctx);
-        }
-        if self.file_dialog {
-            self.file_conversion_dialog(ctx);
         }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if self.import_dialog {
@@ -2408,6 +2542,18 @@ fn choice<T: Copy + PartialEq>(
     });
     ui.label(m3::supporting(hint));
 }
+/// Where the slot at `position` ends up when the slot at `from` moves to `to`.
+fn index_after_move(position: usize, from: usize, to: usize) -> usize {
+    if position == from {
+        to
+    } else if from < to && position > from && position <= to {
+        position - 1
+    } else if to < from && position >= to && position < from {
+        position + 1
+    } else {
+        position
+    }
+}
 const PORTRAIT_TYPES: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
 fn portrait_file(manifest: &std::path::Path) -> Option<PathBuf> {
     let folder = manifest.parent()?;
@@ -2557,5 +2703,26 @@ fn device_picker(
     });
     if let Some(device) = picked {
         *selected = device;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::index_after_move;
+
+    #[test]
+    fn every_slot_follows_a_move() {
+        for (from, to) in [(0, 3), (3, 0), (2, 3), (3, 2), (1, 1)] {
+            let mut slots: Vec<usize> = (0..5).collect();
+            let slot = slots.remove(from);
+            slots.insert(to, slot);
+            for position in 0..5 {
+                assert_eq!(
+                    slots[index_after_move(position, from, to)],
+                    position,
+                    "{from}->{to}"
+                );
+            }
+        }
     }
 }

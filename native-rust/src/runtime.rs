@@ -250,26 +250,7 @@ pub fn available_devices() -> &'static [crate::config::Device] {
     use crate::config::Device;
     static AVAILABLE: std::sync::OnceLock<Vec<Device>> = std::sync::OnceLock::new();
     AVAILABLE.get_or_init(|| {
-        let mut devices = vec![Device::Cpu];
-        #[cfg(any(feature = "onnx", feature = "onnx-static"))]
-        {
-            use ort::execution_providers::{DirectMLExecutionProvider, ExecutionProvider};
-            // ort load-dynamic can panic when its shared library cannot be located.
-            let offered = |provider: &dyn ExecutionProvider| {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    provider.supported_by_platform()
-                        && initialize().is_ok()
-                        && provider.is_available().unwrap_or(false)
-                }))
-                .unwrap_or(false)
-            };
-            if gpu_available() {
-                devices.push(Device::Gpu);
-            }
-            if offered(&DirectMLExecutionProvider::default()) {
-                devices.push(Device::DirectMl);
-            }
-        }
+        let devices: Vec<Device> = std::iter::once(Device::Cpu).chain(gpu_devices()).collect();
         log::info!(
             "Devices available: {}",
             devices
@@ -280,6 +261,36 @@ pub fn available_devices() -> &'static [crate::config::Device] {
         );
         devices
     })
+}
+
+/// The GPU execution providers the loaded ONNX Runtime offers here.
+#[cfg(any(feature = "onnx", feature = "onnx-static"))]
+fn gpu_devices() -> Vec<crate::config::Device> {
+    use crate::config::Device;
+    use ort::execution_providers::{DirectMLExecutionProvider, ExecutionProvider};
+    // ort load-dynamic can panic when its shared library cannot be located.
+    let offered = |provider: &dyn ExecutionProvider| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            provider.supported_by_platform()
+                && initialize().is_ok()
+                && provider.is_available().unwrap_or(false)
+        }))
+        .unwrap_or(false)
+    };
+    let mut devices = Vec::new();
+    if gpu_available() {
+        devices.push(Device::Gpu);
+    }
+    if offered(&DirectMLExecutionProvider::default()) {
+        devices.push(Device::DirectMl);
+    }
+    devices
+}
+
+/// A build without ONNX Runtime has no GPU to offer.
+#[cfg(not(any(feature = "onnx", feature = "onnx-static")))]
+fn gpu_devices() -> Vec<crate::config::Device> {
+    Vec::new()
 }
 
 /// The GPU to use when the user has not chosen: CUDA, then DirectML.

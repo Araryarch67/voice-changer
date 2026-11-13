@@ -30,7 +30,7 @@ Voice Changer converts your microphone into another voice as you speak, using [R
 - **Pitch detectors**: RMVPE, CREPE, FCPE, Harvest, DIO and YIN.
 - **GPU or CPU**: CUDA through ONNX Runtime where available, CPU everywhere else.
 - **One-step import**: pick an RVC `.pth` or `.zip` and the app converts it to ONNX, finds its index and adds the voice, no Python needed. Each voice can have its own picture.
-- **Recording** of the microphone and the converted voice to WAV, and offline WAV file conversion.
+- **Recording** of the microphone and the converted voice to WAV, and a **Convert** page that changes the voice in a WAV file (drop a `.wav` on the window to open it).
 - **Material 3 interface** with a plain-language hint under every option.
 
 ## Download

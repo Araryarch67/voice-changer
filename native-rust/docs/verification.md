@@ -41,3 +41,39 @@ See the README for repeatable commands and the explicit model contract.
   - Metadata (`embChannels`, `f0`, `useFinalProj`), output shape and `onnx.checker`: OK for every variant.
 - For the standard configs (`resblock "1"`), the reference `infer_realtime` does not crop, so realtime and plain outputs are equal.
 - `cargo test -- --include-ignored`: 32 passed. clippy and the `--no-default-features` check passed.
+
+## Update — Windows checks for v0.2 (2026-11-13)
+
+Host: Windows 11 x86_64; Rust 1.100.
+
+- `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` for the default features and for `gui`, `gui,audio` (the Android feature set), `gui,audio,onnx` and `gui,onnx,export`, all passed without warnings. `cargo build` printed no warnings.
+- `cargo test`: all tests passed. `tests/fcpe.rs` (ignored by default) passed against the downloaded FCPE model with ONNX Runtime 1.22: tones with eight harmonics at 110, 220 and 440 Hz read within 1 %, silence read as unvoiced, and the pipeline ran with FCPE beside the synthetic voice. FCPE is unsure of a bare sine below about 120 Hz (peak salience 0.02 to 0.05), so the test uses harmonic tones.
+- GUI screenshots were taken on Windows with `examples/capture` from a folder of placeholder voices (empty ONNX files): Voices, Studio, Convert and Settings at 1100×760 and 390×844, menus open, in English and Indonesian. No voice was converted and no audio device was opened.
+
+## Before 1.0: checks by hand
+
+None of these has been run with real audio yet. Each needs a real RVC voice, a microphone and headphones.
+
+Live audio
+- [ ] Start and Stop on CPU, CUDA and DirectML (Windows) and on CPU (Linux); the Load and Delay readings look plausible.
+- [ ] Switch voices while live: the new one takes over without a crash, and each keeps its own Tune and Index.
+- [ ] Change the microphone, output and monitor while live.
+- [ ] Chunk at 128 (341 ms), 512 (1365 ms) and 1024 (2731 ms): audio keeps flowing, no growing delay.
+- [ ] Every F0 detector: RMVPE, CREPE full and tiny, FCPE, Harvest, DIO, YIN; choosing a CREPE or FCPE one without its model offers the download.
+- [ ] Noise suppression Off, Sup1 and Sup2; echo cancellation with speakers.
+- [ ] VB-Cable on Windows and Voice Changer Mic on Linux reach Discord or OBS; silence while stopped.
+- [ ] Record while live: the WAV files and report are written.
+
+Voices and files
+- [ ] Import a `.pth` with and without its `.index`, by the dialog and by dropping it on the window.
+- [ ] Find online: search, add a voice from Hugging Face, Google Drive and MediaFire.
+- [ ] Add slot past eight; move a card earlier and later and remove one (right-click, and press and hold on a touch screen); the selected voice and its tuning stay with it.
+- [ ] Convert: a WAV converts with the chosen voice and the report is written; dropping a `.wav` opens Convert with it.
+
+Setup and settings
+- [ ] First start without models: the voice engine dialog downloads ContentVec and RMVPE; a failed download says which model failed.
+- [ ] Interface language switches between English, Indonesian and Japanese with no English left in the interface.
+- [ ] Settings from 0.1.x load after updating: slots, favourites and per-voice tuning are kept.
+- [ ] The window opens centred the first time and where it was left afterwards.
+- [ ] The Tune tip shows on hover and while pressed and held.
+- [ ] The Windows installer installs, starts from the Start menu and uninstalls; the Linux packages start from the menu.

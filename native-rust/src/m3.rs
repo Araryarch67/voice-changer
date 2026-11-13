@@ -708,15 +708,28 @@ pub fn setting<N: Numeric>(
                         let mut picked = None;
                         if !format.presets.is_empty() {
                             let current = value.to_f64();
+                            // A value between two presets opens the list at the nearer one.
+                            let nearest = format
+                                .presets
+                                .iter()
+                                .enumerate()
+                                .min_by(|a, b| {
+                                    (a.1 - current).abs().total_cmp(&(b.1 - current).abs())
+                                })
+                                .map(|(index, _)| index);
                             menu_button(ui, t("Common values"), 220.0, |ui| {
-                                for &preset in format.presets {
+                                for (index, &preset) in format.presets.iter().enumerate() {
                                     let text = match format.preset_label {
                                         Some(name) => name(preset),
                                         None => format.show(preset, low),
                                     };
                                     let on = (preset - current).abs() < step.max(1e-6) / 2.0
                                         || (preset.round() - current).abs() < 0.5 && step >= 1.0;
-                                    if menu_item(ui, &text, on).clicked() {
+                                    let item = menu_item(ui, &text, on);
+                                    if Some(index) == nearest && !on && menu_opening(ui) {
+                                        item.scroll_to_me(Some(egui::Align::Center));
+                                    }
+                                    if item.clicked() {
                                         picked = Some(preset);
                                     }
                                 }
@@ -1233,7 +1246,11 @@ fn menu_open(anchor: &Response) -> bool {
 /// M3 menu below `anchor`: opens when the anchor is clicked and closes on a choice
 /// or a click elsewhere. Fill it with [`menu_item`]s; long lists scroll.
 pub fn menu(anchor: &Response, width: f32, add: impl FnOnce(&mut Ui)) {
-    egui::Popup::menu(anchor)
+    // How many frames it has been open: for the first few (the first one only
+    // measures it) the chosen item scrolls into view, see `menu_item`.
+    let frames_key = egui::Popup::default_response_id(anchor).with("frames-open");
+    let ctx = anchor.ctx.clone();
+    let shown = egui::Popup::menu(anchor)
         .gap(4.0)
         .width(width)
         .frame(
@@ -1244,21 +1261,40 @@ pub fn menu(anchor: &Response, width: f32, add: impl FnOnce(&mut Ui)) {
                 .shadow(anchor.ctx.style().visuals.popup_shadow),
         )
         .show(|ui| {
+            let frames: u32 = ctx.data(|data| data.get_temp(frames_key).unwrap_or(0));
+            ctx.data_mut(|data| data.insert_temp(frames_key, frames.saturating_add(1)));
+            let opening = frames < 3;
             ui.set_width(width);
             egui::ScrollArea::vertical()
                 .max_height(304.0)
                 .show(ui, |ui| {
                     ui.set_width(width);
                     ui.spacing_mut().item_spacing = Vec2::ZERO;
+                    ui.data_mut(|data| data.insert_temp(egui::Id::new(MENU_OPENING), opening));
                     add(ui);
                 });
         });
+    if shown.is_none() {
+        ctx.data_mut(|data| data.remove::<u32>(frames_key));
+    }
 }
 
-/// A row of a [`menu`]; the chosen one is tinted and ticked.
+/// Whether the [`menu`] being drawn has just opened.
+const MENU_OPENING: &str = "m3-menu-opening";
+
+/// Inside a [`menu`]: whether it has just opened, so an item can scroll into view.
+pub fn menu_opening(ui: &Ui) -> bool {
+    ui.data(|data| data.get_temp(egui::Id::new(MENU_OPENING)).unwrap_or(false))
+}
+
+/// A row of a [`menu`]; the chosen one is tinted and ticked, and scrolled into view
+/// when the menu opens, so a long list starts at the current value.
 pub fn menu_item(ui: &mut Ui, text: &str, selected: bool) -> Response {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
+    if selected && menu_opening(ui) {
+        response.scroll_to_me(Some(egui::Align::Center));
+    }
     let enabled = ui.is_enabled();
     response.widget_info(|| WidgetInfo::selected(WidgetType::Button, enabled, selected, text));
     let row = rect.shrink2(Vec2::new(8.0, 0.0));
