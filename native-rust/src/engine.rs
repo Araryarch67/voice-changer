@@ -35,6 +35,11 @@ impl Engine {
         self.echo = None;
         self.played.clear();
     }
+    /// Replaces the voice; the next block starts it afresh.
+    pub fn set_converter(&mut self, converter: Box<dyn Converter>) {
+        self.converter = Some(converter);
+        self.reset();
+    }
     pub fn new(converter: Option<Box<dyn Converter>>) -> Self {
         Self {
             converter,

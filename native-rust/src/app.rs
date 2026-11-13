@@ -19,6 +19,48 @@ struct ModelSlot {
     manifest: String,
     #[serde(default)]
     favorite: bool,
+    /// This voice's own tuning; `None` until the voice is first used.
+    #[serde(default)]
+    tune: Option<VoiceTune>,
+}
+/// The settings that belong to one voice; everything else in `Settings` (devices,
+/// buffering, noise handling) is shared by all voices.
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct VoiceTune {
+    semitones: f32,
+    speaker_id: i64,
+    index_ratio: f32,
+    protect: f32,
+    f0_detector: F0Detector,
+    output_gain: f32,
+}
+impl Default for VoiceTune {
+    fn default() -> Self {
+        Self::from(&Settings::default())
+    }
+}
+impl From<&Settings> for VoiceTune {
+    fn from(settings: &Settings) -> Self {
+        Self {
+            semitones: settings.semitones,
+            speaker_id: settings.speaker_id,
+            index_ratio: settings.index_ratio,
+            protect: settings.protect,
+            f0_detector: settings.f0_detector,
+            output_gain: settings.output_gain,
+        }
+    }
+}
+impl VoiceTune {
+    fn apply(self, settings: &mut Settings) {
+        settings.semitones = self.semitones;
+        settings.speaker_id = self.speaker_id;
+        settings.index_ratio = self.index_ratio;
+        settings.protect = self.protect;
+        settings.f0_detector = self.f0_detector;
+        settings.output_gain = self.output_gain;
+    }
 }
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
@@ -45,6 +87,7 @@ impl Default for Saved {
                     name: format!("Voice {i:02}"),
                     manifest: String::new(),
                     favorite: false,
+                    tune: None,
                 })
                 .collect(),
             selected: 0,
@@ -95,6 +138,11 @@ pub struct VoiceApp {
     devices: Vec<AudioDevice>,
     #[cfg(feature = "audio")]
     session: Option<AudioSession>,
+    /// The slot whose tuning is in `saved.settings`.
+    tuned_slot: usize,
+    /// The devices the running session uses, to move it when they change.
+    #[cfg(feature = "audio")]
+    live_devices: Option<crate::audio::Devices>,
     /// Watches the "Voice Changer Mic" devices while they exist.
     #[cfg(all(feature = "audio", target_os = "linux"))]
     virtual_mic: Option<crate::virtual_mic::Guard>,
@@ -173,7 +221,14 @@ impl VoiceApp {
             session: None,
             #[cfg(all(feature = "audio", target_os = "linux"))]
             virtual_mic: None,
+            tuned_slot: 0,
+            #[cfg(feature = "audio")]
+            live_devices: None,
         };
+        // Voices saved before per-voice tuning keep the tuning in use for the selected one.
+        app.tuned_slot = app.saved.selected;
+        let current = VoiceTune::from(&app.saved.settings);
+        app.saved.slots[app.tuned_slot].tune.get_or_insert(current);
         crate::gpu_info::detect_in_background();
         #[cfg(feature = "audio")]
         app.refresh_devices();
@@ -296,6 +351,56 @@ impl VoiceApp {
         }
     }
     #[cfg(feature = "audio")]
+    /// The devices chosen in Settings.
+    #[cfg(feature = "audio")]
+    fn chosen_devices(&self) -> crate::audio::Devices {
+        crate::audio::Devices {
+            input: self.saved.input.clone(),
+            output: self.saved.output.clone(),
+            virtual_mic: cfg!(any(target_os = "linux", windows)) && self.saved.virtual_mic,
+            monitor: self
+                .saved
+                .monitor
+                .then(|| self.saved.monitor_device.clone()),
+        }
+    }
+    /// Keeps each voice's tuning with it: a newly selected voice brings back its own
+    /// (or the defaults the first time), and the running session switches to it.
+    fn follow_voice(&mut self) {
+        let selected = self.saved.selected.min(self.saved.slots.len() - 1);
+        if selected == self.tuned_slot {
+            if let Some(slot) = self.saved.slots.get_mut(selected) {
+                slot.tune = Some(VoiceTune::from(&self.saved.settings));
+            }
+            return;
+        }
+        self.tuned_slot = selected;
+        let slot = &self.saved.slots[selected];
+        slot.tune
+            .unwrap_or_default()
+            .apply(&mut self.saved.settings);
+        #[cfg(feature = "audio")]
+        if let Some(session) = &self.session {
+            let manifest = slot.manifest.trim();
+            if !manifest.is_empty() {
+                log::info!("Switching to \"{}\" while live", slot.name);
+                session.switch_voice(PathBuf::from(manifest));
+            }
+        }
+    }
+    /// Moves a running session to the devices chosen in Settings when they change.
+    #[cfg(feature = "audio")]
+    fn follow_devices(&mut self) {
+        let Some(session) = &self.session else {
+            self.live_devices = None;
+            return;
+        };
+        let chosen = self.chosen_devices();
+        if self.live_devices.as_ref() != Some(&chosen) {
+            session.switch_devices(chosen.clone());
+            self.live_devices = Some(chosen);
+        }
+    }
     fn start(&mut self) {
         if self.work.is_some() {
             return;
@@ -321,9 +426,10 @@ impl VoiceApp {
             }
         }
         let manifest = self.saved.slots[self.saved.selected].manifest.trim();
+        let devices = self.chosen_devices();
         let options = AudioOptions {
-            input: self.saved.input.clone(),
-            output: self.saved.output.clone(),
+            input: devices.input.clone(),
+            output: devices.output.clone(),
             manifest: if manifest.is_empty() {
                 None
             } else {
@@ -331,14 +437,12 @@ impl VoiceApp {
             },
             settings: self.saved.settings.clone(),
             record_dir: recordings_dir(),
-            virtual_mic: cfg!(any(target_os = "linux", windows)) && self.saved.virtual_mic,
-            monitor: self
-                .saved
-                .monitor
-                .then(|| self.saved.monitor_device.clone()),
+            virtual_mic: devices.virtual_mic,
+            monitor: devices.monitor.clone(),
         };
         match AudioSession::start(options) {
             Ok(s) => {
+                self.live_devices = Some(devices);
                 log::info!(
                     "Start: \"{}\" on {}",
                     self.saved.slots[self.saved.selected].name,
@@ -439,6 +543,7 @@ impl VoiceApp {
             name: format!("Voice {:02}", self.saved.slots.len() + 1),
             manifest: String::new(),
             favorite: false,
+            tune: None,
         });
         self.saved.selected = self.saved.slots.len() - 1;
         self.edit_model = true;
@@ -648,7 +753,7 @@ impl VoiceApp {
         header(
             ui,
             "Voices",
-            "Pick a voice, then press Start. Import an RVC .pth (and its .index), drop them on the window, or find one online.",
+            "Pick a voice, then press Start; you can switch voices while it runs. Each voice keeps its own Tune, Index and other voice settings. Import an RVC .pth (and its .index), drop them on the window, or find one online.",
         );
         let total = ui.available_width();
         let side = 320.0;
@@ -956,7 +1061,8 @@ impl VoiceApp {
             }
         }
         let empty = self.saved.slots[index].manifest.trim().is_empty();
-        if response.clicked() && !running {
+        // A filled voice can be chosen while running: it loads and takes over.
+        if response.clicked() && !(running && empty) {
             self.saved.selected = index;
             // An empty card is the same as Import model.
             if empty && self.work.is_none() {
@@ -1234,11 +1340,11 @@ impl VoiceApp {
         header(ui, "Settings", "Audio devices and runtime.");
         #[cfg(feature = "audio")]
         {
-            let running = self.running();
             m3::card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 m3::card_title(ui, icons::ROUTING, "Audio routing");
-                ui.add_enabled_ui(!running, |ui| {
+                // Devices can change while running; the session moves to them.
+                ui.scope(|ui| {
                     device_picker(ui, "Microphone", true, &self.devices, &mut self.saved.input);
                     #[cfg(target_os = "linux")]
                     {
@@ -1302,7 +1408,7 @@ impl VoiceApp {
                         self.refresh_devices();
                     }
                 });
-                ui.label(m3::supporting("Choose headphones for monitoring, or an installed virtual device to send audio to another app."));
+                ui.label(m3::supporting("Choose headphones for monitoring, or an installed virtual device to send audio to another app. Devices can be changed while the voice changer runs; audio pauses for a moment while it moves."));
             });
             ui.add_space(4.0);
         }
@@ -1378,7 +1484,9 @@ impl VoiceApp {
         };
         #[cfg(feature = "audio")]
         if let Some(session) = &self.session {
-            status = if session.metrics.ready.load(Ordering::Acquire) {
+            status = if session.metrics.voice_loading.load(Ordering::Acquire) {
+                "Live · loading this voice, the last one plays meanwhile…".to_owned()
+            } else if session.metrics.ready.load(Ordering::Acquire) {
                 let device = self.saved.settings.device;
                 match crate::gpu_info::name_for(device) {
                     Some(name) => format!("Live · {name}"),
@@ -1951,10 +2059,16 @@ impl eframe::App for VoiceApp {
         {
             self.error = Some(problem);
         }
+        self.follow_voice();
+        #[cfg(feature = "audio")]
+        self.follow_devices();
         #[cfg(feature = "audio")]
         if let Some(session) = &self.session {
             if let Some(recorded) = session.metrics.recorded.lock().unwrap().take() {
                 self.message = Some(recorded);
+            }
+            if let Some(problem) = session.metrics.voice_error.lock().unwrap().take() {
+                self.error = Some(format!("Could not switch voice: {problem}"));
             }
             if !session.metrics.running.load(Ordering::Acquire) {
                 self.error = session.metrics.error.lock().unwrap().clone();
@@ -2184,6 +2298,7 @@ fn adopt_models(saved: &mut Saved) -> Option<usize> {
             name,
             manifest,
             favorite: false,
+            tune: None,
         };
         if let Some(empty) = saved
             .slots

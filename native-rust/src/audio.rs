@@ -65,6 +65,10 @@ pub struct Metrics {
     pub recording: AtomicBool,
     /// Outcome of the last finished recording, taken by the UI.
     pub recorded: Mutex<Option<String>>,
+    /// A voice is loading to replace the current one.
+    pub voice_loading: AtomicBool,
+    /// Why the last voice switch failed, taken by the UI; the old voice keeps playing.
+    pub voice_error: Mutex<Option<String>>,
 }
 
 pub struct AudioOptions {
@@ -81,10 +85,42 @@ pub struct AudioOptions {
     /// `Some(None)` is the system default device.
     pub monitor: Option<Option<String>>,
 }
+/// Where audio comes from and goes to; can change while the session runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Devices {
+    pub input: Option<String>,
+    pub output: Option<String>,
+    pub virtual_mic: bool,
+    pub monitor: Option<Option<String>>,
+}
+impl AudioOptions {
+    pub fn devices(&self) -> Devices {
+        Devices {
+            input: self.input.clone(),
+            output: self.output.clone(),
+            virtual_mic: self.virtual_mic,
+            monitor: self.monitor.clone(),
+        }
+    }
+    fn set_devices(&mut self, devices: Devices) {
+        self.input = devices.input;
+        self.output = devices.output;
+        self.virtual_mic = devices.virtual_mic;
+        self.monitor = devices.monitor;
+    }
+}
+/// Changes the session makes without stopping.
+enum Control {
+    /// Load this voice in the background, then switch to it.
+    Voice(PathBuf),
+    /// Reopen the audio streams on these devices; the voice stays loaded.
+    Devices(Devices),
+}
 pub struct AudioSession {
     pub metrics: Arc<Metrics>,
     stop: Arc<AtomicBool>,
     settings: mpsc::SyncSender<Settings>,
+    control: mpsc::Sender<Control>,
 }
 impl AudioSession {
     pub fn start(options: AudioOptions) -> Result<Self> {
@@ -93,13 +129,20 @@ impl AudioSession {
         metrics.running.store(true, Ordering::Relaxed);
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::sync_channel(1);
+        let (control_tx, control_rx) = mpsc::channel();
         let worker_metrics = metrics.clone();
         let worker_stop = stop.clone();
         thread::Builder::new()
             .name("voice-engine".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run(options, rx, &worker_stop, worker_metrics.clone())
+                    run(
+                        options,
+                        rx,
+                        control_rx,
+                        &worker_stop,
+                        worker_metrics.clone(),
+                    )
                 }));
                 let error = match result {
                     Ok(Ok(())) => None,
@@ -119,10 +162,22 @@ impl AudioSession {
             metrics,
             stop,
             settings: tx,
+            control: control_tx,
         })
     }
     pub fn update(&self, settings: Settings) {
         let _ = self.settings.try_send(settings);
+    }
+    /// Switches to another voice without stopping: it loads in the background while
+    /// the current one keeps playing.
+    pub fn switch_voice(&self, manifest: PathBuf) {
+        self.metrics.voice_loading.store(true, Ordering::Release);
+        let _ = self.control.send(Control::Voice(manifest));
+    }
+    /// Moves the session to other devices; audio pauses briefly while the streams
+    /// reopen, and the voice stays loaded.
+    pub fn switch_devices(&self, devices: Devices) {
+        let _ = self.control.send(Control::Devices(devices));
     }
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
@@ -362,8 +417,9 @@ fn route_to_virtual_mic(stop: Arc<AtomicBool>) -> Result<()> {
 }
 
 fn run(
-    options: AudioOptions,
+    mut options: AudioOptions,
     updates: mpsc::Receiver<Settings>,
+    control: mpsc::Receiver<Control>,
     stop: &AtomicBool,
     metrics: Arc<Metrics>,
 ) -> Result<()> {
@@ -380,10 +436,100 @@ fn run(
     if stop.load(Ordering::Acquire) {
         return Ok(());
     }
-    let mut engine = Engine::new(converter);
+    let mut live = Live {
+        engine: Engine::new(converter),
+        settings: options.settings.clone(),
+        model_label: options.manifest.as_ref().map(|p| p.display().to_string()),
+        analysis_jobs: Vec::new(),
+        loading: None,
+    };
+    while let Some(devices) = run_devices(&options, &mut live, &updates, &control, stop, &metrics)?
+    {
+        log::info!("Switching audio devices");
+        options.set_devices(devices);
+        // The new devices may run at other rates; start the voice afresh.
+        live.engine.reset();
+        metrics.ready.store(false, Ordering::Release);
+        metrics.queued_samples.store(0, Ordering::Relaxed);
+    }
+    for job in live.analysis_jobs {
+        let _ = job.join();
+    }
+    metrics.recording.store(false, Ordering::Release);
+    log::info!("Audio stopped");
+    Ok(())
+}
+
+type Loaded = Result<Box<dyn engine::Converter>, String>;
+
+/// What a session keeps while its devices change.
+struct Live {
+    engine: Engine,
+    settings: Settings,
+    model_label: Option<String>,
+    analysis_jobs: Vec<thread::JoinHandle<()>>,
+    /// A voice loading in the background, and its label.
+    loading: Option<(String, mpsc::Receiver<Loaded>)>,
+}
+impl Live {
+    fn load_voice(&mut self, path: PathBuf, device: crate::config::Device, metrics: &Arc<Metrics>) {
+        let label = path.display().to_string();
+        log::info!("Loading voice {label} to switch to");
+        let (tx, rx) = mpsc::channel();
+        let started = thread::Builder::new()
+            .name("voice-switch".into())
+            .spawn(move || {
+                let loaded = std::panic::catch_unwind(|| engine::load_converter_on(&path, device))
+                    .map_err(|_| "Loading the voice panicked".to_owned())
+                    .and_then(|loaded| loaded.map_err(|error| format!("{error:#}")));
+                let _ = tx.send(loaded);
+            });
+        match started {
+            Ok(_) => self.loading = Some((label, rx)),
+            Err(error) => {
+                metrics.voice_loading.store(false, Ordering::Release);
+                *metrics.voice_error.lock().unwrap() = Some(error.to_string());
+            }
+        }
+    }
+    /// Switches to a voice that finished loading; returns its label.
+    fn finish_voice(&mut self, metrics: &Arc<Metrics>) -> Option<String> {
+        let (_, rx) = self.loading.as_ref()?;
+        let loaded = match rx.try_recv() {
+            Ok(loaded) => loaded,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => Err("Loading the voice stopped".into()),
+        };
+        let (label, _) = self.loading.take().expect("checked above");
+        metrics.voice_loading.store(false, Ordering::Release);
+        match loaded {
+            Ok(converter) => {
+                self.engine.set_converter(converter);
+                log::info!("Switched to {label}");
+                Some(label)
+            }
+            Err(error) => {
+                log::error!("Could not switch voice: {error}");
+                *metrics.voice_error.lock().unwrap() = Some(error);
+                None
+            }
+        }
+    }
+}
+
+/// Opens the streams on `options`' devices and converts until the session stops
+/// (`None`) or is moved to other devices (`Some`).
+fn run_devices(
+    options: &AudioOptions,
+    live: &mut Live,
+    updates: &mpsc::Receiver<Settings>,
+    control: &mpsc::Receiver<Control>,
+    stop: &AtomicBool,
+    metrics: &Arc<Metrics>,
+) -> Result<Option<Devices>> {
     let host = cpal::default_host();
     let input_device = select_device(&host, &options.input, true)?;
-    let output_device = voice_output(&host, &options)?;
+    let output_device = voice_output(&host, options)?;
     let input_config = input_device.default_input_config()?;
     let output_config = output_device.default_output_config()?;
     let input_rate = input_config.sample_rate();
@@ -417,25 +563,25 @@ fn run(
             &input_device,
             &input_config.into(),
             input.clone(),
-            metrics.clone(),
+            Arc::clone(metrics),
         )?,
         SampleFormat::I16 => input_stream::<i16>(
             &input_device,
             &input_config.into(),
             input.clone(),
-            metrics.clone(),
+            Arc::clone(metrics),
         )?,
         SampleFormat::I32 => input_stream::<i32>(
             &input_device,
             &input_config.into(),
             input.clone(),
-            metrics.clone(),
+            Arc::clone(metrics),
         )?,
         SampleFormat::U16 => input_stream::<u16>(
             &input_device,
             &input_config.into(),
             input.clone(),
-            metrics.clone(),
+            Arc::clone(metrics),
         )?,
         format => bail!("Unsupported input sample format: {format:?}"),
     };
@@ -446,7 +592,7 @@ fn run(
         &output_device,
         output_config,
         output.clone(),
-        &metrics,
+        metrics,
     )?;
     let mut monitor: Option<Monitor> = None;
     // Ends the virtual microphone's route keeper with the session.
@@ -458,28 +604,25 @@ fn run(
         }
     }
     let _end_routing = EndRouting(routing.clone());
-    let model_label = options.manifest.as_ref().map(|p| p.display().to_string());
-    let mut settings = options.settings;
-    let block_size = input_rate as usize * settings.block_ms as usize / 1000;
+    let block_size = input_rate as usize * live.settings.block_ms as usize / 1000;
     let mut pending = Vec::with_capacity(block_size);
     let mut rate_converter = StreamResampler::new(input_rate, output_rate);
     input_stream.play()?;
     // Output begins when the first processed block is available.
     let mut output_started = false;
     let mut recorder: Option<Recorder> = None;
-    let mut analysis_jobs: Vec<thread::JoinHandle<()>> = Vec::new();
     metrics.ready.store(true, Ordering::Release);
     log::info!(
         "Live: block {} ms, extra {} ms, crossfade {} ms, pitch {:?}, tune {:+.1}, index {:.0}%, noise {:?}, echo {}{}",
-        settings.block_ms,
-        settings.context_ms,
-        settings.overlap_ms,
-        settings.f0_detector,
-        settings.semitones,
-        settings.index_ratio * 100.0,
-        settings.noise,
-        if settings.echo { "on" } else { "off" },
-        if settings.bypass { ", voice changer off" } else { "" }
+        live.settings.block_ms,
+        live.settings.context_ms,
+        live.settings.overlap_ms,
+        live.settings.f0_detector,
+        live.settings.semitones,
+        live.settings.index_ratio * 100.0,
+        live.settings.noise,
+        if live.settings.echo { "on" } else { "off" },
+        if live.settings.bypass { ", voice changer off" } else { "" }
     );
     let mut report = (Instant::now(), 0u32, 0f32, 0f32);
     while !stop.load(Ordering::Acquire) {
@@ -494,17 +637,35 @@ fn run(
                 ),
             }
         }
+        for command in control.try_iter() {
+            match command {
+                Control::Voice(path) => live.load_voice(path, live.settings.device, metrics),
+                Control::Devices(devices) => {
+                    finish_recording(
+                        &mut recorder,
+                        metrics,
+                        &mut live.analysis_jobs,
+                        live.model_label.clone(),
+                        live.settings.clone(),
+                    );
+                    return Ok(Some(devices));
+                }
+            }
+        }
+        if let Some(label) = live.finish_voice(metrics) {
+            live.model_label = Some(label);
+        }
         for update in updates.try_iter() {
             update.validate()?;
             // Geometry changes are applied on the next session; gain/pitch/bypass are live.
             anyhow::ensure!(
-                update.block_ms == settings.block_ms
-                    && update.context_ms == settings.context_ms
-                    && update.overlap_ms == settings.overlap_ms
-                    && update.search_ms == settings.search_ms,
+                update.block_ms == live.settings.block_ms
+                    && update.context_ms == live.settings.context_ms
+                    && update.overlap_ms == live.settings.overlap_ms
+                    && update.search_ms == live.settings.search_ms,
                 "Stop audio before changing buffer durations"
             );
-            settings = update;
+            live.settings = update;
         }
         // Discard accumulated stale input before selecting the next block.
         if input.len() > block_size * 2 {
@@ -514,7 +675,7 @@ fn run(
                     metrics.dropped_input.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            engine.reset();
+            live.engine.reset();
         }
         while pending.len() < block_size {
             let Some(sample) = input.pop() else {
@@ -530,7 +691,7 @@ fn run(
             .input_level
             .store(dsp::rms(&pending).to_bits(), Ordering::Relaxed);
         let started = Instant::now();
-        let processed = engine.process(&pending, input_rate, &settings)?;
+        let processed = live.engine.process(&pending, input_rate, &live.settings)?;
         let took = started.elapsed().as_secs_f32() * 1000.0;
         metrics
             .processing_ms
@@ -545,7 +706,7 @@ fn run(
                 report.1,
                 report.2 / report.1 as f32,
                 report.3,
-                settings.block_ms,
+                live.settings.block_ms,
                 output.len() as u64 * 1000 / output_rate.max(1) as u64,
                 metrics.dropped_input.load(Ordering::Relaxed),
                 metrics.dropped_output.load(Ordering::Relaxed),
@@ -570,10 +731,10 @@ fn run(
             },
             (false, true) => finish_recording(
                 &mut recorder,
-                &metrics,
-                &mut analysis_jobs,
-                model_label.clone(),
-                settings.clone(),
+                metrics,
+                &mut live.analysis_jobs,
+                live.model_label.clone(),
+                live.settings.clone(),
             ),
             _ => {}
         }
@@ -586,7 +747,7 @@ fn run(
         }
         // With the voice changer off, a virtual microphone carries silence rather
         // than the raw voice, so nobody hears the real voice by surprise.
-        let processed = if options.virtual_mic && settings.bypass {
+        let processed = if options.virtual_mic && live.settings.bypass {
             vec![0.0; processed.len()]
         } else {
             processed
@@ -597,7 +758,7 @@ fn run(
         let processed = rate_converter.push(&processed);
         // A quarter block of lead silence, so a block that takes longer than the
         // first one does not run the output dry.
-        let lead = output_rate as usize * settings.block_ms as usize / 4000;
+        let lead = output_rate as usize * live.settings.block_ms as usize / 4000;
         if !output_started {
             for _ in 0..lead {
                 let _ = output.push(0.0);
@@ -626,7 +787,7 @@ fn run(
                 log::info!("Voice is going to the virtual microphone");
             }
             if let Some(device) = &options.monitor {
-                monitor = Some(Monitor::open(&host, device, input_rate, &metrics)?);
+                monitor = Some(Monitor::open(&host, device, input_rate, metrics)?);
             }
         }
         if metrics.monitor_error.swap(false, Ordering::Relaxed) && monitor.take().is_some() {
@@ -640,17 +801,12 @@ fn run(
     }
     finish_recording(
         &mut recorder,
-        &metrics,
-        &mut analysis_jobs,
-        model_label,
-        settings,
+        metrics,
+        &mut live.analysis_jobs,
+        live.model_label.clone(),
+        live.settings.clone(),
     );
-    for job in analysis_jobs {
-        let _ = job.join();
-    }
-    metrics.recording.store(false, Ordering::Release);
-    log::info!("Audio stopped");
-    Ok(())
+    Ok(None)
 }
 
 fn finish_recording(
