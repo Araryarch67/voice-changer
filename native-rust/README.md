@@ -4,7 +4,7 @@ A Rust + egui prototype based on the audio flow of the original Python applicati
 
 ![Desktop preview](docs/preview-desktop.png)
 
-[Narrow layout preview](docs/preview-mobile.png)
+[Studio preview](docs/preview-studio.png) · [Narrow layout preview](docs/preview-mobile.png)
 
 The application does not launch Python, a browser, or a server. It uses eframe/egui and WGPU for the interface, CPAL for audio, crossbeam-queue for bounded audio queues, and ort for ONNX inference. ONNX Runtime and operating-system audio/graphics libraries are native dependencies; “Rust application” does not mean every dependency is implemented in Rust.
 
@@ -42,7 +42,7 @@ cd native-rust
 cargo run --release
 ```
 
-The initial cards are empty slots, not bundled character voices. Bypass is enabled by default, so audio routing can be tested before loading a model. Use headphones or select an existing virtual output device. The program does not install a virtual microphone driver.
+The initial eight cards are empty slots, not bundled character voices; **Add slot** after the last card adds another, without limit. Bypass is enabled by default, so audio routing can be tested before loading a model. Use headphones or select an existing virtual output device. The program does not install a virtual microphone driver.
 
 1. Open **Settings** and choose the microphone and output.
 2. Double-click a voice card, or press **Edit selected**, and enter its JSON manifest path. **Import model** adds a new slot.
@@ -152,6 +152,8 @@ cargo build --example capture
 bash tools/preview.sh /tmp/voice-desktop.png 1100 760
 bash tools/preview.sh /tmp/voice-narrow.png 390 844
 ```
+
+On Windows, run `target/debug/examples/capture OUT.png 1100 760` directly; it opens the window briefly. Pairs of numbers after the size are clicks made before the picture, for another page or an open menu (`44 195` opens Studio), and `VOICE_CHANGER_LANG=en` sets the language. The pictures in `docs/` were taken from a folder holding only placeholder voices.
 
 ## Source map
 

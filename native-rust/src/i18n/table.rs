@@ -261,4 +261,6 @@ pub static TABLE: &[(&str, &str, &str)] = &[
     ("RVC checkpoint", "Checkpoint RVC", "RVC チェックポイント"),
     ("RVC feature index", "Index fitur RVC", "RVC インデックス"),
     ("WAV audio", "Audio WAV", "WAV 音声"),
+    ("Add slot", "Tambah slot", "枠を追加"),
+    ("Add another empty voice slot; there is no limit", "Tambah satu slot suara kosong lagi; tidak ada batasnya", "空き枠をもう 1 つ追加します。いくつでも追加できます"),
 ];

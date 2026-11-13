@@ -248,6 +248,9 @@ fn main() -> Result<()> {
                     .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/hicolor/256x256/apps/voice-changer.png")).expect("bundled icon is a valid PNG"))
                     .with_inner_size([1060.0, 760.0])
                     .with_min_inner_size([360.0, 540.0]),
+                // In the middle of the screen the first time; after that the window
+                // comes back where it was left.
+                centered: true,
                 ..Default::default()
             }).map_err(|e| anyhow::anyhow!("{e}"))?;
             #[cfg(not(feature = "gui"))]

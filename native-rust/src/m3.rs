@@ -667,26 +667,19 @@ pub fn setting<N: Numeric>(
                         let mut picked = None;
                         if !format.presets.is_empty() {
                             let current = value.to_f64();
-                            egui::ComboBox::from_id_salt((label, "presets"))
-                                .width(24.0)
-                                .selected_text("")
-                                .show_ui(ui, |ui| {
-                                    ui.set_min_width(180.0);
-                                    for &preset in format.presets {
-                                        let text = match format.preset_label {
-                                            Some(name) => name(preset),
-                                            None => format.show(preset, low),
-                                        };
-                                        let on = (preset - current).abs() < step.max(1e-6) / 2.0
-                                            || (preset.round() - current).abs() < 0.5
-                                                && step >= 1.0;
-                                        if ui.selectable_label(on, text).clicked() {
-                                            picked = Some(preset);
-                                        }
+                            menu_button(ui, t("Common values"), 220.0, |ui| {
+                                for &preset in format.presets {
+                                    let text = match format.preset_label {
+                                        Some(name) => name(preset),
+                                        None => format.show(preset, low),
+                                    };
+                                    let on = (preset - current).abs() < step.max(1e-6) / 2.0
+                                        || (preset.round() - current).abs() < 0.5 && step >= 1.0;
+                                    if menu_item(ui, &text, on).clicked() {
+                                        picked = Some(preset);
                                     }
-                                })
-                                .response
-                                .on_hover_text(t("Common values"));
+                                }
+                            });
                         }
                         if let Some(preset) = picked {
                             *value = N::from_f64(((preset / step).round() * step).clamp(low, high));
@@ -1179,6 +1172,154 @@ pub fn field_label(ui: &mut Ui, text: &str) {
     );
 }
 /// Outlined text field.
+/// A chevron pointing down, or up while its menu is open.
+fn paint_chevron(ui: &Ui, center: egui::Pos2, open: bool, color: Color32) {
+    let tip = if open { -2.5 } else { 2.5 };
+    ui.painter().add(egui::Shape::line(
+        vec![
+            center + Vec2::new(-5.0, -tip),
+            center + Vec2::new(0.0, tip),
+            center + Vec2::new(5.0, -tip),
+        ],
+        Stroke::new(2.0_f32, color),
+    ));
+}
+
+fn menu_open(anchor: &Response) -> bool {
+    egui::Popup::is_id_open(&anchor.ctx, egui::Popup::default_response_id(anchor))
+}
+
+/// M3 menu below `anchor`: opens when the anchor is clicked and closes on a choice
+/// or a click elsewhere. Fill it with [`menu_item`]s; long lists scroll.
+pub fn menu(anchor: &Response, width: f32, add: impl FnOnce(&mut Ui)) {
+    egui::Popup::menu(anchor)
+        .gap(4.0)
+        .width(width)
+        .frame(
+            Frame::new()
+                .fill(SURFACE_CONTAINER_HIGH)
+                .corner_radius(12)
+                .inner_margin(Margin::symmetric(0, 8))
+                .shadow(anchor.ctx.style().visuals.popup_shadow),
+        )
+        .show(|ui| {
+            ui.set_width(width);
+            egui::ScrollArea::vertical()
+                .max_height(304.0)
+                .show(ui, |ui| {
+                    ui.set_width(width);
+                    ui.spacing_mut().item_spacing = Vec2::ZERO;
+                    add(ui);
+                });
+        });
+}
+
+/// A row of a [`menu`]; the chosen one is tinted and ticked.
+pub fn menu_item(ui: &mut Ui, text: &str, selected: bool) -> Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
+    let enabled = ui.is_enabled();
+    response.widget_info(|| WidgetInfo::selected(WidgetType::Button, enabled, selected, text));
+    let row = rect.shrink2(Vec2::new(8.0, 0.0));
+    let content = if selected {
+        ON_SECONDARY_CONTAINER
+    } else {
+        ON_SURFACE
+    };
+    if selected {
+        ui.painter().rect_filled(row, 8.0, SECONDARY_CONTAINER);
+        paint_icon(
+            ui,
+            egui::pos2(row.left() + 20.0, row.center().y),
+            icons::CHECK,
+            18.0,
+            false,
+            content,
+        );
+    }
+    ui.painter()
+        .rect_filled(row, 8.0, state_layer(&response, content));
+    let galley = elided(
+        ui,
+        text,
+        FontId::new(14.0, FontFamily::Proportional),
+        content,
+        row.width() - 52.0,
+    );
+    ui.painter().galley(
+        egui::pos2(row.left() + 40.0, row.center().y - galley.size().y / 2.0),
+        galley,
+        content,
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// M3 select field: shows `text` with a chevron and opens a [`menu`] of the same
+/// width, filled by `add`.
+pub fn select(ui: &mut Ui, text: &str, width: f32, add: impl FnOnce(&mut Ui)) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 44.0), Sense::click());
+    let enabled = ui.is_enabled();
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::ComboBox, enabled, text));
+    let open = menu_open(&response);
+    let content = if enabled {
+        ON_SURFACE
+    } else {
+        ON_SURFACE.gamma_multiply(0.38)
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 12.0, SURFACE_CONTAINER_HIGHEST);
+    painter.rect_filled(rect, 12.0, state_layer(&response, ON_SURFACE));
+    if open {
+        painter.rect_stroke(
+            rect,
+            12.0,
+            Stroke::new(2.0_f32, PRIMARY),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let galley = elided(
+        ui,
+        text,
+        FontId::new(14.0, FontFamily::Proportional),
+        content,
+        width - 60.0,
+    );
+    painter.galley(
+        egui::pos2(rect.left() + 16.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        content,
+    );
+    paint_chevron(
+        ui,
+        egui::pos2(rect.right() - 22.0, rect.center().y),
+        open,
+        if open { PRIMARY } else { ON_SURFACE_VARIANT },
+    );
+    menu(&response, width, add);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A small chevron button that opens a [`menu`] of `width`, filled by `add`.
+pub fn menu_button(ui: &mut Ui, hint: &str, width: f32, add: impl FnOnce(&mut Ui)) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(32.0, 28.0), Sense::click());
+    let enabled = ui.is_enabled();
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::ComboBox, enabled, hint));
+    let open = menu_open(&response);
+    let painter = ui.painter();
+    painter.rect_filled(rect, 8.0, SURFACE_CONTAINER_HIGHEST);
+    painter.rect_filled(rect, 8.0, state_layer(&response, ON_SURFACE));
+    paint_chevron(
+        ui,
+        rect.center(),
+        open,
+        if open { PRIMARY } else { ON_SURFACE_VARIANT },
+    );
+    menu(&response, width, add);
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(hint)
+}
+
 pub fn text_edit<'a>(text: &'a mut String, hint: &str, width: f32) -> egui::TextEdit<'a> {
     egui::TextEdit::singleline(text)
         .hint_text(hint)

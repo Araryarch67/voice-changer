@@ -554,7 +554,7 @@ impl VoiceApp {
         }
         self.portraits.remove(&manifest);
     }
-    #[cfg(any(target_os = "android", target_os = "ios"))]
+    /// Adds an empty slot at the end and selects it; there is no limit to how many.
     fn add_slot(&mut self) {
         self.saved.slots.push(ModelSlot {
             name: format!("Voice {:02}", self.saved.slots.len() + 1),
@@ -562,8 +562,9 @@ impl VoiceApp {
             favorite: false,
             tune: None,
         });
-        self.saved.selected = self.saved.slots.len() - 1;
-        self.edit_model = true;
+        if !self.running() {
+            self.saved.selected = self.saved.slots.len() - 1;
+        }
     }
     fn import_model(&mut self) {
         #[cfg(feature = "catalog")]
@@ -575,7 +576,10 @@ impl VoiceApp {
             self.import_dialog = true;
         }
         #[cfg(any(target_os = "android", target_os = "ios"))]
-        self.add_slot();
+        {
+            self.add_slot();
+            self.edit_model = true;
+        }
     }
     /// Puts a checkpoint in the import dialog, with the index beside it if the index
     /// field is still empty.
@@ -899,6 +903,10 @@ impl VoiceApp {
             ui.spacing_mut().item_spacing = Vec2::splat(gap);
             for index in visible.iter().copied() {
                 self.voice_card(ui, index, width, running);
+            }
+            // The slots never run out: one more is a click away.
+            if self.filter == Filter::All && search.is_empty() && add_slot_card(ui, width) {
+                self.add_slot();
             }
         });
         if visible.is_empty() {
@@ -2462,6 +2470,42 @@ fn adopt_models(saved: &mut Saved) -> Option<usize> {
     }
     added
 }
+/// The tile after the last voice card that adds another empty slot.
+fn add_slot_card(ui: &mut egui::Ui, width: f32) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 164.0), egui::Sense::click());
+    let hint = t("Add another empty voice slot; there is no limit");
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, t("Add slot")));
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(rect, 12.0, m3::ON_SURFACE.gamma_multiply(0.08));
+    }
+    painter.rect_stroke(
+        rect,
+        12.0,
+        egui::Stroke::new(1.0_f32, m3::OUTLINE_VARIANT),
+        egui::StrokeKind::Inside,
+    );
+    m3::paint_icon(
+        ui,
+        rect.center() - Vec2::new(0.0, 12.0),
+        icons::ADD,
+        28.0,
+        false,
+        m3::PRIMARY,
+    );
+    painter.text(
+        rect.center() + Vec2::new(0.0, 22.0),
+        egui::Align2::CENTER_CENTER,
+        t("Add slot"),
+        FontId::new(14.0, m3::medium()),
+        m3::PRIMARY,
+    );
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(hint)
+        .clicked()
+}
 fn header(ui: &mut egui::Ui, title: &str, detail: &str) {
     ui.label(m3::headline(title));
     ui.label(m3::supporting(detail));
@@ -2494,13 +2538,20 @@ fn device_picker(
         })
         .unwrap_or(t("System default"));
     m3::field_label(ui, label);
-    egui::ComboBox::from_id_salt(label)
-        .selected_text(name)
-        .width(ui.available_width().min(440.0))
-        .show_ui(ui, |ui| {
-            ui.selectable_value(selected, None, t("System default"));
-            for device in devices.iter().filter(|d| d.input == input) {
-                ui.selectable_value(selected, Some(device.id.clone()), &device.name);
+    let mut picked = None;
+    let width = ui.available_width().min(440.0);
+    m3::select(ui, name, width, |ui| {
+        if m3::menu_item(ui, t("System default"), selected.is_none()).clicked() {
+            picked = Some(None);
+        }
+        for device in devices.iter().filter(|d| d.input == input) {
+            let on = selected.as_ref() == Some(&device.id);
+            if m3::menu_item(ui, &device.name, on).clicked() {
+                picked = Some(Some(device.id.clone()));
             }
-        });
+        }
+    });
+    if let Some(device) = picked {
+        *selected = device;
+    }
 }

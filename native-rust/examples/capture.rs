@@ -1,29 +1,41 @@
-//! Development-only screenshot runner: cargo run --example capture -- output.png [width height [click_x click_y]]
+//! Development-only screenshot runner: cargo run --example capture -- output.png [width height [click_x click_y]...]
 #[cfg(feature = "gui")]
 fn main() -> eframe::Result {
     use eframe::egui;
     struct Capture {
         app: voice_changer::app::VoiceApp,
         path: String,
+        size: egui::Vec2,
         frames: usize,
-        click: Option<egui::Pos2>,
+        clicks: Vec<egui::Pos2>,
     }
     impl eframe::App for Capture {
-        // Optional click before the screenshot, to capture another page or a dialog.
+        // Optional clicks before the screenshot, one every eight frames, to capture
+        // another page, a dialog or an open menu.
         fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
-            let Some(pos) = self.click else { return };
-            match self.frames {
-                3 => raw.events.push(egui::Event::PointerMoved(pos)),
-                4 | 5 => raw.events.push(egui::Event::PointerButton {
+            let Some(step) = self.frames.checked_sub(3) else {
+                return;
+            };
+            let Some(&pos) = self.clicks.get(step / 8) else {
+                return;
+            };
+            match step % 8 {
+                0 => raw.events.push(egui::Event::PointerMoved(pos)),
+                pressed @ (1 | 2) => raw.events.push(egui::Event::PointerButton {
                     pos,
                     button: egui::PointerButton::Primary,
-                    pressed: self.frames == 4,
+                    pressed: pressed == 1,
                     modifiers: Default::default(),
                 }),
                 _ => {}
             }
         }
         fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+            // A window size saved by an earlier run wins over the one asked for at
+            // creation, so ask again.
+            if self.frames == 0 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(self.size));
+            }
             self.app.update(ctx, frame);
             for event in ctx.input(|i| i.events.clone()) {
                 if let egui::Event::Screenshot { image, .. } = event {
@@ -61,21 +73,25 @@ fn main() -> eframe::Result {
         .and_then(|s| s.parse::<f32>().ok())
         .unwrap_or(760.0);
     let coordinate = |i: usize| args.get(i).and_then(|s| s.parse::<f32>().ok());
-    let click = coordinate(4)
-        .zip(coordinate(5))
-        .map(|(x, y)| egui::pos2(x, y));
+    let clicks: Vec<egui::Pos2> = (4..args.len())
+        .step_by(2)
+        .filter_map(|i| coordinate(i).zip(coordinate(i + 1)))
+        .map(|(x, y)| egui::pos2(x, y))
+        .collect();
     eframe::run_native(
         "Voice Changer Preview",
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default().with_inner_size([width, height]),
+            persist_window: false,
             ..Default::default()
         },
         Box::new(move |cc| {
             Ok(Box::new(Capture {
                 app: voice_changer::app::VoiceApp::new(cc),
                 path,
+                size: egui::vec2(width, height),
                 frames: 0,
-                click,
+                clicks,
             }))
         }),
     )
