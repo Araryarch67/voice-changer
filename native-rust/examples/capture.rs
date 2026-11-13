@@ -1,4 +1,5 @@
 //! Development-only screenshot runner: cargo run --example capture -- output.png [width height [click_x click_y]...]
+//! A click whose x starts with `r` (r318 290) uses the right button, for context menus.
 #[cfg(feature = "gui")]
 fn main() -> eframe::Result {
     use eframe::egui;
@@ -7,7 +8,7 @@ fn main() -> eframe::Result {
         path: String,
         size: egui::Vec2,
         frames: usize,
-        clicks: Vec<egui::Pos2>,
+        clicks: Vec<(egui::Pos2, egui::PointerButton)>,
     }
     impl eframe::App for Capture {
         // Optional clicks before the screenshot, one every eight frames, to capture
@@ -16,14 +17,14 @@ fn main() -> eframe::Result {
             let Some(step) = self.frames.checked_sub(3) else {
                 return;
             };
-            let Some(&pos) = self.clicks.get(step / 8) else {
+            let Some(&(pos, button)) = self.clicks.get(step / 8) else {
                 return;
             };
             match step % 8 {
                 0 => raw.events.push(egui::Event::PointerMoved(pos)),
                 pressed @ (1 | 2) => raw.events.push(egui::Event::PointerButton {
                     pos,
-                    button: egui::PointerButton::Primary,
+                    button,
                     pressed: pressed == 1,
                     modifiers: Default::default(),
                 }),
@@ -72,11 +73,24 @@ fn main() -> eframe::Result {
         .get(3)
         .and_then(|s| s.parse::<f32>().ok())
         .unwrap_or(760.0);
-    let coordinate = |i: usize| args.get(i).and_then(|s| s.parse::<f32>().ok());
-    let clicks: Vec<egui::Pos2> = (4..args.len())
+    let coordinate = |i: usize| {
+        args.get(i)
+            .and_then(|s| s.trim_start_matches('r').parse::<f32>().ok())
+    };
+    let button = |i: usize| {
+        if args[i].starts_with('r') {
+            egui::PointerButton::Secondary
+        } else {
+            egui::PointerButton::Primary
+        }
+    };
+    let clicks: Vec<(egui::Pos2, egui::PointerButton)> = (4..args.len())
         .step_by(2)
-        .filter_map(|i| coordinate(i).zip(coordinate(i + 1)))
-        .map(|(x, y)| egui::pos2(x, y))
+        .filter_map(|i| {
+            coordinate(i)
+                .zip(coordinate(i + 1))
+                .map(|(x, y)| (egui::pos2(x, y), button(i)))
+        })
         .collect();
     eframe::run_native(
         "Voice Changer Preview",

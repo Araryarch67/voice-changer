@@ -37,6 +37,39 @@ pub fn models_root() -> Option<PathBuf> {
     })
 }
 
+/// The folder deleted with a voice: the folder holding its `model.json`, directly
+/// inside one of `roots` (the models folders), and never `shared` or a hidden one.
+/// `None` for a manifest anywhere else, whose files are left alone.
+pub fn voice_folder(manifest: &std::path::Path, roots: &[PathBuf]) -> Option<PathBuf> {
+    let manifest = manifest.canonicalize().ok()?;
+    if manifest.file_name()? != "model.json" {
+        return None;
+    }
+    let folder = manifest.parent()?;
+    let name = folder.file_name()?.to_str()?;
+    if name == "shared" || name.starts_with('.') {
+        return None;
+    }
+    let parent = folder.parent()?;
+    roots
+        .iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .any(|root| root == parent)
+        .then(|| folder.to_path_buf())
+}
+
+/// Deletes the voice of `manifest` from disk when it lives in a models folder (see
+/// [`voice_folder`]), and returns the folder deleted; `None` when there was none to
+/// delete.
+pub fn delete_voice(manifest: &std::path::Path) -> std::io::Result<Option<PathBuf>> {
+    let Some(folder) = voice_folder(manifest, &model_directories()) else {
+        return Ok(None);
+    };
+    std::fs::remove_dir_all(&folder)?;
+    log::info!("Deleted {}", folder.display());
+    Ok(Some(folder))
+}
+
 pub fn discover_models() -> Vec<(String, PathBuf)> {
     let mut models = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -327,6 +360,39 @@ pub fn gpu_available() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_voice_folder_inside_models_is_deleted() {
+        use super::voice_folder;
+        let base = std::env::temp_dir().join(format!("vc-delete-{}", std::process::id()));
+        let models = base.join("models");
+        let elsewhere = base.join("elsewhere");
+        for folder in ["aria", "shared", ".downloads"] {
+            std::fs::create_dir_all(models.join(folder)).unwrap();
+            std::fs::write(models.join(folder).join("model.json"), "{}").unwrap();
+        }
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("model.json"), "{}").unwrap();
+        std::fs::write(models.join("loose.json"), "{}").unwrap();
+        let roots = [models.clone()];
+        let found = voice_folder(&models.join("aria/model.json"), &roots).unwrap();
+        assert_eq!(found, models.join("aria").canonicalize().unwrap());
+        for manifest in [
+            models.join("shared/model.json"),
+            models.join(".downloads/model.json"),
+            models.join("loose.json"),
+            elsewhere.join("model.json"),
+            models.join("missing/model.json"),
+        ] {
+            assert_eq!(
+                voice_folder(&manifest, &roots),
+                None,
+                "{}",
+                manifest.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn finds_cudnn_folders_newest_first() {
         let root = std::env::temp_dir().join(format!("vc-cudnn-{}", std::process::id()));

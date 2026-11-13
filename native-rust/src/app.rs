@@ -141,6 +141,8 @@ pub struct VoiceApp {
     file_analyze: bool,
     work: Option<mpsc::Receiver<Result<String, String>>>,
     message: Option<String>,
+    /// The voice waiting for the user to confirm its removal.
+    removing: Option<usize>,
     /// The snackbar: its text, whether it is an error, and when it goes away by
     /// itself (set when first shown; errors stay until closed).
     toast: Option<(String, bool, Option<f64>)>,
@@ -226,6 +228,7 @@ impl VoiceApp {
             file_analyze: true,
             work: None,
             message: None,
+            removing: None,
             toast: None,
             logged: (None, None),
             portraits: Default::default(),
@@ -1136,14 +1139,19 @@ impl VoiceApp {
         }
         // Right-click, or press and hold on a touch screen: move or remove the slot.
         let last = self.saved.slots.len() - 1;
+        let remove = if empty {
+            t("Remove slot")
+        } else {
+            t("Remove voice")
+        };
         let mut action = None;
         response.context_menu(|ui| {
-            ui.set_min_width(200.0);
+            ui.set_width(220.0);
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             for (label, enabled, chosen) in [
                 (t("Move earlier"), index > 0, SlotAction::Earlier),
                 (t("Move later"), index < last, SlotAction::Later),
-                (t("Remove slot"), !running && last > 0, SlotAction::Remove),
+                (remove, !running && (last > 0 || !empty), SlotAction::Remove),
             ] {
                 if ui
                     .add_enabled_ui(enabled, |ui| m3::menu_item(ui, label, false))
@@ -1158,7 +1166,7 @@ impl VoiceApp {
         match action {
             Some(SlotAction::Earlier) => self.move_slot(index, index - 1),
             Some(SlotAction::Later) => self.move_slot(index, index + 1),
-            Some(SlotAction::Remove) => self.remove_slot(index),
+            Some(SlotAction::Remove) => self.ask_to_remove(index),
             None => {}
         }
     }
@@ -1170,7 +1178,89 @@ impl VoiceApp {
         self.saved.selected = index_after_move(selected, from, to);
         self.tuned_slot = index_after_move(self.tuned_slot, from, to);
     }
-    /// Removes slot `index` from the gallery; its files stay on disk.
+    /// An empty slot goes at once; a voice asks first, as its files may be deleted.
+    fn ask_to_remove(&mut self, index: usize) {
+        if self.saved.slots[index].manifest.trim().is_empty() {
+            self.remove_slot(index);
+        } else {
+            self.removing = Some(index);
+        }
+    }
+    /// Asks before removing a voice: its folder in the models folder is deleted from
+    /// disk (it would come back on the next start otherwise); files anywhere else stay.
+    fn removal_dialog(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.removing.filter(|&i| i < self.saved.slots.len()) else {
+            self.removing = None;
+            return;
+        };
+        let slot = &self.saved.slots[index];
+        let manifest = PathBuf::from(slot.manifest.trim());
+        let folder = crate::runtime::voice_folder(&manifest, &crate::runtime::model_directories());
+        let detail = match &folder {
+            Some(folder) => tf(
+                "{} and its folder are deleted from disk: {}. This cannot be undone.",
+                &[&slot.name, &plain_path(folder)],
+            ),
+            None => tf(
+                "{} is removed from the gallery. Its files are outside the models folder and stay where they are: {}",
+                &[&slot.name, &manifest.display()],
+            ),
+        };
+        let (mut confirm, mut cancel) = (false, false);
+        let (_, dismissed) = m3::dialog(ctx, "removal-dialog", t("Remove this voice?"), |ui| {
+            ui.add(egui::Label::new(RichText::new(&detail).color(m3::ON_SURFACE_VARIANT)).wrap());
+            m3::actions(ui, |ui| {
+                let label = if folder.is_some() {
+                    t("Delete")
+                } else {
+                    t("Remove")
+                };
+                confirm = ui
+                    .add_enabled(
+                        !self.running(),
+                        m3::Button::danger(label).icon(icons::DELETE),
+                    )
+                    .clicked();
+                cancel = ui.add(m3::Button::text(t("Cancel"))).clicked();
+            });
+        });
+        if confirm {
+            self.removing = None;
+            self.edit_model = false;
+            let name = self.saved.slots[index].name.clone();
+            match crate::runtime::delete_voice(&manifest) {
+                Ok(deleted) => {
+                    let gone = self.saved.slots[index].manifest.trim().to_owned();
+                    self.portraits.remove(&gone);
+                    if deleted.is_some() {
+                        // Other slots holding the same voice would point at nothing.
+                        for (other, slot) in self.saved.slots.iter_mut().enumerate() {
+                            if other != index && slot.manifest.trim() == gone {
+                                *slot = empty_slot(other);
+                            }
+                        }
+                    }
+                    if self.saved.slots.len() < 2 {
+                        // The only slot stays, emptied, so the gallery is never bare.
+                        self.saved.slots[index] = empty_slot(index);
+                        self.tuned_slot = usize::MAX;
+                    } else {
+                        self.remove_slot(index);
+                    }
+                    self.message = Some(match deleted {
+                        Some(_) => tf("Deleted {}.", &[&name]),
+                        None => tf("Removed {} from the gallery.", &[&name]),
+                    });
+                }
+                Err(error) => {
+                    self.error = Some(tf("Could not delete {}: {}", &[&name, &error]));
+                }
+            }
+        } else if cancel || dismissed {
+            self.removing = None;
+        }
+    }
+    /// Removes slot `index` from the gallery; see `removal_dialog` for its files.
     fn remove_slot(&mut self, index: usize) {
         if self.saved.slots.len() < 2 {
             return;
@@ -1293,10 +1383,10 @@ impl VoiceApp {
             choice(
                 ui,
                 t("F0 detector"),
-                t("How your pitch is measured. RMVPE is the best all-rounder and the most natural for speech and singing. FCPE is about as accurate and lighter. CREPE full and Harvest are accurate but heavy; CREPE tiny, DIO and YIN are light but can crack on high notes."),
+                t("How your pitch is measured. RMVPE is recommended: the best all-rounder and the most natural for speech and singing. FCPE is about as accurate and lighter. CREPE full and Harvest are accurate but heavy; CREPE tiny, DIO and YIN are light but can crack on high notes."),
                 &mut s.f0_detector,
                 &[
-                    (F0Detector::Rmvpe, "RMVPE"),
+                    (F0Detector::Rmvpe, t("RMVPE (recommended)")),
                     (F0Detector::CrepeFull, "CREPE full"),
                     (F0Detector::CrepeTiny, "CREPE tiny"),
                     (F0Detector::Fcpe, "FCPE"),
@@ -1921,7 +2011,11 @@ impl VoiceApp {
     }
     fn model_dialog(&mut self, ctx: &egui::Context) {
         let running = self.running();
-        let removable = self.saved.slots.len() > 1;
+        let removable = self.saved.slots.len() > 1
+            || !self.saved.slots[self.saved.selected]
+                .manifest
+                .trim()
+                .is_empty();
         let (mut remove, mut done) = (false, false);
         #[allow(unused_mut)]
         let mut picture: Option<PathBuf> = None;
@@ -2008,13 +2102,22 @@ impl VoiceApp {
                     t("The manifest connects RVC, ContentVec and RMVPE. See examples/model.json."),
                 ));
             });
+            let remove_label = if self.saved.slots[self.saved.selected]
+                .manifest
+                .trim()
+                .is_empty()
+            {
+                t("Remove slot")
+            } else {
+                t("Remove voice")
+            };
             m3::actions(ui, |ui| {
                 done = ui.add(m3::Button::text(t("Done"))).clicked();
                 if removable
                     && ui
                         .add_enabled(
                             !running,
-                            m3::Button::danger(t("Remove slot")).icon(icons::DELETE),
+                            m3::Button::danger(remove_label).icon(icons::DELETE),
                         )
                         .clicked()
                 {
@@ -2041,7 +2144,7 @@ impl VoiceApp {
             }
         }
         if remove {
-            self.remove_slot(self.saved.selected);
+            self.ask_to_remove(self.saved.selected);
         }
         self.edit_model = !(remove || done || dismissed);
     }
@@ -2391,6 +2494,9 @@ impl eframe::App for VoiceApp {
         if self.edit_model {
             self.model_dialog(ctx);
         }
+        if self.removing.is_some() {
+            self.removal_dialog(ctx);
+        }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if self.import_dialog {
             self.import_dialog(ctx);
@@ -2541,6 +2647,22 @@ fn choice<T: Copy + PartialEq>(
         }
     });
     ui.label(m3::supporting(hint));
+}
+/// `path` as people write it: Windows' long-path prefix (`\?\`) left off.
+fn plain_path(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    text.strip_prefix(r"\\?\")
+        .map(str::to_owned)
+        .unwrap_or(text)
+}
+/// An empty slot named for `index`, as new slots are.
+fn empty_slot(index: usize) -> ModelSlot {
+    ModelSlot {
+        name: format!("Voice {:02}", index + 1),
+        manifest: String::new(),
+        favorite: false,
+        tune: None,
+    }
 }
 /// Where the slot at `position` ends up when the slot at `from` moves to `to`.
 fn index_after_move(position: usize, from: usize, to: usize) -> usize {
