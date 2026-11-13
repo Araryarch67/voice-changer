@@ -1,6 +1,6 @@
 #![cfg(any(feature = "onnx", feature = "onnx-static"))]
 use std::path::Path;
-use voice_changer_native::{
+use voice_changer::{
     config::Settings,
     engine::{load_converter, Engine},
 };

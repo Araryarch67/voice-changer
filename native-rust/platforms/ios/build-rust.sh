@@ -22,4 +22,4 @@ fi
 cargo build --manifest-path "$project_dir/Cargo.toml" --lib --release \
     --target "$rust_target" --no-default-features --features "$rust_features"
 mkdir -p "$project_dir/target/ios"
-cp "$project_dir/target/$rust_target/release/libvoice_changer_native.a" "$project_dir/target/ios/"
+cp "$project_dir/target/$rust_target/release/libvoice_changer.a" "$project_dir/target/ios/"

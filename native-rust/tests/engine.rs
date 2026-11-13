@@ -1,4 +1,4 @@
-use voice_changer_native::{
+use voice_changer::{
     config::Settings,
     engine::{Converter, Engine},
 };

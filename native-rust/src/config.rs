@@ -96,9 +96,12 @@ impl Default for Settings {
         }
     }
 }
+/// The longest chunk: the reference client's CHUNK 1024 (131072 samples at 48 kHz).
+/// Its longer choices, 5 seconds and up, are of no use live.
+pub const MAX_BLOCK_MS: u32 = 2731;
 impl Settings {
     pub fn validate(&self) -> Result<()> {
-        if !(20..=1000).contains(&self.block_ms)
+        if !(20..=MAX_BLOCK_MS).contains(&self.block_ms)
             || self.context_ms > 5000
             || self.overlap_ms == 0
             || self.overlap_ms > self.block_ms

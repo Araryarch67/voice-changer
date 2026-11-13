@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use voice_changer_native::retrieval::{FeatureBank, IvfFlat};
+use voice_changer::retrieval::{FeatureBank, IvfFlat};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -1,19 +1,34 @@
-//! First-start dialog that downloads the shared ContentVec and RMVPE models.
+//! Voice engine dialog: picks and downloads the shared models (ContentVec and RMVPE,
+//! required; CREPE tiny and full, optional) with M3 checkboxes, a recommendation for
+//! each, and a progress bar. Opens on first start while the required ones are missing.
 use super::{icons, m3, VoiceApp};
+use crate::i18n::{t, tf};
 use crate::{catalog::Progress, setup};
 use eframe::egui::{self, FontId, Rect, Sense, Vec2};
 use std::sync::{atomic::Ordering, mpsc, Arc};
 
-#[derive(Default)]
 pub(super) struct Setup {
     pub open: bool,
     progress: Option<Arc<Progress>>,
     done: Option<mpsc::Receiver<Result<(), String>>>,
     problem: Option<String>,
+    /// Which of `setup::SHARED` to download.
+    chosen: [bool; setup::SHARED.len()],
+}
+impl Default for Setup {
+    fn default() -> Self {
+        Self {
+            open: false,
+            progress: None,
+            done: None,
+            problem: None,
+            chosen: setup::SHARED.map(|model| model.required || model.recommended),
+        }
+    }
 }
 
 impl Setup {
-    /// Opens on start when the shared models are missing.
+    /// Opens on start when the required models are missing.
     pub fn on_start() -> Self {
         Self {
             open: crate::runtime::models_root().is_none(),
@@ -36,6 +51,24 @@ fn megabytes(bytes: u64) -> String {
     format!("{:.0} MB", bytes as f64 / 1_048_576.0)
 }
 
+/// The folder the models are in once installed.
+fn shared_folder() -> std::path::PathBuf {
+    crate::runtime::models_root()
+        .unwrap_or_else(setup::target_root)
+        .join("shared")
+}
+
+/// Whether the CREPE model for `detector` is installed (other detectors need none).
+pub(super) fn detector_ready(detector: crate::config::F0Detector) -> bool {
+    use crate::config::F0Detector;
+    let file = match detector {
+        F0Detector::CrepeFull => "crepe_full.onnx",
+        F0Detector::CrepeTiny => "crepe_tiny.onnx",
+        _ => return true,
+    };
+    shared_folder().join(file).is_file()
+}
+
 impl VoiceApp {
     /// Opens the setup dialog instead of failing when the shared models are missing.
     /// Returns true when they are there.
@@ -47,16 +80,39 @@ impl VoiceApp {
         false
     }
 
+    /// Opens the dialog with the CREPE model for `detector` ticked.
+    pub(super) fn offer_detector(&mut self, detector: crate::config::F0Detector) {
+        use crate::config::F0Detector;
+        let file = match detector {
+            F0Detector::CrepeFull => "crepe_full.onnx",
+            F0Detector::CrepeTiny => "crepe_tiny.onnx",
+            _ => return,
+        };
+        for (model, chosen) in setup::SHARED.iter().zip(&mut self.setup.chosen) {
+            if model.file == file {
+                *chosen = true;
+            }
+        }
+        self.setup.open = true;
+    }
+
     fn start_setup(&mut self, ctx: &egui::Context) {
+        let chosen: Vec<&'static str> = setup::SHARED
+            .iter()
+            .zip(self.setup.chosen)
+            .filter(|(model, chosen)| model.required || *chosen)
+            .map(|(model, _)| model.file)
+            .collect();
         let progress = Arc::new(Progress::default());
         let shared = progress.clone();
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
-        let root = setup::target_root();
+        let root = crate::runtime::models_root().unwrap_or_else(setup::target_root);
         let started = std::thread::Builder::new()
             .name("shared-models".into())
             .spawn(move || {
-                let result = setup::download(&root, &shared).map_err(|error| format!("{error:#}"));
+                let result =
+                    setup::download(&root, &chosen, &shared).map_err(|error| format!("{error:#}"));
                 let _ = tx.send(result);
                 ctx.request_repaint();
             });
@@ -84,21 +140,27 @@ impl VoiceApp {
         match result {
             Ok(()) if crate::runtime::models_root().is_some() => {
                 self.setup.open = false;
-                self.message =
-                    Some("Setup finished. Import a voice or press Find online to add one.".into());
+                self.toast(
+                    t("Setup finished. Import a voice or press Find online to add one.").into(),
+                    false,
+                );
             }
             Ok(()) => {
-                self.setup.problem = Some(format!(
+                self.setup.problem = Some(tf(
                     "The models were saved to {}, but the app does not look there. Start it from its install folder.",
-                    setup::target_root().display()
+                    &[&setup::target_root().display()],
                 ));
             }
             Err(problem) => {
-                if !self.setup.open {
-                    self.error = Some(format!(
-                        "The voice engine download stopped: {problem}. Try again in Settings under Processing."
-                    ));
-                }
+                // Models that failed their check are not kept; say which, wherever
+                // the user is looking.
+                self.toast(
+                    tf(
+                        "Download failed, nothing was installed for: {}",
+                        &[&problem],
+                    ),
+                    true,
+                );
                 self.setup.problem = Some(problem);
             }
         }
@@ -106,31 +168,40 @@ impl VoiceApp {
 
     pub(super) fn setup_dialog(&mut self, ctx: &egui::Context) {
         let downloading = self.setup.downloading();
+        let folder = shared_folder();
         let (mut start, mut later, mut cancel, mut hide) = (false, false, false, false);
-        let (_, dismissed) = m3::dialog(ctx, "setup-dialog", "Set up the voice engine", |ui| {
+        let (_, dismissed) = m3::dialog(ctx, "setup-dialog", t("Set up the voice engine"), |ui| {
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new(
+                    egui::RichText::new(t(
                         "Every voice uses two shared models to understand your speech. Download them once and all voices you add will work.",
-                    )
+                    ))
                     .color(m3::ON_SURFACE_VARIANT),
                 )
                 .wrap(),
             );
             ui.add_space(8.0);
-            let folder = setup::target_root().join("shared");
-            for (model, glyph) in setup::SHARED.iter().zip([icons::VOICE, icons::GRAPHIC_EQ]) {
-                let ready = folder.join(model.file).is_file();
-                model_row(ui, glyph, model, ready);
+            let glyphs = [icons::VOICE, icons::GRAPHIC_EQ, icons::SPEED, icons::MEMORY];
+            let mut size = 0;
+            for ((model, glyph), chosen) in
+                setup::SHARED.iter().zip(glyphs).zip(&mut self.setup.chosen)
+            {
+                let ready = setup::installed(&folder, model);
+                if model.required {
+                    *chosen = true;
+                }
+                model_row(ui, glyph, model, ready, chosen, downloading);
+                if *chosen && !ready {
+                    size += model.bytes;
+                }
             }
             ui.add_space(8.0);
             if let Some((received, total, fraction)) = self.setup.amounts() {
                 linear_progress(ui, fraction);
                 ui.horizontal(|ui| {
-                    ui.label(m3::supporting(&format!(
+                    ui.label(m3::supporting(&tf(
                         "Downloading… {} of {}",
-                        megabytes(received),
-                        megabytes(total)
+                        &[&megabytes(received), &megabytes(total)],
                     )));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(m3::supporting(&format!("{:.0}%", fraction * 100.0)));
@@ -153,30 +224,40 @@ impl VoiceApp {
                             );
                         });
                     });
-            } else {
-                ui.label(m3::supporting(&format!(
+            } else if size > 0 {
+                ui.label(m3::supporting(&tf(
                     "{} in total, from Hugging Face. Saved in {}.",
-                    megabytes(setup::total_bytes()),
-                    folder.display()
+                    &[&megabytes(size), &folder.display()],
                 )));
+            } else {
+                ui.label(m3::supporting(t("Everything you picked is installed.")));
             }
+            ui.label(m3::supporting(t(
+                "Each file is checked against its published size and SHA-256 before it is installed.",
+            )));
             m3::actions(ui, |ui| {
                 if downloading {
                     hide = ui
-                        .add(m3::Button::tonal("Hide"))
-                        .on_hover_text("Keep downloading while you use the app")
+                        .add(m3::Button::tonal(t("Hide")))
+                        .on_hover_text(t("Keep downloading while you use the app"))
                         .clicked();
-                    cancel = ui.add(m3::Button::text("Cancel")).clicked();
+                    cancel = ui.add(m3::Button::text(t("Cancel"))).clicked();
                 } else {
                     let label = if self.setup.problem.is_some() {
-                        "Try again"
+                        t("Try again")
                     } else {
-                        "Download"
+                        t("Download")
                     };
-                    start = ui.add(m3::Button::filled(label)).clicked();
+                    start = ui
+                        .add_enabled(size > 0, m3::Button::filled(label))
+                        .clicked();
                     later = ui
-                        .add(m3::Button::text("Later"))
-                        .on_hover_text("You can finish this from Settings before adding a voice")
+                        .add(m3::Button::text(if size > 0 {
+                            t("Later")
+                        } else {
+                            t("Close")
+                        }))
+                        .on_hover_text(t("You can finish this from Settings before adding a voice"))
                         .clicked();
                 }
             });
@@ -216,14 +297,16 @@ impl VoiceApp {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(m3::icon(icons::GRAPHIC_EQ, 20.0, m3::PRIMARY));
-                    ui.label(format!(
-                        "Downloading the voice engine… {} of {} ({:.0}%)",
-                        megabytes(received),
-                        megabytes(total),
-                        fraction * 100.0
+                    ui.label(tf(
+                        "Downloading the voice engine… {} of {} ({}%)",
+                        &[
+                            &megabytes(received),
+                            &megabytes(total),
+                            &format!("{:.0}", fraction * 100.0),
+                        ],
                     ));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        show = ui.add(m3::Button::text("Show")).clicked();
+                        show = ui.add(m3::Button::text(t("Show"))).clicked();
                     });
                 });
                 linear_progress(ui, fraction);
@@ -237,82 +320,108 @@ impl VoiceApp {
     /// Settings card entry for the shared models.
     pub(super) fn setup_status(&mut self, ui: &mut egui::Ui) {
         let ready = crate::runtime::models_root().is_some();
-        m3::field_label(ui, "Voice engine");
+        m3::field_label(ui, t("Voice engine"));
         ui.horizontal(|ui| {
-            if ready {
-                ui.label(m3::icon(icons::CHECK_CIRCLE, 20.0, m3::SUCCESS));
-                ui.label("ContentVec and RMVPE are installed");
-            } else if let Some((_, _, fraction)) = self.setup.amounts() {
+            if let Some((_, _, fraction)) = self.setup.amounts() {
                 ui.add(egui::Spinner::new().color(m3::PRIMARY));
-                ui.label(format!("Downloading… {:.0}%", fraction * 100.0));
-                if ui.add(m3::Button::text("Show")).clicked() {
+                ui.label(tf(
+                    "Downloading… {}%",
+                    &[&format!("{:.0}", fraction * 100.0)],
+                ));
+                if ui.add(m3::Button::text(t("Show"))).clicked() {
+                    self.setup.open = true;
+                }
+            } else if ready {
+                ui.label(m3::icon(icons::CHECK_CIRCLE, 20.0, m3::SUCCESS));
+                ui.label(t("ContentVec and RMVPE are installed"));
+                if ui.add(m3::Button::text(t("Manage models"))).clicked() {
                     self.setup.open = true;
                 }
             } else {
                 ui.label(m3::icon(icons::ERROR, 20.0, m3::ERROR));
-                ui.label("Not installed");
-                if ui.add(m3::Button::tonal("Download")).clicked() {
+                ui.label(t("Not installed"));
+                if ui.add(m3::Button::tonal(t("Download"))).clicked() {
                     self.setup.open = true;
                 }
             }
         });
-        ui.label(m3::supporting(
-            "The two shared models every voice needs: one hears your words, the other follows your pitch.",
-        ));
+        ui.label(m3::supporting(t(
+            "The two shared models every voice needs: one hears your words, the other follows your pitch. Manage models also adds the optional CREPE pitch detectors.",
+        )));
     }
 }
 
-/// Two-line row: an icon tile, the model's name and size, what it does, and a check
-/// once it is there.
-fn model_row(ui: &mut egui::Ui, glyph: char, model: &setup::SharedModel, ready: bool) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 64.0), Sense::hover());
-    let tile = Rect::from_min_size(
-        egui::pos2(rect.left(), rect.center().y - 20.0),
-        Vec2::splat(40.0),
-    );
-    ui.painter()
-        .rect_filled(tile, 12.0, m3::SECONDARY_CONTAINER);
-    m3::paint_icon(
-        ui,
-        tile.center(),
-        glyph,
-        24.0,
-        false,
-        m3::ON_SECONDARY_CONTAINER,
-    );
-    let x = tile.right() + 16.0;
-    let width = rect.right() - x - 36.0;
-    let name = m3::elided(
-        ui,
-        &format!("{} · {}", model.title, megabytes(model.bytes)),
-        FontId::new(16.0, m3::medium()),
-        m3::ON_SURFACE,
-        width,
-    );
-    let purpose = m3::elided(
-        ui,
-        model.purpose,
-        FontId::proportional(12.0),
-        m3::ON_SURFACE_VARIANT,
-        width,
-    );
-    ui.painter()
-        .galley(egui::pos2(x, rect.top() + 12.0), name, m3::ON_SURFACE);
-    ui.painter().galley(
-        egui::pos2(x, rect.top() + 34.0),
-        purpose,
-        m3::ON_SURFACE_VARIANT,
-    );
-    if ready {
+/// A model with its checkbox, icon, name and size, what it does, and its badges
+/// (required, recommended, installed).
+fn model_row(
+    ui: &mut egui::Ui,
+    glyph: char,
+    model: &setup::SharedModel,
+    ready: bool,
+    chosen: &mut bool,
+    downloading: bool,
+) {
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(!model.required && !ready && !downloading, |ui| {
+            let mut ticked = *chosen || ready;
+            if m3::checkbox(ui, &mut ticked, model.title).changed() {
+                *chosen = ticked;
+            }
+        });
+        let (tile, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
+        ui.painter()
+            .rect_filled(tile, 12.0, m3::SECONDARY_CONTAINER);
         m3::paint_icon(
             ui,
-            egui::pos2(rect.right() - 12.0, rect.center().y),
-            icons::CHECK_CIRCLE,
+            tile.center(),
+            glyph,
             24.0,
-            true,
-            m3::SUCCESS,
+            false,
+            m3::ON_SECONDARY_CONTAINER,
         );
-    }
+        ui.add_space(4.0);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} · {}", model.title, megabytes(model.bytes)))
+                        .font(FontId::new(15.0, m3::medium()))
+                        .color(m3::ON_SURFACE),
+                );
+                if ready {
+                    m3::badge(
+                        ui,
+                        t("Installed"),
+                        m3::SUCCESS.gamma_multiply(0.2),
+                        m3::SUCCESS,
+                    );
+                } else if model.required {
+                    m3::badge(
+                        ui,
+                        t("Required"),
+                        m3::PRIMARY_CONTAINER,
+                        m3::ON_PRIMARY_CONTAINER,
+                    );
+                } else if model.recommended {
+                    m3::badge(
+                        ui,
+                        t("Recommended"),
+                        m3::SECONDARY_CONTAINER,
+                        m3::ON_SECONDARY_CONTAINER,
+                    );
+                } else {
+                    m3::badge(
+                        ui,
+                        t("Optional"),
+                        m3::SURFACE_CONTAINER_HIGHEST,
+                        m3::ON_SURFACE_VARIANT,
+                    );
+                }
+            });
+            ui.add(egui::Label::new(m3::supporting(t(model.purpose))).wrap());
+        });
+    });
+    ui.add_space(2.0);
 }
 
 /// M3 linear progress indicator: active track, a gap, the inactive track and its

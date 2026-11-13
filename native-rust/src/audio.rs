@@ -556,8 +556,11 @@ fn run_devices(
     metrics.input_rate.store(input_rate, Ordering::Relaxed);
     metrics.output_rate.store(output_rate, Ordering::Relaxed);
     // Both queues are bounded; callbacks never wait on inference, locks, or allocation.
-    let input = Arc::new(ArrayQueue::new(input_rate as usize * 2));
-    let output = Arc::new(ArrayQueue::new(output_rate as usize * 2));
+    // Two seconds, or three chunks when those are longer: the input is trimmed once
+    // it holds two chunks, and the output holds a chunk and its lead.
+    let span_ms = (live.settings.block_ms as usize * 3).max(2000);
+    let input = Arc::new(ArrayQueue::new(input_rate as usize * span_ms / 1000));
+    let output = Arc::new(ArrayQueue::new(output_rate as usize * span_ms / 1000));
     let input_stream = match input_config.sample_format() {
         SampleFormat::F32 => input_stream::<f32>(
             &input_device,

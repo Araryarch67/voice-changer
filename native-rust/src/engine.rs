@@ -176,6 +176,24 @@ mod tests {
     }
 
     #[test]
+    fn the_longest_chunk_is_accepted_and_one_past_it_is_not() {
+        let mut engine = Engine::new(Some(Box::new(PassthroughConverter)));
+        let longest = Settings {
+            bypass: false,
+            block_ms: crate::config::MAX_BLOCK_MS,
+            ..Settings::default()
+        };
+        let block = vec![0.1; 48 * longest.block_ms as usize];
+        let out = engine.process(&block, 48000, &longest).unwrap();
+        assert_eq!(out.len(), block.len());
+        let too_long = Settings {
+            block_ms: longest.block_ms + 1,
+            ..longest
+        };
+        assert!(engine.process(&block, 48000, &too_long).is_err());
+    }
+
+    #[test]
     fn active_path_applies_high_pass_and_soft_limits_peaks() {
         let mut engine = Engine::new(Some(Box::new(PassthroughConverter)));
         let settings = Settings {

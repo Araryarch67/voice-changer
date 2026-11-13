@@ -2,6 +2,7 @@
 //! (download, unpack the .pth and .index, convert).
 use super::{icons, m3, VoiceApp};
 use crate::catalog::{self, Entry, Progress};
+use crate::i18n::{t, tf};
 use eframe::egui;
 use std::sync::{atomic::Ordering, mpsc, Arc};
 
@@ -28,9 +29,9 @@ impl VoiceApp {
         if ui
             .add_enabled(
                 !self.running(),
-                m3::Button::outlined("Find online").icon(icons::SEARCH),
+                m3::Button::outlined(t("Find online")).icon(icons::SEARCH),
             )
-            .on_hover_text("Search voice-models.com and add a voice in one step")
+            .on_hover_text(t("Search voice-models.com and add a voice in one step"))
             .clicked()
             && self.shared_models_ready()
         {
@@ -73,7 +74,7 @@ impl VoiceApp {
         }
         let link = entry.link.clone();
         if self.work.is_some() {
-            self.error = Some("Wait for the current task to finish, then add the voice.".into());
+            self.error = Some(t("Wait for the current task to finish, then add the voice.").into());
             return;
         }
         let name = catalog::voice_name(&entry.title);
@@ -91,14 +92,16 @@ impl VoiceApp {
             let _ = std::fs::remove_file(&file);
             let _ = std::fs::remove_dir(&folder);
             let voice = crate::config::ModelManifest::load(&imported?)?;
-            Ok(format!(
+            Ok(tf(
                 "Added {}{}.",
-                voice.name,
-                if voice.feature_bank.is_some() {
-                    " with its index"
-                } else {
-                    " (it came without an index)"
-                }
+                &[
+                    &voice.name,
+                    &if voice.feature_bank.is_some() {
+                        t(" with its index")
+                    } else {
+                        t(" (it came without an index)")
+                    },
+                ],
             ))
         });
         if self.work.is_some() {
@@ -134,20 +137,20 @@ impl VoiceApp {
         let (mut search, mut more, mut close) = (false, false, false);
         let mut add: Option<Entry> = None;
         let mut open_page: Option<String> = None;
-        let (_, dismissed) = m3::dialog(ctx, "browse-dialog", "Find voices online", |ui| {
+        let (_, dismissed) = m3::dialog(ctx, "browse-dialog", t("Find voices online"), |ui| {
             let browse = &mut self.browse;
             ui.horizontal(|ui| {
                 let width = ui.available_width() - 110.0;
                 let field = ui.add(m3::text_edit(
                     &mut browse.query,
-                    "Character, singer, game…",
+                    t("Character, singer, game…"),
                     width,
                 ));
                 let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let clicked = ui
                     .add_enabled(
                         browse.pending.is_none(),
-                        m3::Button::filled("Search").icon(icons::SEARCH),
+                        m3::Button::filled(t("Search")).icon(icons::SEARCH),
                     )
                     .clicked();
                 search = (entered || clicked) && browse.pending.is_none();
@@ -157,18 +160,17 @@ impl VoiceApp {
             } else if browse.pending.is_some() && browse.results.is_empty() {
                 ui.horizontal(|ui| {
                     ui.add(egui::Spinner::new().color(m3::PRIMARY));
-                    ui.label(m3::supporting("Searching voice-models.com…"));
+                    ui.label(m3::supporting(t("Searching voice-models.com…")));
                 });
             } else if browse.results.is_empty() {
-                ui.label(m3::supporting("No voices found. Try another name."));
+                ui.label(m3::supporting(t("No voices found. Try another name.")));
             } else {
                 ui.label(m3::supporting(&if browse.searched.is_empty() {
-                    format!("{} newest voices", browse.results.len())
+                    tf("{} newest voices", &[&browse.results.len()])
                 } else {
-                    format!(
+                    tf(
                         "{} voices for \"{}\"",
-                        browse.results.len(),
-                        browse.searched
+                        &[&browse.results.len(), &browse.searched],
                     )
                 }));
             }
@@ -186,7 +188,7 @@ impl VoiceApp {
                         );
                         let mut details: Vec<String> = Vec::new();
                         details.extend(entry.size.clone());
-                        details.extend(entry.uploader.as_ref().map(|by| format!("by {by}")));
+                        details.extend(entry.uploader.as_ref().map(|by| tf("by {}", &[by])));
                         details.extend(entry.unsupported().map(str::to_owned));
                         ui.horizontal(|ui| {
                             ui.label(m3::supporting(&details.join(" · ")));
@@ -194,7 +196,7 @@ impl VoiceApp {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if ui
-                                        .add(m3::Button::text("Page"))
+                                        .add(m3::Button::text(t("Page")))
                                         .on_hover_text(&entry.page)
                                         .clicked()
                                     {
@@ -204,7 +206,7 @@ impl VoiceApp {
                                         && ui
                                             .add_enabled(
                                                 !busy,
-                                                m3::Button::tonal("Add voice").icon(icons::ADD),
+                                                m3::Button::tonal(t("Add voice")).icon(icons::ADD),
                                             )
                                             .clicked()
                                     {
@@ -217,7 +219,10 @@ impl VoiceApp {
                     }
                     if browse.more {
                         more = ui
-                            .add_enabled(browse.pending.is_none(), m3::Button::text("More results"))
+                            .add_enabled(
+                                browse.pending.is_none(),
+                                m3::Button::text(t("More results")),
+                            )
                             .clicked();
                     }
                 });
@@ -229,30 +234,40 @@ impl VoiceApp {
                 );
                 let mb = |bytes: u64| bytes as f32 / 1_048_576.0;
                 let (fraction, text) = if total > 0 && received >= total {
-                    (1.0, format!("Converting {name}…"))
+                    (1.0, tf("Converting {}…", &[name]))
                 } else if total > 0 {
                     (
                         received as f32 / total as f32,
-                        format!(
-                            "Downloading {name}: {:.0} of {:.0} MB",
-                            mb(received),
-                            mb(total)
+                        tf(
+                            "Downloading {}: {} of {} MB",
+                            &[
+                                name,
+                                &format!("{:.0}", mb(received)),
+                                &format!("{:.0}", mb(total)),
+                            ],
                         ),
                     )
                 } else {
-                    (0.0, format!("Downloading {name}: {:.0} MB", mb(received)))
+                    (
+                        0.0,
+                        tf(
+                            "Downloading {}: {} MB",
+                            &[name, &format!("{:.0}", mb(received))],
+                        ),
+                    )
                 };
                 ui.add(egui::ProgressBar::new(fraction).text(text));
-                if received < total.max(1) && ui.add(m3::Button::text("Cancel download")).clicked()
+                if received < total.max(1)
+                    && ui.add(m3::Button::text(t("Cancel download"))).clicked()
                 {
                     progress.cancel.store(true, Ordering::Relaxed);
                 }
             }
             ui.label(m3::supporting(
-                "Voices come from voice-models.com and are hosted by their uploaders. Many imitate real people; use them only where you have the right to. Hugging Face, Google Drive and MediaFire links download here; Mega links open in the browser.",
+                t("Voices come from voice-models.com and are hosted by their uploaders. Many imitate real people; use them only where you have the right to. Hugging Face, Google Drive and MediaFire links download here; Mega links open in the browser."),
             ));
             m3::actions(ui, |ui| {
-                close = ui.add(m3::Button::text("Close")).clicked();
+                close = ui.add(m3::Button::text(t("Close"))).clicked();
             });
         });
         if search {

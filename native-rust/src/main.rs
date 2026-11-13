@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
-use voice_changer_native::{
+use voice_changer::{
     analyze,
     config::{Device, F0Detector, Noise, Settings},
     engine::{self, Engine},
@@ -167,12 +167,7 @@ fn run_convert(args: &[String]) -> Result<()> {
         i += 1;
     }
     let converter = engine::load_converter_on(model, settings.device)?;
-    voice_changer_native::wav::convert(
-        &mut Engine::new(Some(converter)),
-        input,
-        output,
-        &settings,
-    )?;
+    voice_changer::wav::convert(&mut Engine::new(Some(converter)), input, output, &settings)?;
     if do_analyze {
         let prefix = default_report_prefix(output);
         let model_label = model.display().to_string();
@@ -197,7 +192,7 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(
         // Graphics libraries only report real failures; their warnings are noise here.
         env_logger::Env::default().default_filter_or(
-            "warn,voice_changer_native=info,wgpu_hal=error,wgpu_core=error,naga=error,epaint=error,egui_winit=error,eframe=error",
+            "warn,voice_changer=info,wgpu_hal=error,wgpu_core=error,naga=error,epaint=error,egui_winit=error,eframe=error",
         ),
     )
     .format_timestamp_millis()
@@ -220,7 +215,7 @@ fn main() -> Result<()> {
                 Some(other) => bail!("Unknown device {other}; use cpu, cuda or directml"),
             };
             let settings = Settings { block_ms, device, ..Settings::default() };
-            println!("{}", serde_json::to_string_pretty(&voice_changer_native::benchmark::run(Path::new(&args[1]), &settings, blocks)?)?);
+            println!("{}", serde_json::to_string_pretty(&voice_changer::benchmark::run(Path::new(&args[1]), &settings, blocks)?)?);
         }
         Some("--analyze") => run_analyze(&args[1..])?,
         Some("--help" | "-h") => println!(
@@ -228,23 +223,23 @@ fn main() -> Result<()> {
         ),
         Some("--export-rvc") if args.len() == 3 || (args.len() == 4 && args[3] == "--realtime") => {
             #[cfg(feature = "export")]
-            println!("{}", serde_json::to_string(&voice_changer_native::export::export_rvc(Path::new(&args[1]), Path::new(&args[2]), args.len() == 4)?)?);
+            println!("{}", serde_json::to_string(&voice_changer::export::export_rvc(Path::new(&args[1]), Path::new(&args[2]), args.len() == 4)?)?);
             #[cfg(not(feature = "export"))]
             bail!("Build with the export feature");
         }
         Some("--devices") => {
             #[cfg(feature = "audio")]
-            for device in voice_changer_native::audio::devices()? { println!("{}\t{}\t{}", if device.input { "input" } else { "output" }, device.id, device.name); }
+            for device in voice_changer::audio::devices()? { println!("{}\t{}\t{}", if device.input { "input" } else { "output" }, device.id, device.name); }
             #[cfg(not(feature = "audio"))]
             bail!("Build with the audio feature");
         }
         Some("--bypass") if args.len() == 3 => {
-            voice_changer_native::wav::convert(&mut Engine::new(None), Path::new(&args[1]), Path::new(&args[2]), &Settings::default())?;
+            voice_changer::wav::convert(&mut Engine::new(None), Path::new(&args[1]), Path::new(&args[2]), &Settings::default())?;
         }
         Some("--convert") => run_convert(&args[1..])?,
         None => {
             #[cfg(feature = "gui")]
-            voice_changer_native::run(eframe::NativeOptions {
+            voice_changer::run(eframe::NativeOptions {
                 // The app id matches voice-changer.desktop, so Wayland taskbars and docks
                 // show that entry's icon; the window icon covers X11 and Windows.
                 viewport: eframe::egui::ViewportBuilder::default()

@@ -1,6 +1,6 @@
 #![cfg(feature = "export")]
 use std::path::{Path, PathBuf};
-use voice_changer_native::pth::{self, Value};
+use voice_changer::pth::{self, Value};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -40,7 +40,7 @@ fn checkpoint_reader_matches_torch_for_dtypes_strides_and_plain_data() {
 #[test]
 fn non_rvc_or_non_zip_checkpoints_are_rejected() {
     let out = std::env::temp_dir().join("vc-export-reject.onnx");
-    let error = voice_changer_native::export::export_rvc(&fixture("tiny.pth"), &out, false)
+    let error = voice_changer::export::export_rvc(&fixture("tiny.pth"), &out, false)
         .unwrap_err()
         .to_string();
     assert!(error.contains("speaker embedding"), "{error}");
@@ -52,7 +52,7 @@ fn non_rvc_or_non_zip_checkpoints_are_rejected() {
 #[test]
 #[ignore = "requires ../voice-rvc checkpoints, models/shared ONNX and ONNX Runtime 1.22"]
 fn real_checkpoints_export_and_convert() {
-    use voice_changer_native::{
+    use voice_changer::{
         config::Settings,
         engine::{load_converter, Engine},
     };
@@ -61,7 +61,7 @@ fn real_checkpoints_export_and_convert() {
     std::fs::create_dir_all(&dir).unwrap();
     for (checkpoint, rate) in [("kobo/kobov2.pth", 48000), ("zeta/zetaTest.pth", 40000)] {
         let voice = dir.join(format!("{rate}.onnx"));
-        let exported = voice_changer_native::export::export_rvc(
+        let exported = voice_changer::export::export_rvc(
             &root.join("../voice-rvc").join(checkpoint),
             &voice,
             true,

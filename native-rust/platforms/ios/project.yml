@@ -21,7 +21,7 @@ targets:
         script: 'bash "${SRCROOT}/build-rust.sh"'
         basedOnDependencyAnalysis: false
     dependencies:
-      - library: ../../target/ios/libvoice_changer_native.a
+      - library: ../../target/ios/libvoice_changer.a
       - sdk: UIKit.framework
       - sdk: Foundation.framework
       - sdk: CoreFoundation.framework

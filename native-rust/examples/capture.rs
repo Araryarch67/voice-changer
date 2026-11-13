@@ -3,7 +3,7 @@
 fn main() -> eframe::Result {
     use eframe::egui;
     struct Capture {
-        app: voice_changer_native::app::VoiceApp,
+        app: voice_changer::app::VoiceApp,
         path: String,
         frames: usize,
         click: Option<egui::Pos2>,
@@ -72,7 +72,7 @@ fn main() -> eframe::Result {
         },
         Box::new(move |cc| {
             Ok(Box::new(Capture {
-                app: voice_changer_native::app::VoiceApp::new(cc),
+                app: voice_changer::app::VoiceApp::new(cc),
                 path,
                 frames: 0,
                 click,

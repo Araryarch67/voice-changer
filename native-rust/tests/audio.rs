@@ -3,7 +3,7 @@ use std::{
     sync::atomic::Ordering,
     time::{Duration, Instant},
 };
-use voice_changer_native::{
+use voice_changer::{
     audio::{AudioOptions, AudioSession},
     config::Settings,
 };

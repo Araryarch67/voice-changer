@@ -15,6 +15,8 @@ pub mod engine;
 pub mod export;
 #[cfg(feature = "gui")]
 pub mod gpu_info;
+#[cfg(feature = "gui")]
+pub mod i18n;
 #[cfg(feature = "export")]
 pub mod import;
 #[cfg(feature = "gui")]

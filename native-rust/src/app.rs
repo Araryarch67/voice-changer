@@ -1,6 +1,7 @@
 #[cfg(feature = "audio")]
 use crate::audio::{self, AudioDevice, AudioOptions, AudioSession};
 use crate::config::{Device, F0Detector, Noise, Settings};
+use crate::i18n::{t, tf};
 use crate::m3::{self, icons};
 use eframe::egui::{self, FontId, Margin, RichText, Vec2};
 use serde::{Deserialize, Serialize};
@@ -75,6 +76,8 @@ struct Saved {
     /// Also play the converted voice on `monitor_device`, to hear yourself.
     monitor: bool,
     monitor_device: Option<String>,
+    /// Interface language; the system's on first start.
+    language: crate::i18n::Lang,
 }
 impl Default for Saved {
     fn default() -> Self {
@@ -94,6 +97,7 @@ impl Default for Saved {
             virtual_mic: false,
             monitor: false,
             monitor_device: None,
+            language: crate::i18n::system(),
         }
     }
 }
@@ -130,6 +134,9 @@ pub struct VoiceApp {
     file_analyze: bool,
     work: Option<mpsc::Receiver<Result<String, String>>>,
     message: Option<String>,
+    /// The snackbar: its text, whether it is an error, and when it goes away by
+    /// itself (set when first shown; errors stay until closed).
+    toast: Option<(String, bool, Option<f64>)>,
     /// The error and message last written to the terminal, so each is logged once.
     logged: (Option<String>, Option<String>),
     /// Voice pictures by manifest path; `None` once a voice is known to have none.
@@ -213,6 +220,7 @@ impl VoiceApp {
             file_analyze: true,
             work: None,
             message: None,
+            toast: None,
             logged: (None, None),
             portraits: Default::default(),
             #[cfg(feature = "audio")]
@@ -226,6 +234,14 @@ impl VoiceApp {
             live_devices: None,
         };
         // Voices saved before per-voice tuning keep the tuning in use for the selected one.
+        // VOICE_CHANGER_LANG=en|id|ja picks the language at start (also for screenshots).
+        if let Some(lang) = std::env::var("VOICE_CHANGER_LANG")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
+            app.saved.language = crate::i18n::Lang::from_locale(&lang);
+        }
+        crate::i18n::set(app.saved.language);
         app.tuned_slot = app.saved.selected;
         let current = VoiceTune::from(&app.saved.settings);
         app.saved.slots[app.tuned_slot].tune.get_or_insert(current);
@@ -273,48 +289,49 @@ impl VoiceApp {
             .devices
             .iter()
             .any(|device| !device.input && windows_mic::is_cable(&device.name));
-        m3::field_label(ui, "Virtual microphone");
+        m3::field_label(ui, t("Virtual microphone"));
         if !installed {
             self.saved.virtual_mic = false;
             ui.horizontal(|ui| {
                 if ui
-                    .add(m3::Button::tonal("Get VB-Cable"))
+                    .add(m3::Button::tonal(t("Get VB-Cable")))
                     .on_hover_text(windows_mic::VB_CABLE_PAGE)
                     .clicked()
                 {
                     windows_mic::open_page(windows_mic::VB_CABLE_PAGE);
                 }
                 if ui
-                    .add(m3::Button::text("Refresh devices").icon(icons::REFRESH))
+                    .add(m3::Button::text(t("Refresh devices")).icon(icons::REFRESH))
                     .clicked()
                 {
                     self.refresh_devices();
                 }
             });
             ui.label(m3::supporting(
-                "To use the converted voice in Discord or a game, install VB-Cable (free, from VB-Audio's site): unzip it, run VBCABLE_Setup_x64 as administrator, restart Windows, then press Refresh devices. The app then sends its voice there by itself. For OBS alone nothing is needed: add an Application Audio Capture source for this app.",
+                t("To use the converted voice in Discord or a game, install VB-Cable (free, from VB-Audio's site): unzip it, run VBCABLE_Setup_x64 as administrator, restart Windows, then press Refresh devices. The app then sends its voice there by itself. For OBS alone nothing is needed: add an Application Audio Capture source for this app."),
             ));
             return;
         }
         ui.horizontal(|ui| {
-            m3::switch(ui, &mut self.saved.virtual_mic, "Virtual microphone");
+            m3::switch(ui, &mut self.saved.virtual_mic, t("Virtual microphone"));
             ui.label(if self.saved.virtual_mic {
-                format!("On: the voice goes to {}", windows_mic::SPEAKER)
+                tf("On: the voice goes to {}", &[&windows_mic::SPEAKER])
             } else {
-                "Off".into()
+                t("Off").into()
             });
         });
-        ui.label(m3::supporting(&format!(
+        ui.label(m3::supporting(&tf(
             "Pick \"{}\" as the microphone in Discord, OBS or a game. It is silent while the voice changer is stopped.",
-            windows_mic::MICROPHONE
+            &[&windows_mic::MICROPHONE],
         )));
         let buffer = windows_mic::vb_cable_buffer();
         ui.horizontal(|ui| {
             if let Some((samples, rate)) = buffer {
                 let ms = samples as f32 * 1000.0 / rate as f32;
                 ui.label(
-                    egui::RichText::new(format!(
-                        "VB-Cable buffer: {samples} samples, up to {ms:.0} ms"
+                    egui::RichText::new(tf(
+                        "VB-Cable buffer: {} samples, up to {} ms",
+                        &[&samples, &format!("{ms:.0}")],
                     ))
                     .color(if samples > 2048 {
                         m3::TERTIARY
@@ -324,10 +341,10 @@ impl VoiceApp {
                 );
             }
             if ui
-                .add(m3::Button::text("VB-Cable settings"))
-                .on_hover_text(
+                .add(m3::Button::text(t("VB-Cable settings")))
+                .on_hover_text(t(
                     "Opens VB-Cable's control panel; Windows asks for administrator permission",
-                )
+                ))
                 .clicked()
             {
                 if let Err(error) = windows_mic::open_vb_cable_settings() {
@@ -336,7 +353,7 @@ impl VoiceApp {
             }
         });
         ui.label(m3::supporting(
-            "VB-Cable holds the voice in its buffer before Discord hears it. Its default, 7168 samples, adds about 110 ms; in VB-Cable settings set Max Latency to 2048 (or 1024 if it does not crackle). Most of the remaining delay is Chunk in Studio: lower it as far as your computer keeps up.",
+            t("VB-Cable holds the voice in its buffer before Discord hears it. Its default, 7168 samples, adds about 110 ms; in VB-Cable settings set Max Latency to 2048 (or 1024 if it does not crackle). Most of the remaining delay is Chunk in Studio: lower it as far as your computer keeps up."),
         ))
         ;
     }
@@ -409,7 +426,7 @@ impl VoiceApp {
         match crate::platform::microphone_ready() {
             Ok(true) => {}
             Ok(false) => {
-                self.error = Some("Grant microphone permission, then press Start again.".into());
+                self.error = Some(t("Grant microphone permission, then press Start again.").into());
                 return;
             }
             Err(error) => {
@@ -455,9 +472,9 @@ impl VoiceApp {
     }
     fn navigation(&mut self, ui: &mut egui::Ui, compact: bool) {
         let pages = [
-            (Page::Voices, icons::GRAPHIC_EQ, "Voices"),
-            (Page::Studio, icons::TUNE, "Studio"),
-            (Page::Settings, icons::SETTINGS, "Settings"),
+            (Page::Voices, icons::GRAPHIC_EQ, t("Voices")),
+            (Page::Studio, icons::TUNE, t("Studio")),
+            (Page::Settings, icons::SETTINGS, t("Settings")),
         ];
         if compact {
             ui.columns(pages.len(), |columns| {
@@ -531,7 +548,7 @@ impl VoiceApp {
                 let _ = std::fs::remove_file(folder.join(format!("portrait.{old}")));
             }
             if let Err(error) = std::fs::copy(&picked, &target) {
-                self.error = Some(format!("Could not save the picture: {error}"));
+                self.error = Some(tf("Could not save the picture: {}", &[&error]));
                 return;
             }
         }
@@ -580,7 +597,7 @@ impl VoiceApp {
             "pth" => self.choose_checkpoint(path),
             "index" => self.import_index = path.to_string_lossy().into_owned(),
             _ => {
-                self.error = Some("Drop an RVC .pth checkpoint or its .index file.".into());
+                self.error = Some(t("Drop an RVC .pth checkpoint or its .index file.").into());
                 return;
             }
         }
@@ -590,7 +607,7 @@ impl VoiceApp {
     /// Converts the chosen checkpoint with the chosen index, or with none.
     fn import_pair(&mut self) {
         if self.work.is_some() {
-            self.error = Some("Wait for the current task to finish, then import again.".into());
+            self.error = Some(t("Wait for the current task to finish, then import again.").into());
             return;
         }
         let checkpoint = PathBuf::from(self.import_checkpoint.trim());
@@ -614,30 +631,33 @@ impl VoiceApp {
                 started.elapsed().as_secs_f32()
             );
             let voice = crate::config::ModelManifest::load(&manifest)?;
-            Ok(format!(
+            Ok(tf(
                 "Imported {}{}.",
-                voice.name,
-                if voice.feature_bank.is_some() {
-                    " with its index"
-                } else {
-                    " without an index"
-                }
+                &[
+                    &voice.name,
+                    &if voice.feature_bank.is_some() {
+                        t(" with its index")
+                    } else {
+                        t(" without an index")
+                    },
+                ],
             ))
         });
         #[cfg(not(feature = "export"))]
         {
             let _ = (checkpoint, index);
-            self.error =
-                Some("This build cannot convert checkpoints; import a model.json instead.".into());
+            self.error = Some(
+                t("This build cannot convert checkpoints; import a model.json instead.").into(),
+            );
         }
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn import_dialog(&mut self, ctx: &egui::Context) {
         let busy = self.running() || self.work.is_some();
         let (mut close, mut import) = (false, false);
-        let (_, dismissed) = m3::dialog(ctx, "import-dialog", "Import RVC voice", |ui| {
+        let (_, dismissed) = m3::dialog(ctx, "import-dialog", t("Import RVC voice"), |ui| {
             ui.add_enabled_ui(!busy, |ui| {
-                m3::field_label(ui, "Model (.pth)");
+                m3::field_label(ui, t("Model (.pth)"));
                 ui.horizontal(|ui| {
                     let width = ui.available_width() - 48.0;
                     ui.add(m3::text_edit(
@@ -649,12 +669,12 @@ impl VoiceApp {
                         ui,
                         icons::FOLDER_OPEN,
                         m3::ON_SURFACE_VARIANT,
-                        "Choose model…",
+                        t("Choose model…"),
                     )
                     .clicked()
                     {
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("RVC checkpoint", &["pth"])
+                            .add_filter(t("RVC checkpoint"), &["pth"])
                             .pick_file()
                         {
                             // Suggest the index beside it; the user can still change it.
@@ -663,9 +683,9 @@ impl VoiceApp {
                     }
                 });
                 ui.label(m3::supporting(
-                    "The trained voice. It is converted to ONNX, which takes a few seconds.",
+                    t("The trained voice. It is converted to ONNX, which takes a few seconds."),
                 ));
-                m3::field_label(ui, "Index (.index, optional)");
+                m3::field_label(ui, t("Index (.index, optional)"));
                 ui.horizontal(|ui| {
                     let width = ui.available_width() - 96.0;
                     ui.add(m3::text_edit(
@@ -677,38 +697,38 @@ impl VoiceApp {
                         ui,
                         icons::FOLDER_OPEN,
                         m3::ON_SURFACE_VARIANT,
-                        "Choose index…",
+                        t("Choose index…"),
                     )
                     .clicked()
                     {
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("RVC feature index", &["index"])
+                            .add_filter(t("RVC feature index"), &["index"])
                             .pick_file()
                         {
                             self.import_index = path.to_string_lossy().into_owned();
                         }
                     }
-                    if m3::icon_button(ui, icons::CLOSE, m3::ON_SURFACE_VARIANT, "No index")
+                    if m3::icon_button(ui, icons::CLOSE, m3::ON_SURFACE_VARIANT, t("No index"))
                         .clicked()
                     {
                         self.import_index.clear();
                     }
                 });
                 ui.label(m3::supporting(
-                    "Makes the voice sound closer to the original speaker; the Index slider sets how much. Leave it empty if you have none.",
+                    t("Makes the voice sound closer to the original speaker; the Index slider sets how much. Leave it empty if you have none."),
                 ));
             });
             if busy {
-                ui.label(m3::supporting(
+                ui.label(m3::supporting(t(
                     "Stop live audio, or wait for the current model/file task to finish.",
-                ));
+                )));
             }
             m3::actions(ui, |ui| {
                 let ready = !busy && !self.import_checkpoint.trim().is_empty();
                 import = ui
-                    .add_enabled(ready, m3::Button::filled("Import").icon(icons::ADD))
+                    .add_enabled(ready, m3::Button::filled(t("Import")).icon(icons::ADD))
                     .clicked();
-                close = ui.add(m3::Button::text("Cancel")).clicked();
+                close = ui.add(m3::Button::text(t("Cancel"))).clicked();
             });
         });
         if import {
@@ -730,7 +750,7 @@ impl VoiceApp {
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
                     .map_err(|_| {
-                        "Model worker panicked; check the runtime and model files".to_owned()
+                        t("Model worker panicked; check the runtime and model files").to_owned()
                     })
                     .and_then(|result| result.map_err(|error| format!("{error:#}")));
                 let _ = tx.send(result);
@@ -744,16 +764,16 @@ impl VoiceApp {
         let settings = self.saved.settings.clone();
         self.begin_work(move || {
             let result = crate::benchmark::run(&path, &settings, 4)?;
-            Ok(format!("Model test passed. Processing {:.1} ms per {} ms block (RTF {:.2}); first block {:.0} ms. {}",
-                result.median_ms, result.block_ms, result.realtime_factor, result.first_block_ms,
-                if result.realtime_factor <= 1.0 { "Sustained processing fits the block duration on this machine." } else { "Processing exceeds the block duration; increase block size or reduce context." }))
+            Ok(tf("Model test passed. Processing {} ms per {} ms block (RTF {}); first block {} ms. {}",
+                &[&format!("{:.1}", result.median_ms), &result.block_ms, &format!("{:.2}", result.realtime_factor), &format!("{:.0}", result.first_block_ms),
+                &if result.realtime_factor <= 1.0 { t("Sustained processing fits the block duration on this machine.") } else { t("Processing exceeds the block duration; increase block size or reduce context.") }]))
         });
     }
     fn gallery(&mut self, ui: &mut egui::Ui) {
         header(
             ui,
-            "Voices",
-            "Pick a voice, then press Start; you can switch voices while it runs. Each voice keeps its own Tune, Index and other voice settings. Import an RVC .pth (and its .index), drop them on the window, or find one online.",
+            t("Voices"),
+            t("Pick a voice, then press Start; you can switch voices while it runs. Each voice keeps its own Tune, Index and other voice settings. Import an RVC .pth (and its .index), drop them on the window, or find one online."),
         );
         let total = ui.available_width();
         let side = 320.0;
@@ -788,7 +808,7 @@ impl VoiceApp {
             && self.work.is_none()
             && !self.saved.slots[self.saved.selected].manifest.is_empty();
         if ui
-            .add_enabled(ready, m3::Button::tonal("Test model").icon(icons::SPEED))
+            .add_enabled(ready, m3::Button::tonal(t("Test model")).icon(icons::SPEED))
             .clicked()
         {
             self.check_model();
@@ -798,7 +818,7 @@ impl VoiceApp {
         if ui
             .add_enabled(
                 !self.running(),
-                m3::Button::outlined("Edit").icon(icons::EDIT),
+                m3::Button::outlined(t("Edit")).icon(icons::EDIT),
             )
             .clicked()
         {
@@ -820,7 +840,7 @@ impl VoiceApp {
                         ui.label(m3::icon(icons::SEARCH, 20.0, m3::ON_SURFACE_VARIANT));
                         ui.add(
                             egui::TextEdit::singleline(&mut self.search)
-                                .hint_text("Search voices")
+                                .hint_text(t("Search voices"))
                                 .frame(false)
                                 .desired_width(190.0),
                         );
@@ -829,7 +849,7 @@ impl VoiceApp {
             if ui
                 .add_enabled(
                     !running,
-                    m3::Button::filled("Import model").icon(icons::ADD),
+                    m3::Button::filled(t("Import model")).icon(icons::ADD),
                 )
                 .clicked()
             {
@@ -845,9 +865,9 @@ impl VoiceApp {
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             for (filter, title) in [
-                (Filter::All, "All voices"),
-                (Filter::Favorites, "Favorites"),
-                (Filter::Ready, "Ready"),
+                (Filter::All, t("All voices")),
+                (Filter::Favorites, t("Favorites")),
+                (Filter::Ready, t("Ready")),
             ] {
                 if m3::filter_chip(ui, title, self.filter == filter).clicked() {
                     self.filter = filter;
@@ -885,16 +905,16 @@ impl VoiceApp {
             ui.add_space(32.0);
             ui.vertical_centered(|ui| {
                 ui.label(m3::icon(icons::SEARCH, 40.0, m3::OUTLINE));
-                ui.label(m3::title("No voices here"));
-                ui.label(m3::supporting(
+                ui.label(m3::title(t("No voices here")));
+                ui.label(m3::supporting(t(
                     "Change the filter or search, or import a model.",
-                ));
+                )));
             });
         }
         ui.add_space(16.0);
-        ui.label(m3::supporting(
+        ui.label(m3::supporting(t(
             "Empty cards are model slots; pretrained character voices are not bundled.",
-        ));
+        )));
     }
     /// The selected voice: portrait, model file and the controls used most while live.
     fn voice_detail(&mut self, ui: &mut egui::Ui) {
@@ -919,12 +939,12 @@ impl VoiceApp {
                 .ok()
                 .map(|model| model.feature_bank.is_some());
                 match index {
-                    Some(true) => "RVC · ONNX · with index".to_owned(),
-                    Some(false) => "RVC · ONNX · no index".to_owned(),
-                    None => "RVC · ONNX · files missing".to_owned(),
+                    Some(true) => t("RVC · ONNX · with index").to_owned(),
+                    Some(false) => t("RVC · ONNX · no index").to_owned(),
+                    None => t("RVC · ONNX · files missing").to_owned(),
                 }
             } else {
-                "Empty slot. Import an RVC .pth to use it.".to_owned()
+                t("Empty slot. Import an RVC .pth to use it.").to_owned()
             };
             ui.add(egui::Label::new(m3::supporting(&detail)).truncate());
             ui.add_space(8.0);
@@ -932,16 +952,19 @@ impl VoiceApp {
                 let s = &mut self.saved.settings;
                 m3::setting(
                     ui,
-                    "Tune", "Makes the voice higher or lower. +12 is one octave up, -12 one octave down. Male to female voice: about +8 to +12; female to male: about -8 to -12. A natural range sounds most real.",
-                    m3::Format::new(" semitones").decimals(1).signed(),
+                    t("Tune"), t("Makes the voice higher or lower. +12 is one octave up, -12 one octave down. Male to female voice: about +8 to +12; female to male: about -8 to -12. A natural range sounds most real."),
+                    m3::Format::new(t(" semitones"))
+                    .decimals(1)
+                    .signed()
+                    .presets(&[-12.0, -8.0, -5.0, 0.0, 5.0, 8.0, 12.0]),
                     &mut s.semitones,
                     -24.0..=24.0,
                     0.1,
                 );
                 m3::setting(
                     ui,
-                    "Index", "How much of the model's accent and tone to copy from its .index file. 50-75% usually sounds most like the character; higher can add a metallic edge. No effect on voices without an index.",
-                    m3::Format::new(" %").scale(100.0),
+                    t("Index"), t("How much of the model's accent and tone to copy from its .index file. 50-75% usually sounds most like the character; higher can add a metallic edge. No effect on voices without an index."),
+                    m3::Format::new(" %").scale(100.0).presets(&[0.0, 0.25, 0.5, 0.75, 1.0]),
                     &mut s.index_ratio,
                     0.0..=1.0,
                     0.01,
@@ -954,7 +977,7 @@ impl VoiceApp {
             } else if ui
                 .add_enabled(
                     !self.running() && self.work.is_none(),
-                    m3::Button::filled("Import model").icon(icons::ADD),
+                    m3::Button::filled(t("Import model")).icon(icons::ADD),
                 )
                 .clicked()
             {
@@ -1009,7 +1032,7 @@ impl VoiceApp {
             if configured {
                 "RVC · ONNX"
             } else {
-                "Empty slot"
+                t("Empty slot")
             },
             FontId::proportional(12.0),
             if configured {
@@ -1033,9 +1056,9 @@ impl VoiceApp {
                 .interact(heart, response.id.with("favorite"), egui::Sense::click())
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text(if favorite {
-                    "Remove from favorites"
+                    t("Remove from favorites")
                 } else {
-                    "Add to favorites"
+                    t("Add to favorites")
                 });
             if image.is_some() {
                 ui.painter().circle_filled(
@@ -1075,7 +1098,11 @@ impl VoiceApp {
         }
     }
     fn voice_controls(&mut self, ui: &mut egui::Ui) {
-        header(ui, "Voice Studio", "Shape the voice and tune latency.");
+        header(
+            ui,
+            t("Voice Studio"),
+            t("Shape the voice and tune latency."),
+        );
         ui.horizontal_wrapped(|ui| {
             m3::chip(
                 ui,
@@ -1083,8 +1110,10 @@ impl VoiceApp {
                 &self.saved.slots[self.saved.selected].name,
             );
             if ui
-                .add(m3::Button::outlined("Reset to defaults").icon(icons::REFRESH))
-                .on_hover_text("Put every option on this page back to its original value")
+                .add(m3::Button::outlined(t("Reset to defaults")).icon(icons::REFRESH))
+                .on_hover_text(t(
+                    "Put every option on this page back to its original value",
+                ))
                 .clicked()
             {
                 self.reset_settings();
@@ -1128,45 +1157,50 @@ impl VoiceApp {
         }
         self.saved.settings = fresh;
         self.message = Some(if self.running() {
-            "Options reset to defaults. Buffering is kept until audio is stopped.".into()
+            t("Options reset to defaults. Buffering is kept until audio is stopped.").into()
         } else {
-            "Options reset to defaults.".into()
+            t("Options reset to defaults.").into()
         });
     }
     fn voice_settings(&mut self, ui: &mut egui::Ui) {
+        #[cfg(feature = "catalog")]
+        let mut offer = None;
         m3::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing = Vec2::splat(8.0);
-            m3::card_title(ui, icons::VOICE, "Voice");
+            m3::card_title(ui, icons::VOICE, t("Voice"));
             let s = &mut self.saved.settings;
             m3::setting(
                 ui,
-                "Tune", "Makes the voice higher or lower. +12 is one octave up, -12 one octave down. Male to female voice: about +8 to +12; female to male: about -8 to -12. A natural range sounds most real.",
-                m3::Format::new(" semitones").decimals(1).signed(),
+                t("Tune"), t("Makes the voice higher or lower. +12 is one octave up, -12 one octave down. Male to female voice: about +8 to +12; female to male: about -8 to -12. A natural range sounds most real."),
+                m3::Format::new(t(" semitones"))
+                    .decimals(1)
+                    .signed()
+                    .presets(&[-12.0, -8.0, -5.0, 0.0, 5.0, 8.0, 12.0]),
                 &mut s.semitones,
                 -24.0..=24.0,
                 0.1,
             );
             m3::setting(
                 ui,
-                "Index", "How much of the model's accent and tone to copy from its .index file. 50-75% usually sounds most like the character; higher can add a metallic edge. No effect on voices without an index.",
-                m3::Format::new(" %").scale(100.0),
+                t("Index"), t("How much of the model's accent and tone to copy from its .index file. 50-75% usually sounds most like the character; higher can add a metallic edge. No effect on voices without an index."),
+                m3::Format::new(" %").scale(100.0).presets(&[0.0, 0.25, 0.5, 0.75, 1.0]),
                 &mut s.index_ratio,
                 0.0..=1.0,
                 0.01,
             );
             m3::setting(
                 ui,
-                "Protect", "Keeps breaths and s, t, k sounds natural when Index is on. Around 0.33 if they sound lispy or robotic; lower protects more; 0.50 turns it off.",
-                m3::Format::new("").decimals(2),
+                t("Protect"), t("Keeps breaths and s, t, k sounds natural when Index is on. Around 0.33 if they sound lispy or robotic; lower protects more; 0.50 turns it off."),
+                m3::Format::new("").decimals(2).presets(&[0.1, 0.2, 0.33, 0.5]),
                 &mut s.protect,
                 0.0..=0.5,
                 0.01,
             );
             choice(
                 ui,
-                "F0 detector",
-                "How your pitch is measured. RMVPE is the best all-rounder and the most natural for speech and singing. CREPE full and Harvest are accurate but heavy; CREPE tiny, DIO and YIN are light but can crack on high notes.",
+                t("F0 detector"),
+                t("How your pitch is measured. RMVPE is the best all-rounder and the most natural for speech and singing. CREPE full and Harvest are accurate but heavy; CREPE tiny, DIO and YIN are light but can crack on high notes."),
                 &mut s.f0_detector,
                 &[
                     (F0Detector::Rmvpe, "RMVPE"),
@@ -1177,39 +1211,54 @@ impl VoiceApp {
                     (F0Detector::Yin, "YIN"),
                 ],
             );
+            // A CREPE detector needs its own model; offer it instead of failing on Start.
+            #[cfg(feature = "catalog")]
+            if !setup::detector_ready(s.f0_detector) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(m3::icon(icons::ERROR, 20.0, m3::ERROR));
+                    ui.label(t("This detector's model is not installed yet, so Start will fail."));
+                    if ui.add(m3::Button::tonal(t("Download"))).clicked() {
+                        offer = Some(s.f0_detector);
+                    }
+                });
+            }
             ui.allocate_ui_with_layout(
                 Vec2::new(ui.available_width(), 40.0),
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
                     ui.add(egui::DragValue::new(&mut s.speaker_id).range(0..=10000));
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.label("Speaker ID");
+                        ui.label(t("Speaker ID"));
                     });
                 },
             );
             ui.label(m3::supporting(
-                "Only for models that contain several voices. Leave at 0 otherwise.",
+                t("Only for models that contain several voices. Leave at 0 otherwise."),
             ));
         });
+        #[cfg(feature = "catalog")]
+        if let Some(detector) = offer {
+            self.offer_detector(detector);
+        }
     }
     fn level_settings(&mut self, ui: &mut egui::Ui) {
         m3::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing = Vec2::splat(8.0);
-            m3::card_title(ui, icons::MIC, "Levels");
+            m3::card_title(ui, icons::MIC, t("Levels"));
             let s = &mut self.saved.settings;
             m3::setting(
                 ui,
-                "Input gain", "Microphone volume before conversion. Raise it if you sound too quiet.",
-                m3::Format::new("×").decimals(2),
+                t("Input gain"), t("Microphone volume before conversion. Raise it if you sound too quiet."),
+                m3::Format::new("×").decimals(2).presets(&[0.5, 0.75, 1.0, 1.5, 2.0]),
                 &mut s.input_gain,
                 0.0..=4.0,
                 0.01,
             );
             m3::setting(
                 ui,
-                "Output gain", "Volume of the converted voice.",
-                m3::Format::new("×").decimals(2),
+                t("Output gain"), t("Volume of the converted voice."),
+                m3::Format::new("×").decimals(2).presets(&[0.5, 0.75, 1.0, 1.5, 2.0]),
                 &mut s.output_gain,
                 0.0..=4.0,
                 0.01,
@@ -1218,8 +1267,10 @@ impl VoiceApp {
             let mut gate = (20.0 * s.silence_threshold.max(0.00001).log10()).round();
             if m3::setting(
                 ui,
-                "Noise gate (S.Thresh)", "Below this nothing is converted, so room noise stays out and the GPU rests while you are silent. -50 dB suits most microphones; lower it if quiet words are cut. The pink tick on the microphone meter shows it.",
-                m3::Format::new(" dB").off_at_min(),
+                t("Noise gate (S.Thresh)"), t("Below this nothing is converted, so room noise stays out and the GPU rests while you are silent. -50 dB suits most microphones; lower it if quiet words are cut. The pink tick on the microphone meter shows it."),
+                m3::Format::new(" dB")
+                    .off_at_min()
+                    .presets(&[-100.0, -60.0, -55.0, -50.0, -45.0, -40.0]),
                 &mut gate,
                 -100.0..=-20.0,
                 1.0,
@@ -1230,21 +1281,21 @@ impl VoiceApp {
             }
             choice(
                 ui,
-                "Noise suppression", "Removes background noise. Sup1 cleans the microphone. Sup2 also fades out everything that is not speech and cleans the output; it adds a little delay.",
+                t("Noise suppression"), t("Removes background noise. Sup1 cleans the microphone. Sup2 also fades out everything that is not speech and cleans the output; it adds a little delay."),
                 &mut s.noise,
                 &[
-                    (Noise::Off, "Off"),
+                    (Noise::Off, t("Off")),
                     (Noise::Sup1, "Sup1"),
                     (Noise::Sup2, "Sup2"),
                 ],
             );
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                m3::switch(ui, &mut s.echo, "Echo cancellation");
-                ui.label("Echo cancellation");
+                m3::switch(ui, &mut s.echo, t("Echo cancellation"));
+                ui.label(t("Echo cancellation"));
             });
             ui.label(m3::supporting(
-                "Removes your converted voice from the microphone when you listen on speakers. Leave it off with headphones.",
+                t("Removes your converted voice from the microphone when you listen on speakers. Leave it off with headphones."),
             ));
         });
     }
@@ -1253,70 +1304,70 @@ impl VoiceApp {
         m3::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing = Vec2::splat(8.0);
-            m3::card_title(ui, icons::SPEED, "Buffering");
+            m3::card_title(ui, icons::SPEED, t("Buffering"));
             ui.add_enabled_ui(!running, |ui| {
                 let s = &mut self.saved.settings;
                 m3::setting(
                     ui,
-                    "Chunk", "How much audio is converted at once, and most of the delay. Lower it while Load at the bottom stays under about 70%; raise it if the voice stutters. 160-250 ms suits a good GPU, 320 ms or more the CPU.",
-                    m3::Format::new(" ms"),
+                    t("Chunk"), t("How much audio is converted at once, and most of the delay. Lower it while Load at the bottom stays under about 70%; raise it if the voice stutters. 160-250 ms suits a good GPU, 320 ms or more the CPU."),
+                    m3::Format::new(" ms").presets(&CHUNK_PRESETS).preset_label(chunk_label),
                     &mut s.block_ms,
-                    20..=500,
+                    20..=crate::config::MAX_BLOCK_MS,
                     1.0,
                 );
                 s.overlap_ms = s.overlap_ms.min(s.block_ms);
                 m3::setting(
                     ui,
-                    "Extra", "Past audio the model hears for context, so chunk edges sound continuous. It costs little: about 500 ms is a good default; lower it only if Load is too high.",
-                    m3::Format::new(" ms"),
+                    t("Extra"), t("Past audio the model hears for context, so chunk edges sound continuous. It costs little: about 500 ms is a good default; lower it only if Load is too high."),
+                    m3::Format::new(" ms").presets(&EXTRA_PRESETS).preset_label(extra_label),
                     &mut s.context_ms,
-                    0..=2000,
+                    0..=3000,
                     1.0,
                 );
                 let max_overlap = s.block_ms.min(100);
                 m3::setting(
                     ui,
-                    "Crossfade", "Blends each chunk into the next to hide the seams. Raise it to 60-80 ms if you hear a flutter every chunk.",
-                    m3::Format::new(" ms"),
+                    t("Crossfade"), t("Blends each chunk into the next to hide the seams. Raise it to 60-80 ms if you hear a flutter every chunk."),
+                    m3::Format::new(" ms").presets(&[10.0, 20.0, 40.0, 60.0, 80.0, 100.0]),
                     &mut s.overlap_ms,
                     1..=max_overlap,
                     1.0,
                 );
                 m3::setting(
                     ui,
-                    "SOLA search", "How far to look for the best place to join chunks. Leave it unless you hear clicks.",
-                    m3::Format::new(" ms"),
+                    t("SOLA search"), t("How far to look for the best place to join chunks. Leave it unless you hear clicks."),
+                    m3::Format::new(" ms").presets(&[0.0, 6.0, 12.0, 20.0]),
                     &mut s.search_ms,
                     0..=40,
                     1.0,
                 );
             });
-            ui.label(m3::supporting("Stop audio to change buffer durations."));
+            ui.label(m3::supporting(t("Stop audio to change buffer durations.")));
         });
         ui.add_space(4.0);
         m3::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            m3::card_title(ui, icons::INFO, "Tips");
+            m3::card_title(ui, icons::INFO, t("Tips"));
             for (glyph, title, text) in [
                 (
                     icons::VOICE,
-                    "More like the character",
-                    "Use the voice's index (Index 50-75%) and keep Tune in a natural range for the voice. Speak in your normal voice; the model copies your expression.",
+                    t("More like the character"),
+                    t("Use the voice's index (Index 50-75%) and keep Tune in a natural range for the voice. Speak in your normal voice; the model copies your expression."),
                 ),
                 (
                     icons::GRAPHIC_EQ,
-                    "Smoother",
-                    "If the voice stutters, raise Chunk until Load stays under 70%. If you hear a flutter at every chunk, raise Crossfade.",
+                    t("Smoother"),
+                    t("If the voice stutters, raise Chunk until Load stays under 70%. If you hear a flutter at every chunk, raise Crossfade."),
                 ),
                 (
                     icons::SPEED,
-                    "Less delay",
-                    "Lower Chunk while Load stays low, and use a GPU. On Windows, set VB-Cable's Max Latency to 2048 in Settings.",
+                    t("Less delay"),
+                    t("Lower Chunk while Load stays low, and use a GPU. On Windows, set VB-Cable's Max Latency to 2048 in Settings."),
                 ),
                 (
                     icons::MEMORY,
-                    "Less GPU",
-                    "Keep the noise gate around -50 dB: nothing is converted while you are silent. Noise suppression Sup2 costs a little more.",
+                    t("Less GPU"),
+                    t("Keep the noise gate around -50 dB: nothing is converted while you are silent. Noise suppression Sup2 costs a little more."),
                 ),
             ] {
                 ui.horizontal_top(|ui| {
@@ -1332,32 +1383,48 @@ impl VoiceApp {
         });
     }
     fn settings(&mut self, ui: &mut egui::Ui) {
-        header(ui, "Settings", "Audio devices and runtime.");
+        header(ui, t("Settings"), t("Audio devices and runtime."));
+        m3::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            m3::card_title(ui, icons::INFO, t("Language"));
+            let options: Vec<(crate::i18n::Lang, &str)> = crate::i18n::Lang::ALL
+                .iter()
+                .map(|lang| (*lang, lang.name()))
+                .collect();
+            choice(
+                ui,
+                t("Interface language"),
+                t("The language of the app's text. Error details and logs stay in English."),
+                &mut self.saved.language,
+                &options,
+            );
+        });
+        ui.add_space(4.0);
         #[cfg(feature = "audio")]
         {
             m3::card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                m3::card_title(ui, icons::ROUTING, "Audio routing");
+                m3::card_title(ui, icons::ROUTING, t("Audio routing"));
                 // Devices can change while running; the session moves to them.
                 ui.scope(|ui| {
-                    device_picker(ui, "Microphone", true, &self.devices, &mut self.saved.input);
+                    device_picker(ui, t("Microphone"), true, &self.devices, &mut self.saved.input);
                     #[cfg(target_os = "linux")]
                     {
-                        m3::field_label(ui, "Virtual microphone");
+                        m3::field_label(ui, t("Virtual microphone"));
                         ui.horizontal(|ui| {
-                            if m3::switch(ui, &mut self.saved.virtual_mic, "Virtual microphone")
+                            if m3::switch(ui, &mut self.saved.virtual_mic, t("Virtual microphone"))
                                 .changed()
                             {
                                 self.sync_virtual_mic();
                             }
                             ui.label(if self.virtual_mic.is_some() {
-                                "On: Voice Changer Mic is ready"
+                                t("On: Voice Changer Mic is ready")
                             } else {
-                                "Off"
+                                t("Off")
                             });
                         });
                         ui.label(m3::supporting(
-                            "Adds a \"Voice Changer Mic\" input. Pick it as the microphone in Discord, OBS or a game to send them your converted voice. No extra software to install. It stays while you are logged in, even with the app closed, so those apps keep it selected; it carries silence while the voice changer is off, never your own voice. Turning this off removes it.",
+                            t("Adds a \"Voice Changer Mic\" input. Pick it as the microphone in Discord, OBS or a game to send them your converted voice. No extra software to install. It stays while you are logged in, even with the app closed, so those apps keep it selected; it carries silence while the voice changer is off, never your own voice. Turning this off removes it."),
                         ));
                     }
                     #[cfg(windows)]
@@ -1367,7 +1434,7 @@ impl VoiceApp {
                     ui.add_enabled_ui(!virtual_mic, |ui| {
                         device_picker(
                             ui,
-                            "Output / virtual cable",
+                            t("Output / virtual cable"),
                             false,
                             &self.devices,
                             &mut self.saved.output,
@@ -1375,21 +1442,21 @@ impl VoiceApp {
                     });
                     if virtual_mic {
                         ui.label(m3::supporting(
-                            "The voice goes to the virtual microphone. Turn on Monitor below to hear it too.",
+                            t("The voice goes to the virtual microphone. Turn on Monitor below to hear it too."),
                         ));
                     }
-                    m3::field_label(ui, "Monitor");
+                    m3::field_label(ui, t("Monitor"));
                     ui.horizontal(|ui| {
-                        m3::switch(ui, &mut self.saved.monitor, "Monitor");
-                        ui.label(if self.saved.monitor { "On" } else { "Off" });
+                        m3::switch(ui, &mut self.saved.monitor, t("Monitor"));
+                        ui.label(if self.saved.monitor { t("On") } else { t("Off") });
                     });
                     ui.label(m3::supporting(
-                        "Plays the converted voice on a second device, usually your headphones, so you hear how you sound while the output goes to Discord or a virtual cable. Use headphones: speakers feed the voice back into the microphone.",
+                        t("Plays the converted voice on a second device, usually your headphones, so you hear how you sound while the output goes to Discord or a virtual cable. Use headphones: speakers feed the voice back into the microphone."),
                     ));
                     if self.saved.monitor {
                         device_picker(
                             ui,
-                            "Monitor device",
+                            t("Monitor device"),
                             false,
                             &self.devices,
                             &mut self.saved.monitor_device,
@@ -1397,20 +1464,20 @@ impl VoiceApp {
                     }
                     ui.add_space(8.0);
                     if ui
-                        .add(m3::Button::outlined("Refresh devices").icon(icons::REFRESH))
+                        .add(m3::Button::outlined(t("Refresh devices")).icon(icons::REFRESH))
                         .clicked()
                     {
                         self.refresh_devices();
                     }
                 });
-                ui.label(m3::supporting("Choose headphones for monitoring, or an installed virtual device to send audio to another app. Devices can be changed while the voice changer runs; audio pauses for a moment while it moves."));
+                ui.label(m3::supporting(t("Choose headphones for monitoring, or an installed virtual device to send audio to another app. Devices can be changed while the voice changer runs; audio pauses for a moment while it moves.")));
             });
             ui.add_space(4.0);
         }
         let running = self.running();
         m3::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            m3::card_title(ui, icons::MEMORY, "Processing");
+            m3::card_title(ui, icons::MEMORY, t("Processing"));
             let available = crate::runtime::available_devices();
             let current = self.saved.settings.device;
             // A saved choice stays visible even when this runtime cannot use it.
@@ -1423,8 +1490,8 @@ impl VoiceApp {
             ui.add_enabled_ui(!running && options.len() > 1, |ui| {
                 choice(
                     ui,
-                    "Device",
-                    "Where the model runs. A GPU is much faster than the CPU. CUDA is the fastest on NVIDIA; DirectML works on any DirectX 12 GPU (NVIDIA, AMD, Intel) without installing anything.",
+                    t("Device"),
+                    t("Where the model runs. A GPU is much faster than the CPU. CUDA is the fastest on NVIDIA; DirectML works on any DirectX 12 GPU (NVIDIA, AMD, Intel) without installing anything."),
                     &mut self.saved.settings.device,
                     &options,
                 );
@@ -1432,15 +1499,15 @@ impl VoiceApp {
             if let Some(name) = crate::gpu_info::name_for(current) {
                 ui.horizontal(|ui| {
                     ui.label(m3::icon(icons::MEMORY, 18.0, m3::PRIMARY));
-                    ui.label(egui::RichText::new(format!("Runs on {name}")).color(m3::ON_SURFACE));
+                    ui.label(egui::RichText::new(tf("Runs on {}", &[&name])).color(m3::ON_SURFACE));
                 });
             }
             ui.label(m3::supporting(if !available.contains(&current) {
-                "The selected device is not available with this ONNX Runtime; choose another one."
+                t("The selected device is not available with this ONNX Runtime; choose another one.")
             } else if available.len() > 1 {
-                "The choice applies the next time you press Start."
+                t("The choice applies the next time you press Start.")
             } else {
-                "Only the CPU is available with this ONNX Runtime. On Windows, the standard download includes DirectML for any GPU."
+                t("Only the CPU is available with this ONNX Runtime. On Windows, the standard download includes DirectML for any GPU.")
             }));
             #[cfg(feature = "catalog")]
             self.setup_status(ui);
@@ -1448,24 +1515,24 @@ impl VoiceApp {
         ui.add_space(4.0);
         m3::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            m3::card_title(ui, icons::INFO, "About");
+            m3::card_title(ui, icons::INFO, t("About"));
             m3::list_item(
                 ui,
                 icons::DEVICES,
-                "Native Rust application",
-                "egui / CPAL / ONNX Runtime. No Python process or network server is used.",
+                t("Native Rust application"),
+                t("egui / CPAL / ONNX Runtime. No Python process or network server is used."),
             );
             m3::list_item(
                 ui,
                 icons::MEMORY,
-                "Inference",
-                "CPU or CUDA GPU, float32 ONNX exports",
+                t("Inference"),
+                t("CPU or CUDA GPU, float32 ONNX exports"),
             );
             m3::list_item(
                 ui,
                 icons::SETTINGS,
-                "Runtime",
-                "ONNX Runtime 1.22 shared library (ORT_DYLIB_PATH)",
+                t("Runtime"),
+                t("ONNX Runtime 1.22 shared library (ORT_DYLIB_PATH)"),
             );
         });
     }
@@ -1473,22 +1540,22 @@ impl VoiceApp {
         let index = self.saved.selected;
         #[allow(unused_mut)]
         let mut status = if self.saved.settings.bypass {
-            "Ready · voice changer off (bypass)".to_owned()
+            t("Ready · voice changer off (bypass)").to_owned()
         } else {
-            "Ready · model loads on Start".to_owned()
+            t("Ready · model loads on Start").to_owned()
         };
         #[cfg(feature = "audio")]
         if let Some(session) = &self.session {
             status = if session.metrics.voice_loading.load(Ordering::Acquire) {
-                "Live · loading this voice, the last one plays meanwhile…".to_owned()
+                t("Live · loading this voice, the last one plays meanwhile…").to_owned()
             } else if session.metrics.ready.load(Ordering::Acquire) {
                 let device = self.saved.settings.device;
                 match crate::gpu_info::name_for(device) {
-                    Some(name) => format!("Live · {name}"),
-                    None => format!("Live · {}", device.label()),
+                    Some(name) => tf("Live · {}", &[&name]),
+                    None => tf("Live · {}", &[&device.label()]),
                 }
             } else {
-                "Loading model…".to_owned()
+                t("Loading model…").to_owned()
             };
         }
         ui.allocate_ui_with_layout(
@@ -1501,8 +1568,8 @@ impl VoiceApp {
                     let stopping = session.is_stopping();
                     let label = match (compact, stopping) {
                         (true, _) => "",
-                        (false, true) => "Stopping…",
-                        (false, false) => "Stop",
+                        (false, true) => t("Stopping…"),
+                        (false, false) => t("Stop"),
                     };
                     if ui
                         .add_enabled(!stopping, m3::Button::fab_stop(label).icon(icons::STOP))
@@ -1524,9 +1591,9 @@ impl VoiceApp {
                             m3::ON_SURFACE_VARIANT
                         },
                         if recording {
-                            "Stop recording and save WAV + diagnostic report"
+                            t("Stop recording and save WAV + diagnostic report")
                         } else {
-                            "Record microphone and converted voice to WAV files with pitch/spectrogram diagnostics"
+                            t("Record microphone and converted voice to WAV files with pitch/spectrogram diagnostics")
                         },
                     )
                     .clicked()
@@ -1536,7 +1603,7 @@ impl VoiceApp {
                 } else if ui
                     .add_enabled(
                         self.work.is_none(),
-                        m3::Button::fab(if compact { "" } else { "Start" }).icon(icons::PLAY),
+                        m3::Button::fab(if compact { "" } else { t("Start") }).icon(icons::PLAY),
                     )
                     .clicked()
                 {
@@ -1547,24 +1614,24 @@ impl VoiceApp {
                     ui,
                     icons::AUDIO_FILE,
                     m3::ON_SURFACE_VARIANT,
-                    "Convert a WAV file",
+                    t("Convert a WAV file"),
                 )
                 .clicked()
                 {
                     self.file_dialog = true;
                 }
-                if m3::icon_button(ui, icons::ROUTING, m3::ON_SURFACE_VARIANT, "Audio routing")
+                if m3::icon_button(ui, icons::ROUTING, m3::ON_SURFACE_VARIANT, t("Audio routing"))
                     .clicked()
                 {
                     self.page = Page::Settings;
                 }
                 ui.add_space(4.0);
                 let mut apply = !self.saved.settings.bypass;
-                m3::switch(ui, &mut apply, "Apply voice changer")
-                    .on_hover_text("Apply voice changer");
+                m3::switch(ui, &mut apply, t("Apply voice changer"))
+                    .on_hover_text(t("Apply voice changer"));
                 self.saved.settings.bypass = !apply;
                 if !compact {
-                    ui.label(RichText::new("Voice changer").color(m3::ON_SURFACE_VARIANT));
+                    ui.label(RichText::new(t("Voice changer")).color(m3::ON_SURFACE_VARIANT));
                     ui.add_space(8.0);
                 }
                 // Whatever is left on the leading side shows the selected voice.
@@ -1647,14 +1714,14 @@ impl VoiceApp {
                 icons::MIC,
                 load(&m.input_level),
                 (!settings.bypass).then_some(gate_db),
-                "Microphone level. The pink tick is the noise gate (Studio > Noise gate): below it nothing is converted and the GPU rests.",
+                t("Microphone level. The pink tick is the noise gate (Studio > Noise gate): below it nothing is converted and the GPU rests."),
             );
             m3::meter(
                 ui,
                 icons::HEADPHONES,
                 load(&m.output_level),
                 None,
-                "Converted voice level. Red near 0 dB means it is clipping; lower the output gain.",
+                t("Converted voice level. Red near 0 dB means it is clipping; lower the output gain."),
             );
             if !converting {
                 return;
@@ -1663,10 +1730,10 @@ impl VoiceApp {
                 m3::stat(
                     ui,
                     icons::INFO,
-                    "Silent",
-                    "GPU idle",
+                    t("Silent"),
+                    t("GPU idle"),
                     m3::OUTLINE,
-                    "You are quieter than the noise gate, so nothing is converted. Speak, or lower the gate in Studio if your voice is cut.",
+                    t("You are quieter than the noise gate, so nothing is converted. Speak, or lower the gate in Studio if your voice is cut."),
                 );
             }
             // A sound waits for its chunk to fill, is converted, then plays after the
@@ -1676,40 +1743,55 @@ impl VoiceApp {
             let delay = processing + queued;
             let lead = (queued - block).max(0.0);
             let (tone, advice) = if delay < 250.0 {
-                (m3::SUCCESS, "Low delay.")
+                (m3::SUCCESS, t("Low delay."))
             } else if delay < 450.0 {
-                (m3::TERTIARY, "Noticeable delay. Lower Chunk in Studio if the load stays under 70%.")
+                (m3::TERTIARY, t("Noticeable delay. Lower Chunk in Studio if the load stays under 70%."))
             } else {
-                (m3::ERROR, "High delay. Lower Chunk in Studio; use a GPU if the load is high.")
+                (m3::ERROR, t("High delay. Lower Chunk in Studio; use a GPU if the load is high."))
             };
             m3::stat(
                 ui,
                 icons::SPEED,
-                "Delay",
+                t("Delay"),
                 &format!("~{delay:.0} ms"),
                 tone,
                 &format!(
-                    "{advice}\nChunk {block:.0} ms + converting {processing:.0} ms + safety buffer {lead:.0} ms. A virtual cable such as VB-Cable adds its own buffer on top."
+                    "{advice}\n{}",
+                    tf(
+                        "Chunk {} ms + converting {} ms + safety buffer {} ms. A virtual cable such as VB-Cable adds its own buffer on top.",
+                        &[
+                            &format!("{block:.0}"),
+                            &format!("{processing:.0}"),
+                            &format!("{lead:.0}"),
+                        ],
+                    )
                 ),
             );
             let usage = if block > 0.0 { processing / block } else { 0.0 };
             let (tone, advice) = if usage < 0.6 {
-                (m3::SUCCESS, "Plenty of headroom: you can lower Chunk for less delay.")
+                (m3::SUCCESS, t("Plenty of headroom: you can lower Chunk for less delay."))
             } else if usage < 0.9 {
-                (m3::TERTIARY, "Busy but keeping up.")
+                (m3::TERTIARY, t("Busy but keeping up."))
             } else {
-                (m3::ERROR, "Cannot keep up, so the voice stutters: raise Chunk, lower Extra, or use a GPU.")
+                (m3::ERROR, t("Cannot keep up, so the voice stutters: raise Chunk, lower Extra, or use a GPU."))
             };
             m3::stat(
                 ui,
                 icons::MEMORY,
-                "Load",
+                t("Load"),
                 &format!("{:.0}%", usage * 100.0),
                 tone,
                 &format!(
-                    "{advice}\nConverting one {block:.0} ms chunk takes {processing:.0} ms on {}.",
-                    crate::gpu_info::name_for(settings.device)
-                        .unwrap_or_else(|| settings.device.label())
+                    "{advice}\n{}",
+                    tf(
+                        "Converting one {} ms chunk takes {} ms on {}.",
+                        &[
+                            &format!("{block:.0}"),
+                            &format!("{processing:.0}"),
+                            &crate::gpu_info::name_for(settings.device)
+                                .unwrap_or_else(|| settings.device.label()),
+                        ],
+                    )
                 ),
             );
             let glitches = m.dropped_input.load(Ordering::Relaxed)
@@ -1719,7 +1801,7 @@ impl VoiceApp {
                 m3::stat(
                     ui,
                     icons::ERROR,
-                    "Glitches",
+                    t("Glitches"),
                     &format!(
                         "{} / {} / {}",
                         m.dropped_input.load(Ordering::Relaxed),
@@ -1727,7 +1809,7 @@ impl VoiceApp {
                         m.underrun_samples.load(Ordering::Relaxed)
                     ),
                     m3::TERTIARY,
-                    "Samples dropped from the microphone / dropped from the output / missing when the output ran dry. Occasional ones are harmless; if they keep rising, raise Chunk.",
+                    t("Samples dropped from the microphone / dropped from the output / missing when the output ran dry. Occasional ones are harmless; if they keep rising, raise Chunk."),
                 );
             }
         });
@@ -1748,16 +1830,16 @@ impl VoiceApp {
         .ok()
         .and_then(|model| model.feature_bank)
         .and_then(|bank| bank.file_name().map(|n| n.to_string_lossy().into_owned()));
-        let (_, dismissed) = m3::dialog(ctx, "model-dialog", "Configure voice", |ui| {
+        let (_, dismissed) = m3::dialog(ctx, "model-dialog", t("Configure voice"), |ui| {
             ui.add_enabled_ui(!running, |ui| {
                 let slot = &mut self.saved.slots[self.saved.selected];
-                m3::field_label(ui, "Display name");
-                ui.add(m3::text_edit(&mut slot.name, "Voice name", f32::INFINITY));
+                m3::field_label(ui, t("Display name"));
+                ui.add(m3::text_edit(&mut slot.name, t("Voice name"), f32::INFINITY));
                 // Phones have no file picker for checkpoints; there the manifest path
                 // is typed in.
                 #[cfg(any(target_os = "android", target_os = "ios"))]
                 {
-                    m3::field_label(ui, "Model manifest (.json)");
+                    m3::field_label(ui, t("Model manifest (.json)"));
                     ui.add(m3::text_edit(
                         &mut slot.manifest,
                         "/path/to/model.json",
@@ -1766,68 +1848,68 @@ impl VoiceApp {
                 }
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 if !slot.manifest.trim().is_empty() {
-                    m3::field_label(ui, "Index (.index)");
+                    m3::field_label(ui, t("Index (.index)"));
                     ui.label(
-                        egui::RichText::new(current_index.as_deref().unwrap_or("No index"))
+                        egui::RichText::new(current_index.as_deref().unwrap_or(t("No index")))
                             .color(m3::ON_SURFACE),
                     );
                     ui.horizontal(|ui| {
                         if ui
-                            .add(m3::Button::outlined("Change index").icon(icons::FOLDER_OPEN))
+                            .add(m3::Button::outlined(t("Change index")).icon(icons::FOLDER_OPEN))
                             .clicked()
                         {
                             if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("RVC feature index", &["index"])
+                                .add_filter(t("RVC feature index"), &["index"])
                                 .pick_file()
                             {
                                 index_change = Some(Some(path));
                             }
                         }
                         if current_index.is_some()
-                            && ui.add(m3::Button::text("Remove index")).clicked()
+                            && ui.add(m3::Button::text(t("Remove index"))).clicked()
                         {
                             index_change = Some(None);
                         }
                     });
                     ui.label(m3::supporting(
-                        "Makes the voice sound closer to the original speaker; the Index slider sets how much. The file is copied into the voice's folder.",
+                        t("Makes the voice sound closer to the original speaker; the Index slider sets how much. The file is copied into the voice's folder."),
                     ));
                 }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    m3::switch(ui, &mut slot.favorite, "Favorite");
-                    ui.label("Favorite");
+                    m3::switch(ui, &mut slot.favorite, t("Favorite"));
+                    ui.label(t("Favorite"));
                 });
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 {
-                    m3::field_label(ui, "Picture");
+                    m3::field_label(ui, t("Picture"));
                     if ui
                         .add_enabled(
                             !slot.manifest.trim().is_empty(),
-                            m3::Button::outlined("Choose picture").icon(icons::FOLDER_OPEN),
+                            m3::Button::outlined(t("Choose picture")).icon(icons::FOLDER_OPEN),
                         )
                         .clicked()
                     {
                         picture = rfd::FileDialog::new()
-                            .add_filter("Picture", &PORTRAIT_TYPES)
+                            .add_filter(t("Picture"), &PORTRAIT_TYPES)
                             .pick_file();
                     }
                     ui.label(m3::supporting(
-                        "Shown on the voice card. It is copied into the voice's folder as portrait.*",
+                        t("Shown on the voice card. It is copied into the voice's folder as portrait.*"),
                     ));
                 }
                 #[cfg(any(target_os = "android", target_os = "ios"))]
                 ui.label(m3::supporting(
-                    "The manifest connects RVC, ContentVec and RMVPE. See examples/model.json.",
+                    t("The manifest connects RVC, ContentVec and RMVPE. See examples/model.json."),
                 ));
             });
             m3::actions(ui, |ui| {
-                done = ui.add(m3::Button::text("Done")).clicked();
+                done = ui.add(m3::Button::text(t("Done"))).clicked();
                 if removable
                     && ui
                         .add_enabled(
                             !running,
-                            m3::Button::danger("Remove slot").icon(icons::DELETE),
+                            m3::Button::danger(t("Remove slot")).icon(icons::DELETE),
                         )
                         .clicked()
                 {
@@ -1845,9 +1927,9 @@ impl VoiceApp {
                 Ok(()) => {
                     self.message = Some(match index {
                         Some(_) => {
-                            "Index updated; it applies the next time you press Start.".into()
+                            t("Index updated; it applies the next time you press Start.").into()
                         }
-                        None => "Index removed.".into(),
+                        None => t("Index removed.").into(),
                     })
                 }
                 Err(error) => self.error = Some(format!("{error:#}")),
@@ -1862,7 +1944,7 @@ impl VoiceApp {
     fn file_conversion_dialog(&mut self, ctx: &egui::Context) {
         let busy = self.running() || self.work.is_some();
         let mut close = false;
-        let (_, dismissed) = m3::dialog(ctx, "file-dialog", "Convert a WAV file", |ui| {
+        let (_, dismissed) = m3::dialog(ctx, "file-dialog", t("Convert a WAV file"), |ui| {
             m3::chip(
                 ui,
                 icons::VOICE,
@@ -1872,7 +1954,7 @@ impl VoiceApp {
             let trailing = if browse { 48.0 } else { 0.0 };
             let mut convert = false;
             ui.add_enabled_ui(!busy, |ui| {
-                m3::field_label(ui, "Input WAV");
+                m3::field_label(ui, t("Input WAV"));
                 ui.horizontal(|ui| {
                     let width = ui.available_width() - trailing;
                     ui.add(m3::text_edit(&mut self.file_input, "input.wav", width));
@@ -1881,12 +1963,12 @@ impl VoiceApp {
                         ui,
                         icons::FOLDER_OPEN,
                         m3::ON_SURFACE_VARIANT,
-                        "Choose input WAV…",
+                        t("Choose input WAV…"),
                     )
                     .clicked()
                     {
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("WAV audio", &["wav"])
+                            .add_filter(t("WAV audio"), &["wav"])
                             .pick_file()
                         {
                             self.file_input = path.to_string_lossy().into_owned();
@@ -1898,7 +1980,7 @@ impl VoiceApp {
                         }
                     }
                 });
-                m3::field_label(ui, "Output WAV");
+                m3::field_label(ui, t("Output WAV"));
                 ui.horizontal(|ui| {
                     let width = ui.available_width() - trailing;
                     ui.add(m3::text_edit(&mut self.file_output, "converted.wav", width));
@@ -1907,12 +1989,12 @@ impl VoiceApp {
                         ui,
                         icons::FOLDER_OPEN,
                         m3::ON_SURFACE_VARIANT,
-                        "Choose output…",
+                        t("Choose output…"),
                     )
                     .clicked()
                     {
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("WAV audio", &["wav"])
+                            .add_filter(t("WAV audio"), &["wav"])
                             .set_file_name("converted.wav")
                             .save_file()
                         {
@@ -1924,35 +2006,41 @@ impl VoiceApp {
                 let s = &mut self.saved.settings;
                 m3::setting(
                     ui,
-                    "Tune",
-                    "Makes the voice higher or lower. +12 is one octave up, -12 one octave down.",
-                    m3::Format::new(" semitones").decimals(1).signed(),
+                    t("Tune"),
+                    t("Makes the voice higher or lower. +12 is one octave up, -12 one octave down."),
+                    m3::Format::new(t(" semitones"))
+                    .decimals(1)
+                    .signed()
+                    .presets(&[-12.0, -8.0, -5.0, 0.0, 5.0, 8.0, 12.0]),
                     &mut s.semitones,
                     -24.0..=24.0,
                     0.1,
                 );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    m3::switch(ui, &mut self.file_analyze, "Save diagnostic report");
-                    ui.label("Save diagnostic report (.json + .png)");
+                    m3::switch(ui, &mut self.file_analyze, t("Save diagnostic report"));
+                    ui.label(t("Save diagnostic report (.json + .png)"));
                 });
                 ui.label(m3::supporting(
-                    "Writes pitch, spectrogram, and artifact diagnostics beside the converted WAV.",
+                    t("Writes pitch, spectrogram, and artifact diagnostics beside the converted WAV."),
                 ));
             });
             ui.label(m3::supporting(if busy {
-                "Stop live audio, or wait for the current model/file task to finish."
+                t("Stop live audio, or wait for the current model/file task to finish.")
             } else {
-                "The selected voice is applied to the entire file. Microphone capture is stopped during file conversion."
+                t("The selected voice is applied to the entire file. Microphone capture is stopped during file conversion.")
             }));
             m3::actions(ui, |ui| {
                 let ready = !busy
                     && !self.file_input.trim().is_empty()
                     && !self.file_output.trim().is_empty();
                 convert = ui
-                    .add_enabled(ready, m3::Button::filled("Convert").icon(icons::AUDIO_FILE))
+                    .add_enabled(
+                        ready,
+                        m3::Button::filled(t("Convert")).icon(icons::AUDIO_FILE),
+                    )
                     .clicked();
-                close = ui.add(m3::Button::text("Close")).clicked();
+                close = ui.add(m3::Button::text(t("Close"))).clicked();
             });
             if convert {
                 let manifest = PathBuf::from(&self.saved.slots[self.saved.selected].manifest);
@@ -1984,21 +2072,19 @@ impl VoiceApp {
                             Some(&settings),
                         )?;
                         let plot = png
-                            .map(|p| format!(" and {}", p.display()))
+                            .map(|p| tf(" and {}", &[&p.display()]))
                             .unwrap_or_default();
                         let headline = crate::analyze::format_summary(&report)
                             .lines()
                             .take(3)
                             .collect::<Vec<_>>()
                             .join(" | ");
-                        Ok(format!(
-                            "Conversion complete: {} (report: {}{} — {headline})",
-                            output.display(),
-                            json.display(),
-                            plot
+                        Ok(tf(
+                            "Conversion complete: {} (report: {}{} — {})",
+                            &[&output.display(), &json.display(), &plot, &headline],
                         ))
                     } else {
-                        Ok(format!("Conversion complete: {}", output.display()))
+                        Ok(tf("Conversion complete: {}", &[&output.display()]))
                     }
                 });
             }
@@ -2008,6 +2094,7 @@ impl VoiceApp {
 }
 impl eframe::App for VoiceApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        crate::i18n::set(self.saved.language);
         // Whatever the window shows as an error or a message also goes to the terminal.
         if self.error != self.logged.0 {
             if let Some(error) = &self.error {
@@ -2024,7 +2111,9 @@ impl eframe::App for VoiceApp {
         let completed = self.work.as_ref().and_then(|work| match work.try_recv() {
             Ok(result) => Some(result),
             Err(mpsc::TryRecvError::Empty) => None,
-            Err(mpsc::TryRecvError::Disconnected) => Some(Err("Model worker disconnected".into())),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Some(Err(t("Model worker disconnected").into()))
+            }
         });
         if let Some(result) = completed {
             self.work = None;
@@ -2063,7 +2152,7 @@ impl eframe::App for VoiceApp {
                 self.message = Some(recorded);
             }
             if let Some(problem) = session.metrics.voice_error.lock().unwrap().take() {
-                self.error = Some(format!("Could not switch voice: {problem}"));
+                self.error = Some(tf("Could not switch voice: {}", &[&problem]));
             }
             if !session.metrics.running.load(Ordering::Acquire) {
                 self.error = session.metrics.error.lock().unwrap().clone();
@@ -2171,6 +2260,7 @@ impl eframe::App for VoiceApp {
                 self.setup_dialog(ctx);
             }
         }
+        self.show_toast(ctx);
         if self.running() || self.work.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
@@ -2180,6 +2270,35 @@ impl eframe::App for VoiceApp {
     }
 }
 impl VoiceApp {
+    /// Shows `text` in a snackbar over whatever page or dialog is open, and writes it
+    /// to the terminal. A message goes away by itself; an error stays until closed.
+    #[cfg(feature = "catalog")]
+    fn toast(&mut self, text: String, error: bool) {
+        if error {
+            log::error!("{text}");
+        } else {
+            log::info!("{text}");
+        }
+        self.toast = Some((text, error, None));
+    }
+
+    fn show_toast(&mut self, ctx: &egui::Context) {
+        const SHOWN_FOR: f64 = 6.0;
+        let Some((text, error, until)) = &mut self.toast else {
+            return;
+        };
+        let now = ctx.input(|i| i.time);
+        let closed = m3::snackbar(ctx, text, *error);
+        let expired = !*error && now >= *until.get_or_insert(now + SHOWN_FOR);
+        if closed || expired {
+            self.toast = None;
+        } else if let Some(until) = until.filter(|_| !*error) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                (until - now).max(0.0) + 0.05,
+            ));
+        }
+    }
+
     /// Progress, result and error strips above the page content.
     fn notices(&mut self, ui: &mut egui::Ui) {
         #[cfg(feature = "catalog")]
@@ -2193,7 +2312,7 @@ impl VoiceApp {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.add(egui::Spinner::new().color(m3::PRIMARY));
-                        ui.label("Processing model/audio…");
+                        ui.label(t("Processing model/audio…"));
                     });
                 });
             ui.add_space(4.0);
@@ -2226,6 +2345,40 @@ impl VoiceApp {
     }
 }
 /// Single-choice row of filter chips under a field label.
+/// The reference client's CHUNK choices (units of 128 samples at 48 kHz) in ms, up
+/// to `config::MAX_BLOCK_MS`.
+const CHUNK_PRESETS: [f64; 25] = {
+    const UNITS: [f64; 25] = [
+        8.0, 16.0, 24.0, 32.0, 40.0, 48.0, 64.0, 80.0, 96.0, 112.0, 128.0, 192.0, 256.0, 320.0,
+        384.0, 448.0, 512.0, 576.0, 640.0, 704.0, 768.0, 832.0, 896.0, 960.0, 1024.0,
+    ];
+    let mut ms = [0.0; 25];
+    let mut i = 0;
+    while i < 25 {
+        ms[i] = UNITS[i] * 128.0 * 1000.0 / 48000.0;
+        i += 1;
+    }
+    ms
+};
+const _: () = assert!(CHUNK_PRESETS[24] <= crate::config::MAX_BLOCK_MS as f64);
+/// "128 (341.3 ms, 16384)", as the reference client lists CHUNK.
+fn chunk_label(ms: f64) -> String {
+    let units = (ms * 48.0 / 128.0).round();
+    format!("{units} ({ms:.1} ms, {})", units * 128.0)
+}
+/// The reference client's EXTRA choices (samples at 48 kHz) in ms.
+const EXTRA_PRESETS: [f64; 6] = [
+    4096.0 / 48.0,
+    8192.0 / 48.0,
+    16384.0 / 48.0,
+    32768.0 / 48.0,
+    65536.0 / 48.0,
+    131072.0 / 48.0,
+];
+/// "16384 (341 ms)", the reference's sample count with its duration.
+fn extra_label(ms: f64) -> String {
+    format!("{} ({ms:.0} ms)", (ms * 48.0).round())
+}
 fn choice<T: Copy + PartialEq>(
     ui: &mut egui::Ui,
     label: &str,
@@ -2337,15 +2490,15 @@ fn device_picker(
                 .iter()
                 .find(|d| &d.id == id && d.input == input)
                 .map(|d| d.name.as_str())
-                .unwrap_or("Unavailable device")
+                .unwrap_or(t("Unavailable device"))
         })
-        .unwrap_or("System default");
+        .unwrap_or(t("System default"));
     m3::field_label(ui, label);
     egui::ComboBox::from_id_salt(label)
         .selected_text(name)
         .width(ui.available_width().min(440.0))
         .show_ui(ui, |ui| {
-            ui.selectable_value(selected, None, "System default");
+            ui.selectable_value(selected, None, t("System default"));
             for device in devices.iter().filter(|d| d.input == input) {
                 ui.selectable_value(selected, Some(device.id.clone()), &device.name);
             }

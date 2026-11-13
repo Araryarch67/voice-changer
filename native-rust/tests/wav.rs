@@ -1,4 +1,4 @@
-use voice_changer_native::{config::Settings, engine::Engine, wav};
+use voice_changer::{config::Settings, engine::Engine, wav};
 #[test]
 fn wav_downmix_preserves_tail_length_and_same_path_is_rejected() {
     let directory = std::env::temp_dir().join(format!("vc-wav-test-{}", std::process::id()));

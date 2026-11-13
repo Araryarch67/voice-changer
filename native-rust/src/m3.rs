@@ -1,4 +1,5 @@
 //! Material 3 dark theme: colour roles, type, icons and the components the app uses.
+use crate::i18n::t;
 use eframe::egui::{
     self, emath::Numeric, Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Margin, Rect,
     Response, RichText, Sense, Stroke, StrokeKind, Ui, Vec2, WidgetInfo, WidgetType,
@@ -85,7 +86,7 @@ pub fn icon(glyph: char, size: f32, color: Color32) -> RichText {
 
 pub fn install(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    let embedded: [(&str, &'static [u8]); 4] = [
+    let embedded: [(&str, &'static [u8]); 5] = [
         (
             "roboto",
             include_bytes!("../assets/fonts/Roboto-Regular-subset.ttf"),
@@ -97,6 +98,11 @@ pub fn install(ctx: &egui::Context) {
         (
             "icons",
             include_bytes!("../assets/fonts/MaterialSymbolsRounded-subset.ttf"),
+        ),
+        // Japanese interface text (and kana in voice or device names).
+        (
+            "noto-jp",
+            include_bytes!("../assets/fonts/NotoSansJP-Regular-subset.ttf"),
         ),
         (
             "icons-filled",
@@ -110,9 +116,9 @@ pub fn install(ctx: &egui::Context) {
     }
     // egui's own fonts stay as fallbacks for scripts outside the Roboto subset.
     let fallback = fonts.families[&FontFamily::Proportional].clone();
-    let mut regular = vec!["roboto".to_owned()];
+    let mut regular = vec!["roboto".to_owned(), "noto-jp".to_owned()];
     regular.extend(fallback.iter().cloned());
-    let mut strong = vec!["roboto-medium".to_owned()];
+    let mut strong = vec!["roboto-medium".to_owned(), "noto-jp".to_owned()];
     strong.extend(fallback);
     fonts.families.insert(FontFamily::Proportional, regular);
     fonts.families.insert(medium(), strong);
@@ -562,6 +568,10 @@ pub struct Format {
     suffix: &'static str,
     signed: bool,
     off_at_min: bool,
+    /// Common values offered in a drop-down beside the number, in stored units.
+    presets: &'static [f64],
+    /// How a preset reads in the drop-down; `None` shows it like the number.
+    preset_label: Option<fn(f64) -> String>,
 }
 impl Format {
     pub const fn new(suffix: &'static str) -> Self {
@@ -571,7 +581,19 @@ impl Format {
             suffix,
             signed: false,
             off_at_min: false,
+            presets: &[],
+            preset_label: None,
         }
+    }
+    /// Common values to pick from a drop-down; typing and the slider still work.
+    pub const fn presets(mut self, presets: &'static [f64]) -> Self {
+        self.presets = presets;
+        self
+    }
+    /// How each preset reads, for values known by another name (CHUNK 128).
+    pub const fn preset_label(mut self, label: fn(f64) -> String) -> Self {
+        self.preset_label = Some(label);
+        self
     }
     /// Shown and typed as the value times `scale` (0.5 as 50 %).
     pub const fn scale(mut self, scale: f64) -> Self {
@@ -587,14 +609,15 @@ impl Format {
         self.signed = true;
         self
     }
-    /// The lowest value reads "Off", and typing "off" sets it.
+    /// The lowest value reads "Off", and typing "off" (in English or the current
+    /// language) sets it.
     pub const fn off_at_min(mut self) -> Self {
         self.off_at_min = true;
         self
     }
     fn show(self, value: f64, min: f64) -> String {
         if self.off_at_min && value <= min {
-            return "Off".into();
+            return t("Off").into();
         }
         let shown = value * self.scale;
         if self.signed {
@@ -607,7 +630,7 @@ impl Format {
     /// decimal point, so "320", "320 ms" and "0,5" all parse.
     fn parse(self, text: &str, min: f64) -> Option<f64> {
         let text = text.trim().to_lowercase();
-        if self.off_at_min && (text == "off" || text == "mati") {
+        if self.off_at_min && (text == "off" || text == t("Off").to_lowercase()) {
             return Some(min);
         }
         let number: String = text
@@ -641,6 +664,33 @@ pub fn setting<N: Numeric>(
                 |ui| {
                     ui.label(RichText::new(label).size(14.0).color(ON_SURFACE));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let mut picked = None;
+                        if !format.presets.is_empty() {
+                            let current = value.to_f64();
+                            egui::ComboBox::from_id_salt((label, "presets"))
+                                .width(24.0)
+                                .selected_text("")
+                                .show_ui(ui, |ui| {
+                                    ui.set_min_width(180.0);
+                                    for &preset in format.presets {
+                                        let text = match format.preset_label {
+                                            Some(name) => name(preset),
+                                            None => format.show(preset, low),
+                                        };
+                                        let on = (preset - current).abs() < step.max(1e-6) / 2.0
+                                            || (preset.round() - current).abs() < 0.5
+                                                && step >= 1.0;
+                                        if ui.selectable_label(on, text).clicked() {
+                                            picked = Some(preset);
+                                        }
+                                    }
+                                })
+                                .response
+                                .on_hover_text(t("Common values"));
+                        }
+                        if let Some(preset) = picked {
+                            *value = N::from_f64(((preset / step).round() * step).clamp(low, high));
+                        }
                         ui.spacing_mut().interact_size = Vec2::new(64.0, 26.0);
                         ui.spacing_mut().button_padding = egui::vec2(8.0, 2.0);
                         ui.style_mut().override_font_id = Some(FontId::new(14.0, medium()));
@@ -655,7 +705,7 @@ pub fn setting<N: Numeric>(
                                         .map(|n| ((n / step).round() * step).clamp(low, high))
                                 }),
                         )
-                        .on_hover_text("Click to type a value, or drag sideways")
+                        .on_hover_text(t("Click to type a value, or drag sideways"))
                     })
                     .inner
                 },
@@ -774,7 +824,7 @@ pub fn meter(ui: &mut Ui, glyph: char, level: f32, gate_db: Option<f32>, hint: &
         egui::pos2(rect.right(), rect.center().y),
         Align2::RIGHT_CENTER,
         if db <= METER_FLOOR_DB {
-            "silent".to_owned()
+            t("silent").to_owned()
         } else {
             format!("{db:.0} dB")
         },
@@ -949,6 +999,116 @@ pub fn nav_item(ui: &mut Ui, glyph: char, label: &str, active: bool) -> Response
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// M3 checkbox: an 18 px box, filled with the primary colour and a check mark when
+/// on, in a 40 px touch target. A disabled one is drawn faded and cannot change.
+pub fn checkbox(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
+    let (rect, mut response) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
+    let enabled = ui.is_enabled();
+    if response.clicked() && enabled {
+        *on = !*on;
+        response.mark_changed();
+    }
+    let checked = *on;
+    response.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, enabled, checked, label));
+    let painter = ui.painter();
+    let alpha = if enabled { 1.0 } else { 0.38 };
+    painter.circle_filled(rect.center(), 20.0, state_layer(&response, PRIMARY));
+    let square = Rect::from_center_size(rect.center(), Vec2::splat(18.0));
+    if checked {
+        painter.rect_filled(square, 2.0, PRIMARY.gamma_multiply(alpha));
+        paint_icon(
+            ui,
+            square.center(),
+            icons::CHECK,
+            16.0,
+            false,
+            ON_PRIMARY.gamma_multiply(alpha),
+        );
+    } else {
+        painter.rect_stroke(
+            square,
+            2.0,
+            Stroke::new(2.0_f32, ON_SURFACE_VARIANT.gamma_multiply(alpha)),
+            StrokeKind::Inside,
+        );
+    }
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+/// Small tonal label such as "Recommended" or "Installed".
+pub fn badge(ui: &mut Ui, text: &str, fill: Color32, content: Color32) {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), FontId::new(11.0, medium()), content);
+    let size = Vec2::new(galley.size().x + 16.0, 20.0);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    ui.painter().rect_filled(rect, 10.0, fill);
+    ui.painter().galley(
+        egui::pos2(rect.left() + 8.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        content,
+    );
+}
+
+/// M3 snackbar ("toast"): a short message at the bottom of the window, above the
+/// bottom bar, with a close button. Errors use the error container colours. Returns
+/// true when closed.
+pub fn snackbar(ctx: &egui::Context, text: &str, error: bool) -> bool {
+    let (fill, content) = if error {
+        (ERROR_CONTAINER, ON_ERROR_CONTAINER)
+    } else {
+        (
+            Color32::from_rgb(230, 224, 233),
+            Color32::from_rgb(50, 47, 53),
+        )
+    };
+    let width = (ctx.screen_rect().width() - 32.0).min(560.0);
+    let mut closed = false;
+    egui::Area::new(egui::Id::new("snackbar"))
+        .order(egui::Order::Foreground)
+        .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -96.0))
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(fill)
+                .corner_radius(8)
+                .inner_margin(Margin {
+                    left: 16,
+                    right: 4,
+                    top: 6,
+                    bottom: 6,
+                })
+                .shadow(egui::Shadow {
+                    offset: [0, 3],
+                    blur: 10,
+                    spread: 0,
+                    color: Color32::from_black_alpha(110),
+                })
+                .show(ui, |ui| {
+                    ui.set_width(width - 20.0);
+                    ui.horizontal(|ui| {
+                        if error {
+                            ui.label(icon(icons::ERROR, 20.0, content));
+                        }
+                        let text_width = (ui.available_width() - 48.0).max(80.0);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(text_width, 20.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_width(text_width);
+                                ui.add(egui::Label::new(RichText::new(text).color(content)).wrap());
+                            },
+                        );
+                        closed = icon_button(ui, icons::CLOSE, content, t("Dismiss")).clicked();
+                    });
+                });
+        });
+    closed
+}
+
 /// Tonal message strip with a dismiss button; returns true when dismissed.
 pub fn banner(ui: &mut Ui, glyph: char, fill: Color32, content: Color32, text: &str) -> bool {
     let mut dismissed = false;
@@ -969,7 +1129,7 @@ pub fn banner(ui: &mut Ui, glyph: char, fill: Color32, content: Color32, text: &
                         ui.add(egui::Label::new(RichText::new(text).color(content)).wrap());
                     },
                 );
-                dismissed = icon_button(ui, icons::CLOSE, content, "Dismiss").clicked();
+                dismissed = icon_button(ui, icons::CLOSE, content, t("Dismiss")).clicked();
             });
         });
     dismissed
