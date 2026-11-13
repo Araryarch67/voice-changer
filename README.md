@@ -27,7 +27,7 @@ Voice Changer converts your microphone into another voice as you speak, using [R
 - **Real-time conversion** with RVC v2 models, pitch shifting (Tune) and speaker selection.
 - **Index retrieval** that reads RVC's FAISS `IndexIVFFlat` `.index` files directly, without the FAISS library.
 - **Noise handling**: RNNoise suppression in two strengths (Sup1, Sup2), a noise gate and echo cancellation.
-- **Pitch detectors**: RMVPE, CREPE, Harvest, DIO and YIN.
+- **Pitch detectors**: RMVPE, CREPE, FCPE, Harvest, DIO and YIN.
 - **GPU or CPU**: CUDA through ONNX Runtime where available, CPU everywhere else.
 - **One-step import**: pick an RVC `.pth` or `.zip` and the app converts it to ONNX, finds its index and adds the voice, no Python needed. Each voice can have its own picture.
 - **Recording** of the microphone and the converted voice to WAV, and offline WAV file conversion.
@@ -93,7 +93,7 @@ Then choose **GPU (CUDA)** under **Settings → Processing**. As a rough guide f
 | RVC v1 and v2, with and without f0 (32, 40, 48 kHz) | Supported |
 | Tune, index ratio, protect, gain, chunk, extra, crossfade | Supported |
 | Noise suppression and noise gate | Supported |
-| Pitch detection | RMVPE, CREPE (full, tiny), Harvest, DIO and built-in YIN |
+| Pitch detection | RMVPE, CREPE (full, tiny), FCPE, Harvest, DIO and built-in YIN |
 | CUDA GPU | Supported with a GPU build of ONNX Runtime |
 | Recording and WAV file conversion | Supported |
 | Echo cancellation | Supported (WebRTC AEC3) |

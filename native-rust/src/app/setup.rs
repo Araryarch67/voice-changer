@@ -1,5 +1,5 @@
 //! Voice engine dialog: picks and downloads the shared models (ContentVec and RMVPE,
-//! required; CREPE tiny and full, optional) with M3 checkboxes, a recommendation for
+//! required; CREPE tiny and full and FCPE, optional) with M3 checkboxes, a recommendation for
 //! each, and a progress bar. Opens on first start while the required ones are missing.
 use super::{icons, m3, VoiceApp};
 use crate::i18n::{t, tf};
@@ -58,15 +58,11 @@ fn shared_folder() -> std::path::PathBuf {
         .join("shared")
 }
 
-/// Whether the CREPE model for `detector` is installed (other detectors need none).
+/// Whether the model `detector` needs is installed (some need none).
 pub(super) fn detector_ready(detector: crate::config::F0Detector) -> bool {
-    use crate::config::F0Detector;
-    let file = match detector {
-        F0Detector::CrepeFull => "crepe_full.onnx",
-        F0Detector::CrepeTiny => "crepe_tiny.onnx",
-        _ => return true,
-    };
-    shared_folder().join(file).is_file()
+    detector
+        .model_file()
+        .is_none_or(|file| shared_folder().join(file).is_file())
 }
 
 impl VoiceApp {
@@ -80,13 +76,10 @@ impl VoiceApp {
         false
     }
 
-    /// Opens the dialog with the CREPE model for `detector` ticked.
+    /// Opens the dialog with the model `detector` needs ticked.
     pub(super) fn offer_detector(&mut self, detector: crate::config::F0Detector) {
-        use crate::config::F0Detector;
-        let file = match detector {
-            F0Detector::CrepeFull => "crepe_full.onnx",
-            F0Detector::CrepeTiny => "crepe_tiny.onnx",
-            _ => return,
+        let Some(file) = detector.model_file() else {
+            return;
         };
         for (model, chosen) in setup::SHARED.iter().zip(&mut self.setup.chosen) {
             if model.file == file {
@@ -181,7 +174,13 @@ impl VoiceApp {
                 .wrap(),
             );
             ui.add_space(8.0);
-            let glyphs = [icons::VOICE, icons::GRAPHIC_EQ, icons::SPEED, icons::MEMORY];
+            let glyphs = [
+                icons::VOICE,
+                icons::GRAPHIC_EQ,
+                icons::SPEED,
+                icons::MEMORY,
+                icons::TUNE,
+            ];
             let mut size = 0;
             for ((model, glyph), chosen) in
                 setup::SHARED.iter().zip(glyphs).zip(&mut self.setup.chosen)
@@ -346,7 +345,7 @@ impl VoiceApp {
             }
         });
         ui.label(m3::supporting(t(
-            "The two shared models every voice needs: one hears your words, the other follows your pitch. Manage models also adds the optional CREPE pitch detectors.",
+            "The two shared models every voice needs: one hears your words, the other follows your pitch. Manage models also adds the optional CREPE and FCPE pitch detectors.",
         )));
     }
 }

@@ -349,6 +349,35 @@ pub fn icon_button(ui: &mut Ui, glyph: char, color: Color32, hint: &str) -> Resp
         .on_hover_text(hint)
 }
 
+/// A small info icon that shows `tip` while it is held (touch screens have no
+/// hover) or hovered.
+pub fn info_button(ui: &mut Ui, tip: &str) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+    let enabled = ui.is_enabled();
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, tip));
+    let held = response.is_pointer_button_down_on();
+    ui.painter()
+        .circle_filled(rect.center(), 14.0, state_layer(&response, PRIMARY));
+    paint_icon(
+        ui,
+        rect.center(),
+        icons::INFO,
+        20.0,
+        held,
+        if held || response.hovered() {
+            PRIMARY
+        } else {
+            ON_SURFACE_VARIANT
+        },
+    );
+    if held {
+        response.show_tooltip_text(tip);
+    }
+    response
+        .on_hover_cursor(egui::CursorIcon::Help)
+        .on_hover_text(tip)
+}
+
 pub fn filter_chip(ui: &mut Ui, label: &str, selected: bool) -> Response {
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),
@@ -572,6 +601,9 @@ pub struct Format {
     presets: &'static [f64],
     /// How a preset reads in the drop-down; `None` shows it like the number.
     preset_label: Option<fn(f64) -> String>,
+    /// Advice behind an info button beside the name, shown while it is held or
+    /// hovered.
+    tip: Option<&'static str>,
 }
 impl Format {
     pub const fn new(suffix: &'static str) -> Self {
@@ -583,7 +615,13 @@ impl Format {
             off_at_min: false,
             presets: &[],
             preset_label: None,
+            tip: None,
         }
+    }
+    /// Advice shown while the info button beside the name is held or hovered.
+    pub const fn tip(mut self, tip: &'static str) -> Self {
+        self.tip = Some(tip);
+        self
     }
     /// Common values to pick from a drop-down; typing and the slider still work.
     pub const fn presets(mut self, presets: &'static [f64]) -> Self {
@@ -663,6 +701,9 @@ pub fn setting<N: Numeric>(
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     ui.label(RichText::new(label).size(14.0).color(ON_SURFACE));
+                    if let Some(tip) = format.tip {
+                        info_button(ui, tip);
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let mut picked = None;
                         if !format.presets.is_empty() {

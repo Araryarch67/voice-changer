@@ -20,11 +20,12 @@ fn parse_f0(name: &str) -> Result<F0Detector> {
         "rmvpe" => Ok(F0Detector::Rmvpe),
         "crepe_full" | "crepe" => Ok(F0Detector::CrepeFull),
         "crepe_tiny" => Ok(F0Detector::CrepeTiny),
+        "fcpe" => Ok(F0Detector::Fcpe),
         "harvest" => Ok(F0Detector::Harvest),
         "dio" => Ok(F0Detector::Dio),
         "yin" => Ok(F0Detector::Yin),
         other => bail!(
-            "Unknown F0 detector {other}; use rmvpe, crepe_full, crepe_tiny, harvest, dio, or yin"
+            "Unknown F0 detector {other}; use rmvpe, crepe_full, crepe_tiny, fcpe, harvest, dio, or yin"
         ),
     }
 }

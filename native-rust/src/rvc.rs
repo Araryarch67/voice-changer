@@ -55,8 +55,9 @@ pub struct Rvc {
     voice: Session,
     embedder: Session,
     pitch: Option<Session>,
-    /// Loaded on first use of a CREPE detector, with the detector it was loaded for.
-    crepe: Option<(F0Detector, Session)>,
+    /// Loaded on first use of a CREPE or FCPE detector, with the detector it was
+    /// loaded for.
+    detector_model: Option<(F0Detector, Session)>,
     /// Blocks still converted after the input fell under the noise gate.
     gate_hold: u32,
     /// Whether the noise gate is currently open (needs a smooth fade-out before muting).
@@ -176,7 +177,7 @@ impl Rvc {
             voice,
             embedder,
             pitch,
-            crepe: None,
+            detector_model: None,
             gate_hold: 0,
             gate_open: false,
             device,
@@ -225,6 +226,32 @@ impl Rvc {
         Ok(values.to_vec())
     }
 
+    /// The session of `detector`'s own model (`F0Detector::model_file` beside the
+    /// RMVPE model), loaded on first use; `input` is the input it must take.
+    fn detector_model(&mut self, detector: F0Detector, input: &str) -> Result<&mut Session> {
+        if self
+            .detector_model
+            .as_ref()
+            .is_none_or(|(loaded, _)| *loaded != detector)
+        {
+            let name = detector.model_file().expect("detectors with a model");
+            let file = self.manifest.pitch.with_file_name(name);
+            anyhow::ensure!(
+                file.is_file(),
+                "{detector:?} model not found: {}. Put {name} beside the RMVPE model, download it in Settings under Processing, or choose another F0 detector",
+                file.display()
+            );
+            let model = open_session(&file, self.manifest.intra_threads, self.device)
+                .with_context(|| format!("Load {name}"))?;
+            anyhow::ensure!(
+                model.inputs.iter().any(|i| i.name == input),
+                "{name} must take an `{input}` input"
+            );
+            self.detector_model = Some((detector, model));
+        }
+        Ok(&mut self.detector_model.as_mut().expect("loaded above").1)
+    }
+
     /// F0 per frame for `frames` 10 ms frames of `audio`, from `detector`.
     fn detect(&mut self, audio: &[f32], frames: usize, detector: F0Detector) -> Result<Vec<f32>> {
         let detected = match detector {
@@ -238,36 +265,20 @@ impl Rvc {
                 bail!("This build does not include the Harvest and DIO detectors")
             }
             F0Detector::CrepeFull | F0Detector::CrepeTiny => {
-                if self
-                    .crepe
-                    .as_ref()
-                    .is_none_or(|(loaded, _)| *loaded != detector)
-                {
-                    let name = if detector == F0Detector::CrepeFull {
-                        "crepe_full.onnx"
-                    } else {
-                        "crepe_tiny.onnx"
-                    };
-                    let file = self.manifest.pitch.with_file_name(name);
-                    anyhow::ensure!(
-                        file.is_file(),
-                        "CREPE model not found: {}. Put {name} beside the RMVPE model, or choose another F0 detector",
-                        file.display()
-                    );
-                    let model = open_session(&file, self.manifest.intra_threads, self.device)
-                        .context("Load CREPE ONNX")?;
-                    anyhow::ensure!(
-                        model.inputs.iter().any(|i| i.name == "frames"),
-                        "CREPE model must take a `frames` input of [N,1024]"
-                    );
-                    self.crepe = Some((detector, model));
-                }
-                let (_, model) = self.crepe.as_mut().expect("loaded above");
+                let model = self.detector_model(detector, "frames")?;
                 let (input, count) = crate::pitch::crepe_frames(audio);
                 let input = Tensor::from_array(([count, 1024], input.into_boxed_slice()))?;
                 let output = model.run(ort::inputs! { "frames" => input })?;
                 let (_, activations) = output[0].try_extract_tensor::<f32>()?;
                 crate::pitch::crepe_decode(activations)
+            }
+            F0Detector::Fcpe => {
+                let model = self.detector_model(detector, "audio")?;
+                let input =
+                    Tensor::from_array(([1, audio.len()], audio.to_vec().into_boxed_slice()))?;
+                let output = model.run(ort::inputs! { "audio" => input })?;
+                let (_, salience) = output[0].try_extract_tensor::<f32>()?;
+                crate::pitch::fcpe_decode(salience)
             }
             F0Detector::Rmvpe => {
                 let model = self.pitch.as_mut().expect("checked by the caller");

@@ -21,12 +21,25 @@ pub enum F0Detector {
     /// CREPE ONNX models, `crepe_full.onnx` or `crepe_tiny.onnx` beside the RMVPE file.
     CrepeFull,
     CrepeTiny,
+    /// FCPE ONNX model, `fcpe.onnx` beside the RMVPE file.
+    Fcpe,
     /// WORLD's Harvest: accurate and slow.
     Harvest,
     /// WORLD's DIO: fast and rough.
     Dio,
     /// Built-in YIN: no model run, less robust than RMVPE.
     Yin,
+}
+impl F0Detector {
+    /// The model file this detector needs beside the RMVPE model, if any.
+    pub fn model_file(self) -> Option<&'static str> {
+        match self {
+            F0Detector::CrepeFull => Some("crepe_full.onnx"),
+            F0Detector::CrepeTiny => Some("crepe_tiny.onnx"),
+            F0Detector::Fcpe => Some("fcpe.onnx"),
+            F0Detector::Rmvpe | F0Detector::Harvest | F0Detector::Dio | F0Detector::Yin => None,
+        }
+    }
 }
 /// Where ONNX sessions run. Applied when a model is loaded.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

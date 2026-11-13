@@ -128,6 +128,44 @@ pub fn crepe_decode(activations: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+const FCPE_BINS: usize = 360;
+/// FCPE's peak salience under which a frame is unvoiced: torchfcpe's default, which
+/// the reference uses.
+const FCPE_THRESHOLD: f32 = 0.006;
+
+/// Decodes FCPE's `[frames, 360]` salience as torchfcpe's `local_argmax` decoder
+/// does for the reference: the salience-weighted mean of the nine bins around the
+/// peak, bins evenly spaced in cents from 32.7 Hz to 1975.5 Hz, and unvoiced (0)
+/// where the peak is under 0.006. No smoothing, as in the reference.
+pub fn fcpe_decode(salience: &[f32]) -> Vec<f32> {
+    let cents = |hz: f64| 1200.0 * (hz / 10.0).log2();
+    let (first, last) = (cents(32.7), cents(1975.5));
+    let bin_cents = |bin: usize| first + (last - first) * bin as f64 / (FCPE_BINS - 1) as f64;
+    salience
+        .as_chunks::<FCPE_BINS>()
+        .0
+        .iter()
+        .map(|frame| {
+            let finite = |v: f32| if v.is_finite() { v } else { 0.0 };
+            let peak = (0..FCPE_BINS)
+                .max_by(|a, b| finite(frame[*a]).total_cmp(&finite(frame[*b])))
+                .unwrap_or(0);
+            if finite(frame[peak]) < FCPE_THRESHOLD {
+                return 0.0;
+            }
+            // As torch.gather with clamped indices: an edge bin may count twice.
+            let (mut weighted, mut total) = (0.0_f64, 0.0_f64);
+            for offset in 0..9 {
+                let bin = (peak + offset).saturating_sub(4).min(FCPE_BINS - 1);
+                let weight = f64::from(finite(frame[bin]));
+                weighted += bin_cents(bin) * weight;
+                total += weight;
+            }
+            (10.0 * 2.0_f64.powf(weighted / total / 1200.0)) as f32
+        })
+        .collect()
+}
+
 /// Three-point median. Edges either use the two values there are, or are padded
 /// with zeros like `scipy.signal.medfilt`.
 fn median3(values: &[f32], zero_padded: bool) -> Vec<f32> {
@@ -297,6 +335,40 @@ mod tests {
             }
         }
         assert!(harvest(&[0.0; 100]).iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn fcpe_decoding_matches_the_bin_scale() {
+        // A peak on bin 0 and bin 359 decodes to the ends of FCPE's range; a peak
+        // between two bins lands between their pitches; a weak frame is unvoiced.
+        let frame = |bins: &[(usize, f32)]| {
+            let mut frame = vec![0.0; FCPE_BINS];
+            for &(bin, value) in bins {
+                frame[bin] = value;
+            }
+            frame
+        };
+        let decoded = fcpe_decode(
+            &[
+                frame(&[(0, 0.9)]),
+                frame(&[(359, 0.9)]),
+                frame(&[(180, 0.8), (181, 0.8)]),
+                frame(&[(200, 0.005)]),
+            ]
+            .concat(),
+        );
+        assert!((decoded[0] - 32.7).abs() < 0.01, "{decoded:?}");
+        assert!((decoded[1] - 1975.5).abs() < 0.1, "{decoded:?}");
+        let between = (
+            fcpe_decode(&frame(&[(180, 0.9)]))[0],
+            fcpe_decode(&frame(&[(181, 0.9)]))[0],
+        );
+        assert!(
+            between.0 < decoded[2] && decoded[2] < between.1,
+            "{decoded:?} {between:?}"
+        );
+        assert_eq!(decoded[3], 0.0);
+        assert_eq!(fcpe_decode(&frame(&[(100, f32::NAN)])), vec![0.0]);
     }
 
     #[test]

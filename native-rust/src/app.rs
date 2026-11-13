@@ -962,6 +962,7 @@ impl VoiceApp {
                     ui,
                     t("Tune"), t("Makes the voice higher or lower. +12 is one octave up, -12 one octave down. Male to female voice: about +8 to +12; female to male: about -8 to -12. A natural range sounds most real."),
                     m3::Format::new(t(" semitones"))
+                    .tip(t("Recommended: +12 for a female voice, -2.5 for a male voice."))
                     .decimals(1)
                     .signed()
                     .presets(&[-12.0, -8.0, -5.0, 0.0, 5.0, 8.0, 12.0]),
@@ -1182,6 +1183,7 @@ impl VoiceApp {
                 ui,
                 t("Tune"), t("Makes the voice higher or lower. +12 is one octave up, -12 one octave down. Male to female voice: about +8 to +12; female to male: about -8 to -12. A natural range sounds most real."),
                 m3::Format::new(t(" semitones"))
+                    .tip(t("Recommended: +12 for a female voice, -2.5 for a male voice."))
                     .decimals(1)
                     .signed()
                     .presets(&[-12.0, -8.0, -5.0, 0.0, 5.0, 8.0, 12.0]),
@@ -1208,12 +1210,13 @@ impl VoiceApp {
             choice(
                 ui,
                 t("F0 detector"),
-                t("How your pitch is measured. RMVPE is the best all-rounder and the most natural for speech and singing. CREPE full and Harvest are accurate but heavy; CREPE tiny, DIO and YIN are light but can crack on high notes."),
+                t("How your pitch is measured. RMVPE is the best all-rounder and the most natural for speech and singing. FCPE is about as accurate and lighter. CREPE full and Harvest are accurate but heavy; CREPE tiny, DIO and YIN are light but can crack on high notes."),
                 &mut s.f0_detector,
                 &[
                     (F0Detector::Rmvpe, "RMVPE"),
                     (F0Detector::CrepeFull, "CREPE full"),
                     (F0Detector::CrepeTiny, "CREPE tiny"),
+                    (F0Detector::Fcpe, "FCPE"),
                     (F0Detector::Harvest, "Harvest"),
                     (F0Detector::Dio, "DIO"),
                     (F0Detector::Yin, "YIN"),
@@ -1289,12 +1292,12 @@ impl VoiceApp {
             }
             choice(
                 ui,
-                t("Noise suppression"), t("Removes background noise. Sup1 cleans the microphone. Sup2 also fades out everything that is not speech and cleans the output; it adds a little delay."),
+                t("Noise suppression"), t("Removes background noise. Sup2 is recommended: it also fades out everything that is not speech and cleans the output, for a little more delay. Sup1 only cleans the microphone."),
                 &mut s.noise,
                 &[
                     (Noise::Off, t("Off")),
                     (Noise::Sup1, "Sup1"),
-                    (Noise::Sup2, "Sup2"),
+                    (Noise::Sup2, t("Sup2 (recommended)")),
                 ],
             );
             ui.add_space(4.0);
@@ -2017,6 +2020,7 @@ impl VoiceApp {
                     t("Tune"),
                     t("Makes the voice higher or lower. +12 is one octave up, -12 one octave down."),
                     m3::Format::new(t(" semitones"))
+                    .tip(t("Recommended: +12 for a female voice, -2.5 for a male voice."))
                     .decimals(1)
                     .signed()
                     .presets(&[-12.0, -8.0, -5.0, 0.0, 5.0, 8.0, 12.0]),

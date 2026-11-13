@@ -1,6 +1,6 @@
 //! Voice engine setup: downloads the shared models into `models/shared/`, from the
 //! same place the reference voice changer fetches them. ContentVec and RMVPE are
-//! required by every voice; the CREPE pitch detectors are optional. Each download
+//! required by every voice; the CREPE and FCPE pitch detectors are optional. Each download
 //! is checked against its size and SHA-256 before it is kept.
 use crate::catalog::{agent, Progress};
 use anyhow::{bail, Context, Result};
@@ -26,7 +26,7 @@ pub struct SharedModel {
     pub recommended: bool,
 }
 
-pub const SHARED: [SharedModel; 4] = [
+pub const SHARED: [SharedModel; 5] = [
     SharedModel {
         file: "contentvec.onnx",
         title: "ContentVec",
@@ -65,6 +65,20 @@ pub const SHARED: [SharedModel; 4] = [
         url: "https://huggingface.co/wok000/weights/resolve/main/crepe/onnx/full.onnx",
         bytes: 88_984_790,
         sha256: "119845c72c702e052e5262430f9d120bce46176689aa226c39d09dea5cc3a610",
+        required: false,
+        recommended: false,
+    },
+    // The reference runs FCPE through PyTorch (torchfcpe), which ships no ONNX model.
+    // This is an MIT export of the same bundled weights (torchfcpe 0.0.4), with the
+    // mel front end inside the graph, checked against PyTorch by its exporter;
+    // pinned to one commit.
+    SharedModel {
+        file: "fcpe.onnx",
+        title: "FCPE",
+        purpose: "A fast and accurate pitch detector, close to RMVPE with less work; pick it as the F0 detector in Studio",
+        url: "https://huggingface.co/Scicom-intl/fcpe-onnx/resolve/11b6e6f968224227acd682cee8397ebe5b1821e5/fcpe.onnx",
+        bytes: 47_798_721,
+        sha256: "1a36aeb24b8695dce42fb18c432deb2ca9cd46567afb1a12e0e16301d524b925",
         required: false,
         recommended: false,
     },
@@ -187,11 +201,13 @@ mod tests {
     #[test]
     fn models_come_from_the_reference_weights() {
         for model in &SHARED {
-            assert!(
-                model.url.starts_with("https://huggingface.co/wok000/"),
-                "{}",
-                model.url
-            );
+            // FCPE has no ONNX model there; see its entry.
+            let source = if model.file == "fcpe.onnx" {
+                "https://huggingface.co/Scicom-intl/fcpe-onnx/resolve/"
+            } else {
+                "https://huggingface.co/wok000/"
+            };
+            assert!(model.url.starts_with(source), "{}", model.url);
             assert!(model.file.ends_with(".onnx"));
             assert_eq!(model.sha256.len(), 64);
             assert!(!model.required || model.recommended);
@@ -201,6 +217,15 @@ mod tests {
         assert_eq!(SHARED[1].file, "rmvpe.onnx");
         assert!(SHARED.iter().any(|m| m.file == "crepe_full.onnx"));
         assert!(SHARED.iter().any(|m| m.file == "crepe_tiny.onnx"));
+        // The detectors find their models by these names.
+        for detector in [
+            crate::config::F0Detector::CrepeFull,
+            crate::config::F0Detector::CrepeTiny,
+            crate::config::F0Detector::Fcpe,
+        ] {
+            let file = detector.model_file().unwrap();
+            assert!(SHARED.iter().any(|m| m.file == file), "{file}");
+        }
     }
 
     #[test]
