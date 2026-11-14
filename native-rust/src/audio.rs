@@ -203,9 +203,15 @@ struct Recorder {
     input: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
     output: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
     stem: PathBuf,
+    output_rate: u32,
+    start_dropped_in: u64,
+    start_dropped_out: u64,
+    start_underruns: u64,
+    worker_times_ms: Vec<f32>,
+    queue_peak_samples: usize,
 }
 impl Recorder {
-    fn create(directory: &Path, rate: u32) -> Result<Self> {
+    fn create(directory: &Path, rate: u32, output_rate: u32, metrics: &Metrics) -> Result<Self> {
         std::fs::create_dir_all(directory)
             .with_context(|| format!("Create {}", directory.display()))?;
         let seconds = std::time::SystemTime::now()
@@ -226,6 +232,12 @@ impl Recorder {
             input: open("in")?,
             output: open("out")?,
             stem,
+            output_rate: output_rate.max(1),
+            start_dropped_in: metrics.dropped_input.load(Ordering::Relaxed),
+            start_dropped_out: metrics.dropped_output.load(Ordering::Relaxed),
+            start_underruns: metrics.underrun_samples.load(Ordering::Relaxed),
+            worker_times_ms: Vec::new(),
+            queue_peak_samples: 0,
         })
     }
     fn name(stem: &Path, suffix: &str) -> String {
@@ -242,6 +254,48 @@ impl Recorder {
         }
         Ok(())
     }
+    fn record_block_health(&mut self, worker_ms: f32, queued_samples: usize) {
+        if worker_ms.is_finite() {
+            self.worker_times_ms.push(worker_ms);
+        }
+        self.queue_peak_samples = self.queue_peak_samples.max(queued_samples);
+    }
+    fn build_live_health(
+        &self,
+        metrics: &Metrics,
+        block_ms: u32,
+    ) -> crate::analyze::LiveHealthStats {
+        let mut sorted = self.worker_times_ms.clone();
+        sorted.sort_by(f32::total_cmp);
+        let percentile = |p: f32| -> f32 {
+            if sorted.is_empty() {
+                0.0
+            } else {
+                let idx = ((sorted.len() - 1) as f32 * p).round() as usize;
+                sorted[idx.min(sorted.len() - 1)]
+            }
+        };
+        crate::analyze::LiveHealthStats {
+            blocks: sorted.len(),
+            block_ms,
+            worker_p50_ms: percentile(0.50),
+            worker_p95_ms: percentile(0.95),
+            worker_max_ms: sorted.last().copied().unwrap_or(0.0),
+            dropped_input_samples: metrics
+                .dropped_input
+                .load(Ordering::Relaxed)
+                .saturating_sub(self.start_dropped_in),
+            dropped_output_samples: metrics
+                .dropped_output
+                .load(Ordering::Relaxed)
+                .saturating_sub(self.start_dropped_out),
+            underrun_samples: metrics
+                .underrun_samples
+                .load(Ordering::Relaxed)
+                .saturating_sub(self.start_underruns),
+            queue_peak_ms: self.queue_peak_samples as f32 * 1000.0 / self.output_rate as f32,
+        }
+    }
     fn finish(
         self,
         metrics: Arc<Metrics>,
@@ -249,6 +303,7 @@ impl Recorder {
         model: Option<String>,
         settings: Settings,
     ) -> Result<String> {
+        let live_health = self.build_live_health(&metrics, settings.block_ms);
         self.input.finalize()?;
         self.output.finalize()?;
         let dir = self.stem.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -267,12 +322,13 @@ impl Recorder {
         if let Ok(handle) = thread::Builder::new()
             .name("voice-analyze".into())
             .spawn(move || {
-                let message = match crate::analyze::analyze_wavs_with_context(
+                let message = match crate::analyze::analyze_wavs_with_live_health(
                     &in_path,
                     Some(&out_path),
                     &stem,
                     model.as_deref(),
                     Some(&settings),
+                    Some(live_health),
                 ) {
                     Ok((report, json_path, png_path)) => {
                         let json_name = json_path
@@ -610,6 +666,17 @@ fn run_devices(
     let block_size = input_rate as usize * live.settings.block_ms as usize / 1000;
     let mut pending = Vec::with_capacity(block_size);
     let mut rate_converter = StreamResampler::new(input_rate, output_rate);
+    let warmup_started = Instant::now();
+    live.engine.warmup(input_rate, &live.settings)?;
+    if !live.settings.bypass {
+        log::info!(
+            "Warmed inference pipeline in {} ms",
+            warmup_started.elapsed().as_millis()
+        );
+    }
+    if stop.load(Ordering::Acquire) {
+        return Ok(None);
+    }
     input_stream.play()?;
     // Output begins when the first processed block is available.
     let mut output_started = false;
@@ -724,14 +791,16 @@ fn run_devices(
             metrics.recording.load(Ordering::Acquire),
             recorder.is_some(),
         ) {
-            (true, false) => match Recorder::create(&options.record_dir, input_rate) {
-                Ok(created) => recorder = Some(created),
-                Err(error) => {
-                    metrics.recording.store(false, Ordering::Release);
-                    *metrics.recorded.lock().unwrap() =
-                        Some(format!("Recording failed: {error:#}"));
+            (true, false) => {
+                match Recorder::create(&options.record_dir, input_rate, output_rate, metrics) {
+                    Ok(created) => recorder = Some(created),
+                    Err(error) => {
+                        metrics.recording.store(false, Ordering::Release);
+                        *metrics.recorded.lock().unwrap() =
+                            Some(format!("Recording failed: {error:#}"));
+                    }
                 }
-            },
+            }
             (false, true) => finish_recording(
                 &mut recorder,
                 metrics,
@@ -782,6 +851,10 @@ fn run_devices(
                 metrics.dropped_output.fetch_add(1, Ordering::Relaxed);
             }
         }
+        let queued_len = output.len();
+        if let Some(active) = &mut recorder {
+            active.record_block_health(took, queued_len);
+        }
         if !output_started {
             output_stream.play()?;
             output_started = true;
@@ -799,7 +872,7 @@ fn run_devices(
         }
         metrics
             .queued_samples
-            .store(output.len() as u64, Ordering::Relaxed);
+            .store(queued_len as u64, Ordering::Relaxed);
         pending.clear();
     }
     finish_recording(

@@ -267,21 +267,28 @@ impl Sola {
         );
         let audio = &audio[audio.len() - (block + overlap + search)..];
         let mut offset = 0;
-        if self.tail.len() == overlap {
+        let tail_energy = self.tail.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if self.tail.len() == overlap && tail_energy > 1e-6 {
             let mut best = f32::NEG_INFINITY;
             for shift in 0..=search {
                 let candidate = &audio[shift..shift + overlap];
-                let energy = candidate.iter().map(|v| v * v).sum::<f32>().sqrt() + 1e-8;
-                let score = candidate
+                let cand_energy = candidate.iter().map(|v| v * v).sum::<f32>().sqrt();
+                if cand_energy <= 1e-6 {
+                    continue;
+                }
+                let corr = candidate
                     .iter()
                     .zip(&self.tail)
                     .map(|(a, b)| a * b)
                     .sum::<f32>()
-                    / energy;
-                if score > best {
-                    best = score;
+                    / (cand_energy * tail_energy);
+                if corr > best {
+                    best = corr;
                     offset = shift;
                 }
+            }
+            if best < 0.15 {
+                offset = 0;
             }
         }
         let mut result = audio[offset..offset + block].to_vec();
@@ -298,6 +305,243 @@ impl Sola {
         }
         self.tail = audio[offset + block..offset + block + overlap].to_vec();
         Ok(result)
+    }
+}
+
+/// Stateful post-HPF vocal dynamics leveler: gentle voice-gated AGC, soft-knee downward
+/// compression for belt/transient control, and a noise-floor-aware soft downward expander.
+pub struct VocalDynamics {
+    rate: u32,
+    sc_b0: f32,
+    sc_b1: f32,
+    sc_a1: f32,
+    sc_x1: f32,
+    sc_y1: f32,
+    rms_power: f32,
+    fast_power: f32,
+    noise_floor_db: f32,
+    quiet_ref_db: f32,
+    quiet_steady_samples: u32,
+    agc_gain_db: f32,
+    smoothed_gain_db: f32,
+    below_close_samples: u32,
+    gate_closed: bool,
+    gate_atten_db: f32,
+}
+
+impl VocalDynamics {
+    pub fn new(rate: u32) -> Self {
+        let rate = rate.max(1);
+        // 1st-order 700 Hz ±2.5 dB presence tilt for the sidechain detector only (keeps chest boom
+        // from over-compressing upper-mid consonants while leaving the audio path uncolored).
+        let amp = 10.0_f64.powf(5.0 / 40.0);
+        let k = (std::f64::consts::PI * (700.0 / rate as f64).min(0.45)).tan();
+        let a0 = amp * k + 1.0;
+        let sc_b0 = ((k + amp) / a0) as f32;
+        let sc_b1 = ((k - amp) / a0) as f32;
+        let sc_a1 = ((amp * k - 1.0) / a0) as f32;
+        Self {
+            rate,
+            sc_b0,
+            sc_b1,
+            sc_a1,
+            sc_x1: 0.0,
+            sc_y1: 0.0,
+            rms_power: 1e-10,
+            fast_power: 1e-10,
+            noise_floor_db: -55.0,
+            quiet_ref_db: -55.0,
+            quiet_steady_samples: 0,
+            agc_gain_db: 0.0,
+            smoothed_gain_db: 0.0,
+            below_close_samples: 0,
+            gate_closed: false,
+            gate_atten_db: 0.0,
+        }
+    }
+
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::new(self.rate);
+    }
+
+    /// Processes `audio` in place with `amount` in `0.0..=1.0`.
+    pub fn process(&mut self, audio: &mut [f32], amount: f32) {
+        let amount = amount.clamp(0.0, 1.0);
+        if amount <= 0.0 || audio.is_empty() {
+            return;
+        }
+        let sr = self.rate as f32;
+        let alpha = |tau: f32| (-1.0 / (sr * tau)).exp();
+
+        let a_rms_atk = alpha(0.010);
+        let a_rms_rel = alpha(0.080);
+        let a_fast_atk = alpha(0.005);
+        let a_fast_rel = alpha(0.180);
+        let a_agc_up = alpha(0.800);
+        let a_agc_dn = alpha(0.080);
+        let a_noise_up = alpha(2.500);
+        let a_noise_dn = alpha(0.250);
+        let a_steady_ref = alpha(0.300);
+        let a_gate_open = alpha(0.004);
+        let a_gate_close = alpha(0.140);
+        let a_gain_up = alpha(0.025);
+        let a_gain_dn = alpha(0.004);
+        let hold_samples = (0.160 * sr) as u32;
+        let steady_hold_samples = (0.450 * sr) as u32;
+
+        const TARGET_ACTIVE_DB: f32 = -20.0;
+        const AGC_MIN_DB: f32 = -3.0;
+        const AGC_MAX_DB: f32 = 8.0;
+        const COMP_THRESH_DB: f32 = -18.0;
+        const COMP_RATIO: f32 = 3.0;
+        const COMP_KNEE_DB: f32 = 6.0;
+        const EXP_KNEE_DB: f32 = 4.0;
+        const EXP_RATIO: f32 = 1.5;
+        const MAX_GATE_ATTEN_DB: f32 = 12.0;
+
+        for sample in audio.iter_mut() {
+            let x = *sample;
+            let sc = self.sc_b0 * x + self.sc_b1 * self.sc_x1 - self.sc_a1 * self.sc_y1;
+            self.sc_x1 = x;
+            self.sc_y1 = sc;
+            let p = sc * sc;
+            let a_rms = if p > self.rms_power {
+                a_rms_atk
+            } else {
+                a_rms_rel
+            };
+            self.rms_power = a_rms * self.rms_power + (1.0 - a_rms) * p;
+
+            let a_fast = if p > self.fast_power {
+                a_fast_atk
+            } else {
+                a_fast_rel
+            };
+            self.fast_power = a_fast * self.fast_power + (1.0 - a_fast) * p;
+
+            let level_db = 10.0 * (self.rms_power + 1e-12).log10();
+            let fast_db = 10.0 * (self.fast_power + 1e-12).log10();
+
+            // Detect sustained low-variance, low-crest stationary background in (-70, -38) dBFS so
+            // changed room noise or recovery after digital silence reacquires without learning speech.
+            if level_db > -70.0 && level_db < -38.0 && (fast_db - level_db) < 6.0 {
+                if self.quiet_steady_samples == 0 {
+                    self.quiet_ref_db = level_db;
+                    self.quiet_steady_samples = 1;
+                } else if (level_db - self.quiet_ref_db).abs() <= 2.5 {
+                    self.quiet_ref_db =
+                        a_steady_ref * self.quiet_ref_db + (1.0 - a_steady_ref) * level_db;
+                    self.quiet_steady_samples = self.quiet_steady_samples.saturating_add(1);
+                } else {
+                    self.quiet_ref_db = level_db;
+                    self.quiet_steady_samples = 1;
+                }
+            } else {
+                self.quiet_steady_samples = 0;
+            }
+            let stationary_quiet = self.quiet_steady_samples >= steady_hold_samples;
+
+            // Adapt noise floor downward whenever input drops below it, and upward either slowly
+            // near the current estimate or via confirmed stationary background reacquisition.
+            if level_db < self.noise_floor_db {
+                let target_n = level_db.max(-72.0);
+                self.noise_floor_db =
+                    a_noise_dn * self.noise_floor_db + (1.0 - a_noise_dn) * target_n;
+            } else if stationary_quiet {
+                let target_n = level_db.min(-40.0);
+                if target_n > self.noise_floor_db {
+                    self.noise_floor_db =
+                        a_noise_dn * self.noise_floor_db + (1.0 - a_noise_dn) * target_n;
+                }
+            } else if level_db < -38.0 && level_db < self.noise_floor_db + 4.5 {
+                let target_n = level_db.min(-40.0);
+                self.noise_floor_db =
+                    a_noise_up * self.noise_floor_db + (1.0 - a_noise_up) * target_n;
+            }
+
+            // Continuous hysteresis gate: require `hold_samples` strictly below `close_thresh`
+            // without accumulation across intermediate-band excursions.
+            let open_thresh = self.noise_floor_db + 5.0;
+            let close_thresh = self.noise_floor_db + 2.0;
+            if level_db > open_thresh {
+                self.below_close_samples = 0;
+                self.gate_closed = false;
+            } else if level_db < close_thresh {
+                self.below_close_samples = self.below_close_samples.saturating_add(1);
+                if self.below_close_samples >= hold_samples {
+                    self.gate_closed = true;
+                }
+            } else {
+                self.below_close_samples = 0;
+            }
+            let gate_target = if self.gate_closed {
+                MAX_GATE_ATTEN_DB
+            } else {
+                0.0
+            };
+            let a_gate = if gate_target < self.gate_atten_db {
+                a_gate_open
+            } else {
+                a_gate_close
+            };
+            self.gate_atten_db = a_gate * self.gate_atten_db + (1.0 - a_gate) * gate_target;
+
+            // Soft downward expander below T_e.
+            let t_exp = (self.noise_floor_db + 5.0).min(-38.0);
+            let exp_atten_db = if level_db > t_exp + EXP_KNEE_DB * 0.5 {
+                0.0
+            } else if level_db >= t_exp - EXP_KNEE_DB * 0.5 {
+                let d = t_exp + EXP_KNEE_DB * 0.5 - level_db;
+                (EXP_RATIO - 1.0) * (d * d) / (2.0 * EXP_KNEE_DB)
+            } else {
+                ((EXP_RATIO - 1.0) * (t_exp - level_db)).min(MAX_GATE_ATTEN_DB)
+            };
+            let floor_atten_db = exp_atten_db.max(self.gate_atten_db);
+
+            // Freeze AGC during pauses and confirmed stationary background so noise is never boosted.
+            let confidently_active = level_db > self.noise_floor_db + 6.5
+                && self.gate_atten_db < 1.0
+                && !stationary_quiet;
+            if confidently_active {
+                let agc_target = (TARGET_ACTIVE_DB - level_db).clamp(AGC_MIN_DB, AGC_MAX_DB);
+                let a_agc = if agc_target > self.agc_gain_db {
+                    a_agc_up
+                } else {
+                    a_agc_dn
+                };
+                self.agc_gain_db = a_agc * self.agc_gain_db + (1.0 - a_agc) * agc_target;
+            }
+
+            // Downward soft-knee compressor reacts on the fast peak/RMS envelope after AGC.
+            let comp_in_db = fast_db.max(level_db) + self.agc_gain_db;
+            let comp_out_db = if comp_in_db < COMP_THRESH_DB - COMP_KNEE_DB * 0.5 {
+                comp_in_db
+            } else if comp_in_db <= COMP_THRESH_DB + COMP_KNEE_DB * 0.5 {
+                let d = comp_in_db - COMP_THRESH_DB + COMP_KNEE_DB * 0.5;
+                comp_in_db + (1.0 / COMP_RATIO - 1.0) * (d * d) / (2.0 * COMP_KNEE_DB)
+            } else {
+                COMP_THRESH_DB + (comp_in_db - COMP_THRESH_DB) / COMP_RATIO
+            };
+            let comp_gr_db = comp_out_db - comp_in_db;
+
+            // Fade out AGC boost smoothly when gating down during silence.
+            let agc_blend = (1.0 - self.gate_atten_db / MAX_GATE_ATTEN_DB).clamp(0.0, 1.0);
+            let target_gain_db =
+                (self.agc_gain_db * agc_blend + comp_gr_db - floor_atten_db).clamp(-18.0, 8.0);
+            let a_gain = if target_gain_db < self.smoothed_gain_db {
+                a_gain_dn
+            } else {
+                a_gain_up
+            };
+            self.smoothed_gain_db =
+                a_gain * self.smoothed_gain_db + (1.0 - a_gain) * target_gain_db;
+
+            *sample *= 10.0_f32.powf((amount * self.smoothed_gain_db) / 20.0);
+        }
     }
 }
 
@@ -489,5 +733,136 @@ mod tests {
         assert_eq!(coarse_pitch(50.0), 1);
         assert_eq!(coarse_pitch(1100.0), 255);
         assert_eq!(coarse_pitch(10000.0), 255);
+    }
+
+    #[test]
+    fn sola_handles_silent_tail_without_nan() {
+        let mut sola = Sola::default();
+        let silence = vec![0.0_f32; 140];
+        let first = sola.process(&silence, 100, 20, 20).unwrap();
+        let second = sola.process(&silence, 100, 20, 20).unwrap();
+        assert!(first.iter().all(|v| v.is_finite() && *v == 0.0));
+        assert!(second.iter().all(|v| v.is_finite() && *v == 0.0));
+    }
+
+    #[test]
+    fn vocal_dynamics_lifts_quiet_signal_tames_loud_and_holds_during_silence() {
+        let mut dyn_proc = VocalDynamics::new(48000);
+        // Low-level room noise (-50 dBFS) for 0.8 s should never cause gain climb above unity.
+        let noise: Vec<f32> = (0..38400)
+            .map(|i| 0.00316 * (i as f32 * 0.37).sin())
+            .collect();
+        let mut noisy = noise.clone();
+        dyn_proc.process(&mut noisy, 1.0);
+        assert!(
+            rms(&noisy[19200..]) <= rms(&noise[19200..]) * 1.05,
+            "AGC climbed on background noise"
+        );
+
+        // Quiet singing (-32 dBFS -> amp ~0.0355) for 1.2 s receives gentle upward boost.
+        let mut dyn_voice = VocalDynamics::new(48000);
+        let mut quiet = sine_wave(220.0, 48000, 57600)
+            .into_iter()
+            .map(|s| s * 0.0355)
+            .collect::<Vec<_>>();
+        let quiet_in_rms = rms(&quiet[38400..]);
+        dyn_voice.process(&mut quiet, 1.0);
+        let quiet_out_rms = rms(&quiet[38400..]);
+        assert!(
+            quiet_out_rms > quiet_in_rms * 1.4,
+            "expected gentle lift on quiet phrase: {quiet_in_rms} -> {quiet_out_rms}"
+        );
+
+        // Loud belt transient (-4 dBFS peak -> amp ~0.63) is compressed rather than boosted.
+        let mut loud = sine_wave(220.0, 48000, 24000)
+            .into_iter()
+            .map(|s| s * 0.63)
+            .collect::<Vec<_>>();
+        let loud_in_rms = rms(&loud[12000..]);
+        dyn_voice.process(&mut loud, 1.0);
+        let loud_out_rms = rms(&loud[12000..]);
+        assert!(
+            loud_out_rms < loud_in_rms,
+            "expected downward compression on loud phrase: {loud_in_rms} -> {loud_out_rms}"
+        );
+
+        // Dynamics scale consistently across 44.1 kHz and 48 kHz.
+        let mut d44 = VocalDynamics::new(44100);
+        let mut q44 = sine_wave(220.0, 44100, 44100)
+            .into_iter()
+            .map(|s| s * 0.0355)
+            .collect::<Vec<_>>();
+        d44.process(&mut q44, 1.0);
+        assert!(rms(&q44[22050..]) > 0.035);
+    }
+
+    #[test]
+    fn vocal_dynamics_reacquires_stationary_floor_and_requires_continuous_gate_hold() {
+        // Stationary -45 dBFS background for 3 s must reacquire noise floor and avoid boost.
+        let mut loud_room = VocalDynamics::new(48000);
+        let amp_45 = 10.0_f32.powf(-45.0 / 20.0) * std::f32::consts::SQRT_2;
+        let bg_45: Vec<f32> = (0..48000 * 3)
+            .map(|i| amp_45 * (2.0 * std::f32::consts::PI * 190.0 * i as f32 / 48000.0).sin())
+            .collect();
+        let mut proc_45 = bg_45.clone();
+        loud_room.process(&mut proc_45, 0.75);
+        assert!(
+            rms(&proc_45[48000 * 2..]) < rms(&bg_45[48000 * 2..]) * 0.85,
+            "expected stationary -45 dBFS floor to reacquire and attenuate"
+        );
+
+        // 1 s digital silence followed by 3 s of -55 dBFS background must recover from -72 dB.
+        let mut after_silence = VocalDynamics::new(48000);
+        let mut silence_then_bg = vec![0.0_f32; 48000];
+        let amp_55 = 10.0_f32.powf(-55.0 / 20.0) * std::f32::consts::SQRT_2;
+        let bg_55: Vec<f32> = (0..48000 * 3)
+            .map(|i| amp_55 * (2.0 * std::f32::consts::PI * 210.0 * i as f32 / 48000.0).sin())
+            .collect();
+        silence_then_bg.extend_from_slice(&bg_55);
+        after_silence.process(&mut silence_then_bg, 0.75);
+        assert!(
+            rms(&silence_then_bg[48000 * 3..]) < rms(&bg_55[48000 * 2..]) * 0.85,
+            "expected silence-to-background recovery without boosting -55 dBFS noise"
+        );
+
+        // Interrupted gate hold: ~80 ms below close, 120 ms in [close, open] band, ~135 ms below
+        // close (cumulative > 210 ms, each continuous interval < 160 ms) must NOT close the gate,
+        // whereas continuing without interruption past 160 ms must close it.
+        let mut gated = VocalDynamics::new(48000);
+        let amp_active = 10.0_f32.powf(-35.0 / 20.0) * std::f32::consts::SQRT_2;
+        let amp_low = 10.0_f32.powf(-60.0 / 20.0) * std::f32::consts::SQRT_2;
+        let amp_mid = 10.0_f32.powf(-49.5 / 20.0) * std::f32::consts::SQRT_2; // safely in [close, open] with sidechain tilt
+        let make_tone = |len: usize, amp: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| amp * (2.0 * std::f32::consts::PI * 220.0 * i as f32 / 48000.0).sin())
+                .collect()
+        };
+        gated.process(&mut make_tone(48000 / 2, amp_active), 1.0);
+        // ~360 ms RMS decay from -35 dBFS + ~80 ms strictly below close_thresh (~ -53.5 dBFS).
+        gated.process(&mut make_tone(48000 * 440 / 1000, amp_low), 1.0);
+        assert!(
+            gated.below_close_samples > 0 && !gated.gate_closed,
+            "expected active hold counter without closing: below={} closed={} floor={}",
+            gated.below_close_samples,
+            gated.gate_closed,
+            gated.noise_floor_db
+        );
+        // Entering [close_thresh, open_thresh] resets hold counter without clearing hysteresis.
+        gated.process(&mut make_tone(48000 * 120 / 1000, amp_mid), 1.0);
+        assert_eq!(gated.below_close_samples, 0);
+        assert!(!gated.gate_closed);
+        // Another <160 ms strictly below close (~25 ms RMS decay + ~135 ms below close).
+        gated.process(&mut make_tone(48000 * 160 / 1000, amp_low), 1.0);
+        assert!(
+            !gated.gate_closed,
+            "interrupted intervals should not close 160 ms continuous hold (below={})",
+            gated.below_close_samples
+        );
+        // Continuing below close crosses 160 ms continuously and closes the gate.
+        gated.process(&mut make_tone(48000 * 150 / 1000, amp_low), 1.0);
+        assert!(
+            gated.gate_closed,
+            "continuous interval exceeding 160 ms below close_thresh should close gate"
+        );
     }
 }

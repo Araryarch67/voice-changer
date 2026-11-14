@@ -1380,6 +1380,15 @@ impl VoiceApp {
                 0.0..=0.5,
                 0.01,
             );
+            m3::setting(
+                ui,
+                t("Pitch correction"),
+                t("Gently guides wobbly or slightly off-key singing onto musical notes while keeping vibrato natural. Leave at 0 % for natural speech."),
+                m3::Format::new(" %").scale(100.0).presets(&[0.0, 0.25, 0.5, 0.75, 1.0]),
+                &mut s.pitch_correct,
+                0.0..=1.0,
+                0.01,
+            );
             choice(
                 ui,
                 t("F0 detector"),
@@ -1445,6 +1454,15 @@ impl VoiceApp {
                 m3::Format::new("×").decimals(2).presets(&[0.5, 0.75, 1.0, 1.5, 2.0]),
                 &mut s.output_gain,
                 0.0..=4.0,
+                0.01,
+            );
+            m3::setting(
+                ui,
+                t("Vocal leveling"),
+                t("Smoothly evens out quiet and loud singing phrases without boosting room noise in pauses."),
+                m3::Format::new(" %").scale(100.0).presets(&[0.0, 0.25, 0.5, 0.75, 1.0]),
+                &mut s.vocal_leveling,
+                0.0..=1.0,
                 0.01,
             );
             // The engine gates on block RMS; show it in dBFS, where -100 is effectively off.

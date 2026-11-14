@@ -283,4 +283,8 @@ pub static TABLE: &[(&str, &str, &str)] = &[
     ("Deleted {}.", "{} dihapus.", "{} を削除しました。"),
     ("Removed {} from the gallery.", "{} dilepas dari galeri.", "{} をギャラリーから外しました。"),
     ("Could not delete {}: {}", "Gagal menghapus {}: {}", "{} を削除できませんでした：{}"),
+    ("Pitch correction", "Koreksi nada", "ピッチ補正"),
+    ("Gently guides wobbly or slightly off-key singing onto musical notes while keeping vibrato natural. Leave at 0 % for natural speech.", "Mengarahkan nyanyian yang goyah atau sedikit sumbang ke nada musik secara halus sambil menjaga vibrato tetap alami. Biarkan di 0 % untuk bicara alami.", "揺れたり少し外れたりした歌声の音程を、ビブラートを自然に保ったまま音楽的な音階へ穏やかに導きます。自然な話し声には 0 % のままにしてください。"),
+    ("Vocal leveling", "Perataan vokal", "ボーカルレベリング"),
+    ("Smoothly evens out quiet and loud singing phrases without boosting room noise in pauses.", "Menyeimbangkan bagian nyanyian yang pelan dan keras secara halus tanpa menaikkan bising ruangan saat jeda.", "小さなフレーズと大きなフレーズの音量をなめらかに整え、無音区間の部屋の雑音を持ち上げないようにします。"),
 ];

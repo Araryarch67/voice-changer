@@ -88,12 +88,27 @@ pub struct TimelineBin {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct LiveHealthStats {
+    pub blocks: usize,
+    pub block_ms: u32,
+    pub worker_p50_ms: f32,
+    pub worker_p95_ms: f32,
+    pub worker_max_ms: f32,
+    pub dropped_input_samples: u64,
+    pub dropped_output_samples: u64,
+    pub underrun_samples: u64,
+    pub queue_peak_ms: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AnalysisReport {
     pub label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settings: Option<Settings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_health: Option<LiveHealthStats>,
     pub input: Option<SignalStats>,
     pub output: SignalStats,
     pub comparison: Option<ComparisonStats>,
@@ -139,6 +154,7 @@ fn analyze_single_with_frames(
         label: label.to_owned(),
         model: None,
         settings: None,
+        live_health: None,
         input: None,
         output: out.stats.clone(),
         comparison: None,
@@ -188,6 +204,7 @@ fn analyze_pair_with_frames(
         label: label.to_owned(),
         model: None,
         settings: None,
+        live_health: None,
         input: Some(in_track.stats.clone()),
         output: out_track.stats.clone(),
         comparison: Some(comparison),
@@ -287,6 +304,18 @@ pub fn analyze_wavs_with_context(
     model: Option<&str>,
     settings: Option<&Settings>,
 ) -> Result<(AnalysisReport, PathBuf, Option<PathBuf>)> {
+    analyze_wavs_with_live_health(first, second, prefix, model, settings, None)
+}
+
+/// Like [`analyze_wavs_with_context`], also attaching live stream playback health telemetry.
+pub fn analyze_wavs_with_live_health(
+    first: &Path,
+    second: Option<&Path>,
+    prefix: &Path,
+    model: Option<&str>,
+    settings: Option<&Settings>,
+    live_health: Option<LiveHealthStats>,
+) -> Result<(AnalysisReport, PathBuf, Option<PathBuf>)> {
     let (out_rate, out_samples) = wav::read_mono(second.unwrap_or(first))?;
     let in_loaded = second
         .is_some()
@@ -322,6 +351,7 @@ pub fn analyze_wavs_with_context(
     };
     report.model = model.map(str::to_owned);
     report.settings = settings.cloned();
+    report.live_health = live_health;
     let (json_path, png_path) = write_report_files(&report, prefix, in_track.as_ref(), &out_track)?;
     Ok((report, json_path, png_path))
 }
@@ -1129,6 +1159,24 @@ fn yin_f0(audio: &[f32], center: usize) -> Option<f32> {
             while best < max_tau && cmnd[best + 1] < cmnd[best] {
                 best += 1;
             }
+            // Disambiguate weak borderline 2nd-harmonic triggers only when 2 * tau is at least
+            // 4x deeper (< 0.25 * cmnd[best]), avoiding false octave-halvings on clean fundamentals.
+            if cmnd[best] >= 0.09 {
+                let dbl = best * 2;
+                if dbl <= max_tau {
+                    let lo = dbl.saturating_sub(2).max(min_tau);
+                    let hi = (dbl + 2).min(max_tau);
+                    if let Some((offset, &dbl_val)) = cmnd[lo..=hi]
+                        .iter()
+                        .enumerate()
+                        .min_by(|a, b| a.1.total_cmp(b.1))
+                    {
+                        if dbl_val < cmnd[best] * 0.25 {
+                            best = lo + offset;
+                        }
+                    }
+                }
+            }
             chosen = Some(best);
             break;
         }
@@ -1913,5 +1961,17 @@ mod tests {
         }
         let report = analyze_samples(&sig, rate, "sibilant-test");
         assert_eq!(report.output.click_count, 0);
+
+        // Dominant 2nd harmonic (strong 360 Hz + weaker 180 Hz fundamental) must resolve to 180 Hz,
+        // not falsely lock onto 2*f0 = 360 Hz.
+        let harm: Vec<f32> = (0..ANALYSIS_RATE as usize / 2)
+            .map(|i| {
+                let t = i as f32 / ANALYSIS_RATE as f32;
+                0.28 * (2.0 * std::f32::consts::PI * 180.0 * t).sin()
+                    + 0.72 * (2.0 * std::f32::consts::PI * 360.0 * t).sin()
+            })
+            .collect();
+        let f0 = yin_f0(&harm, ANALYSIS_RATE as usize / 4).expect("detected fundamental");
+        assert!((f0 - 180.0).abs() < 4.0, "expected ~180 Hz f0, got {f0}");
     }
 }

@@ -64,6 +64,8 @@ pub struct Rvc {
     gate_open: bool,
     device: Device,
     history: Vec<f32>,
+    samples_seen: i64,
+    pitch_tracker: crate::pitch::PitchTracker,
     sola: Sola,
     geometry: Option<(u32, u32, u32, u32, u32)>,
     bank: Option<FeatureBank>,
@@ -182,6 +184,8 @@ impl Rvc {
             gate_open: false,
             device,
             history: Vec::new(),
+            samples_seen: 0,
+            pitch_tracker: crate::pitch::PitchTracker::default(),
             sola: Sola::default(),
             geometry: None,
             bank,
@@ -309,6 +313,7 @@ impl Rvc {
     fn pitches(
         &mut self,
         audio: &[f32],
+        history_start: i64,
         frames: usize,
         fresh_frames: Option<usize>,
         tail_frames: usize,
@@ -336,9 +341,14 @@ impl Rvc {
         };
         self.pitch_track.clone_from(&track);
         self.pitch_track_detector = Some(detector);
-        let stabilized = crate::pitch::stabilize_f0(&track);
-        let shift = 2.0_f32.powf(settings.semitones / 12.0);
-        let pitchf: Vec<_> = stabilized.iter().map(|v| v * shift).collect();
+        let clean = crate::pitch::stabilize_f0(&track);
+        let pitchf = self.pitch_tracker.process(
+            history_start,
+            &clean,
+            frames,
+            settings.semitones,
+            settings.pitch_correct,
+        );
         let pitch = pitchf.iter().map(|v| dsp::coarse_pitch(*v)).collect();
         Ok((pitch, pitchf))
     }
@@ -405,6 +415,8 @@ impl Converter for Rvc {
         let search = settings.search_ms as usize * 16;
         let context = settings.context_ms as usize * 16;
         let required = (new_audio.len() + overlap + search + context).div_ceil(160) * 160;
+        self.samples_seen += new_audio.len() as i64;
+        let history_start = self.samples_seen - required as i64;
         self.history.extend(new_audio);
         if self.history.len() < required {
             let mut padding = vec![0.0; required - self.history.len()];
@@ -421,7 +433,7 @@ impl Converter for Rvc {
             .map(dsp::rms)
             .fold(0.0, f32::max);
         let mut closing = false;
-        if loudest >= settings.silence_threshold {
+        if loudest > 0.0 && loudest >= settings.silence_threshold {
             self.gate_hold = 1;
             self.gate_open = true;
         } else if self.gate_hold > 0 {
@@ -433,6 +445,7 @@ impl Converter for Rvc {
             self.sola.reset();
             // The pitch track no longer lines up with the history after a gap.
             self.pitch_track.clear();
+            self.pitch_tracker.reset();
             return Ok(vec![0.0; input.len()]);
         }
         let audio = self.history.clone();
@@ -451,6 +464,7 @@ impl Converter for Rvc {
         let pitch_start = std::time::Instant::now();
         let (pitch, pitchf) = self.pitches(
             &audio,
+            history_start,
             frames,
             fresh_frames,
             convert_frames + PITCH_MARGIN_FRAMES,
@@ -518,6 +532,8 @@ impl Converter for Rvc {
     }
     fn reset(&mut self) {
         self.history.clear();
+        self.samples_seen = 0;
+        self.pitch_tracker.reset();
         self.sola.reset();
         self.geometry = None;
         self.gate_hold = 0;

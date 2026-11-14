@@ -16,6 +16,7 @@ pub struct Engine {
     converter: Option<Box<dyn Converter>>,
     was_bypass: bool,
     high_pass: Option<(u32, dsp::HighPass)>,
+    vocal_dynamics: Option<dsp::VocalDynamics>,
     input_denoise: Denoiser,
     output_denoise: Denoiser,
     echo: Option<EchoCanceller>,
@@ -29,6 +30,9 @@ impl Engine {
         }
         if let Some((_, hp)) = &mut self.high_pass {
             hp.reset();
+        }
+        if let Some(dyn_proc) = &mut self.vocal_dynamics {
+            dyn_proc.reset();
         }
         self.input_denoise.reset();
         self.output_denoise.reset();
@@ -45,6 +49,7 @@ impl Engine {
             converter,
             was_bypass: true,
             high_pass: None,
+            vocal_dynamics: None,
             input_denoise: Denoiser::default(),
             output_denoise: Denoiser::default(),
             echo: None,
@@ -54,6 +59,23 @@ impl Engine {
     pub fn process(&mut self, audio: &[f32], rate: u32, settings: &Settings) -> Result<Vec<f32>> {
         settings.validate()?;
         anyhow::ensure!(rate > 0, "Sample rate must be positive");
+        // Reset stateful conversion stages on transition *before* filtering block 1,
+        // otherwise block 1 runs through the HPF and immediately gets wiped for block 2.
+        if !settings.bypass && self.was_bypass {
+            if let Some(converter) = &mut self.converter {
+                converter.reset();
+            }
+            if let Some((_, hp)) = &mut self.high_pass {
+                hp.reset();
+            }
+            if let Some(dyn_proc) = &mut self.vocal_dynamics {
+                dyn_proc.reset();
+            }
+        } else if settings.bypass && !self.was_bypass {
+            if let Some(converter) = &mut self.converter {
+                converter.reset();
+            }
+        }
         let mut input: Vec<_> = audio.iter().map(|s| s * settings.input_gain).collect();
         if settings.echo {
             if self.echo.is_none() {
@@ -85,22 +107,18 @@ impl Engine {
                     .process(&input, rate, mode == Noise::Sup2)
             }
         }
+        if !settings.bypass && settings.vocal_leveling > 0.0 {
+            let dyn_proc = match &mut self.vocal_dynamics {
+                Some(d) if d.rate() == rate => d,
+                slot => slot.insert(dsp::VocalDynamics::new(rate)),
+            };
+            dyn_proc.process(&mut input, settings.vocal_leveling);
+        } else if let Some(dyn_proc) = &mut self.vocal_dynamics {
+            dyn_proc.reset();
+        }
         let mut out = if settings.bypass {
-            if !self.was_bypass {
-                if let Some(converter) = &mut self.converter {
-                    converter.reset();
-                }
-            }
             input
         } else {
-            if self.was_bypass {
-                if let Some(converter) = &mut self.converter {
-                    converter.reset();
-                }
-                if let Some((_, hp)) = &mut self.high_pass {
-                    hp.reset();
-                }
-            }
             let Some(converter) = &mut self.converter else {
                 bail!("Load a model or enable bypass before starting");
             };
@@ -132,6 +150,29 @@ impl Engine {
     }
     pub fn input_level(audio: &[f32]) -> f32 {
         dsp::rms(audio)
+    }
+
+    /// Runs one non-silent synthetic block with gate bypassed so lazy ONNX Runtime kernels
+    /// initialize before live capture starts, then resets all stateful DSP history.
+    pub fn warmup(&mut self, rate: u32, settings: &Settings) -> Result<()> {
+        settings.validate()?;
+        anyhow::ensure!(rate > 0, "Sample rate must be positive");
+        if self.converter.is_none() {
+            return Ok(());
+        }
+        let mut warmup_settings = settings.clone();
+        warmup_settings.bypass = false;
+        warmup_settings.echo = false;
+        warmup_settings.silence_threshold = 0.0;
+        warmup_settings.input_gain = 1.0;
+        let samples = (rate as usize * settings.block_ms as usize / 1000).max(1);
+        let synth: Vec<f32> = (0..samples)
+            .map(|i| 0.1 * (2.0 * std::f32::consts::PI * 220.0 * i as f32 / rate as f32).sin())
+            .collect();
+        let _ = self.process(&synth, rate, &warmup_settings)?;
+        self.reset();
+        self.was_bypass = true;
+        Ok(())
     }
 }
 
@@ -202,10 +243,17 @@ mod tests {
             ..Settings::default()
         };
 
-        // Pure DC input should settle near zero after the 80 Hz high-pass filter.
+        // Pure DC input should settle near zero after the 80 Hz high-pass filter,
+        // and the second consecutive block must not suffer a late HPF reset transient.
         let dc = vec![0.4; 4800];
-        let filtered = engine.process(&dc, 48000, &settings).unwrap();
-        assert!(dsp::rms(&filtered[2400..]) < 1e-3);
+        let filtered1 = engine.process(&dc, 48000, &settings).unwrap();
+        assert!(dsp::rms(&filtered1[2400..]) < 1e-3);
+        let filtered2 = engine.process(&dc, 48000, &settings).unwrap();
+        assert!(
+            dsp::rms(&filtered2) < 1e-3,
+            "second DC block saw unexpected HPF transient: {}",
+            dsp::rms(&filtered2)
+        );
 
         // Normal speech band (220 Hz) passes through and hot peaks are soft-limited inside [-1, 1].
         engine.reset();
@@ -225,5 +273,44 @@ mod tests {
         assert!(soft_limit(-1.0) > -1.0 && soft_limit(-1.0) < -0.95);
         assert!(soft_limit(2.0) <= 1.0 && soft_limit(2.0) > 0.99);
         assert!(soft_limit(-2.0) >= -1.0 && soft_limit(-2.0) < -0.99);
+    }
+
+    #[test]
+    fn warmup_runs_non_zero_audio_and_resets_state() {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        struct SpyConverter {
+            saw_nonzero: Arc<AtomicBool>,
+            resets: Arc<AtomicUsize>,
+        }
+        impl Converter for SpyConverter {
+            fn process(&mut self, audio: &[f32], _: u32, _: &Settings) -> Result<Vec<f32>> {
+                if dsp::rms(audio) > 0.01 {
+                    self.saw_nonzero.store(true, Ordering::Relaxed);
+                }
+                Ok(audio.to_vec())
+            }
+            fn reset(&mut self) {
+                self.resets.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let saw_nonzero = Arc::new(AtomicBool::new(false));
+        let resets = Arc::new(AtomicUsize::new(0));
+        let mut engine = Engine::new(Some(Box::new(SpyConverter {
+            saw_nonzero: saw_nonzero.clone(),
+            resets: resets.clone(),
+        })));
+        let settings = Settings {
+            bypass: true,
+            silence_threshold: 0.9,
+            block_ms: 40,
+            ..Settings::default()
+        };
+        engine.warmup(48000, &settings).unwrap();
+        assert!(saw_nonzero.load(Ordering::Relaxed));
+        assert_eq!(resets.load(Ordering::Relaxed), 2);
+        assert!(engine.was_bypass);
     }
 }

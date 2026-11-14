@@ -155,6 +155,20 @@ fn run_convert(args: &[String]) -> Result<()> {
                     .context("--output-gain requires a value")?
                     .parse()?;
             }
+            "--pitch-correct" => {
+                i += 1;
+                settings.pitch_correct = args
+                    .get(i)
+                    .context("--pitch-correct requires a value")?
+                    .parse()?;
+            }
+            "--vocal-leveling" => {
+                i += 1;
+                settings.vocal_leveling = args
+                    .get(i)
+                    .context("--vocal-leveling requires a value")?
+                    .parse()?;
+            }
             arg if !arg.starts_with("--") && positional_idx < 2 => {
                 if positional_idx == 0 {
                     settings.semitones = arg.parse().context("Invalid semitones")?;

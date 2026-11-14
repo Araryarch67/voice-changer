@@ -78,6 +78,10 @@ pub struct Settings {
     pub silence_threshold: f32,
     pub index_ratio: f32,
     pub protect: f32,
+    /// Musical pitch-correction blend (`0.0` = off, `1.0` = full chromatic snap with vibrato/slide preservation).
+    pub pitch_correct: f32,
+    /// Pre-RVC vocal dynamics leveling (`0.0` = off, `1.0` = full gentle AGC + soft-knee compression + noise-floor gate).
+    pub vocal_leveling: f32,
     pub noise: Noise,
     /// Acoustic echo cancellation for use with speakers instead of headphones.
     pub echo: bool,
@@ -102,6 +106,8 @@ impl Default for Settings {
             silence_threshold: 0.0032,
             index_ratio: 0.0,
             protect: 0.5,
+            pitch_correct: 0.0,
+            vocal_leveling: 0.0,
             noise: Noise::Off,
             echo: false,
             f0_detector: F0Detector::Rmvpe,
@@ -132,11 +138,15 @@ impl Settings {
             || !(0.0..=1.0).contains(&self.index_ratio)
             || !self.protect.is_finite()
             || !(0.0..=0.5).contains(&self.protect)
+            || !self.pitch_correct.is_finite()
+            || !(0.0..=1.0).contains(&self.pitch_correct)
+            || !self.vocal_leveling.is_finite()
+            || !(0.0..=1.0).contains(&self.vocal_leveling)
             || !self.silence_threshold.is_finite()
             || !(0.0..=1.0).contains(&self.silence_threshold)
             || self.speaker_id < 0
         {
-            bail!("Invalid gain, pitch, speaker, index ratio, protect, or silence threshold");
+            bail!("Invalid gain, pitch, speaker, index ratio, protect, leveling, or silence threshold");
         }
         Ok(())
     }
