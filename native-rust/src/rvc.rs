@@ -35,7 +35,7 @@ fn open_session(file: &Path, threads: usize, device: Device) -> Result<Session> 
                 .with_tf32(false)
                 .build()
                 .error_on_failure()])
-            .context("GPU (CUDA) is selected but CUDA could not start; use the GPU (CUDA) download with CUDA 12 and cuDNN 9 installed, or choose another device")?,
+            .context("GPU (CUDA) is selected but CUDA could not start; press Set up CUDA in Settings to download its NVIDIA libraries (or install CUDA 12 and cuDNN 9), or choose another device")?,
         // DirectML needs sequential execution without memory patterns.
         Device::DirectMl => builder
             .with_memory_pattern(false)?

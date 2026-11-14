@@ -20,8 +20,9 @@ audio = ["dep:cpal", "dep:crossbeam-queue"]
 onnx = ["dep:ort", "ort/load-dynamic", "ort/cuda"]
 onnx-static = ["dep:ort"]
 android = ["gui", "audio", "eframe/android-native-activity"]
-# Search and download voices from voice-models.com.
-catalog = ["dep:ureq", "dep:sha2", "export"]
+# Search and download voices from voice-models.com, the shared models and the
+# NVIDIA CUDA libraries.
+catalog = ["dep:ureq", "dep:sha2", "export", "dep:tar", "dep:lzma-rs"]
 
 [dependencies]
 anyhow = "1"
@@ -45,6 +46,9 @@ env_logger = { version = "0.11", default-features = false, features = ["auto-col
 ureq = { version = "2", optional = true }
 # Checks downloaded models against their published SHA-256.
 sha2 = { version = "0.10", optional = true }
+# Unpack NVIDIA's Linux CUDA archives (.tar.xz) for the CUDA setup.
+tar = { version = "0.4", default-features = false, optional = true }
+lzma-rs = { version = "0.3", optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }

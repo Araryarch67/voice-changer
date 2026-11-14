@@ -47,4 +47,5 @@ cargo test
 - `models/`, `runtime/` and `target/` are git-ignored. Voices are `models/<name>/model.json` manifests; `runtime/` holds the ONNX Runtime shared library.
 - The UI is Material 3. Colours, type, icons and components are in `src/m3.rs`; screens are in `src/app.rs`. Every option shows a plain-language hint, so add one with any new control.
 - GPU uses the CUDA execution provider and needs a GPU build of ONNX Runtime with matching CUDA and cuDNN libraries. CPU must keep working without them.
+- The command line (`voice-changer-native --help`) is `src/cli.rs`: subcommands with `--json` output and fixed exit codes, documented in `native-rust/README.md`. Give new features that work without a window a subcommand there too, with its help text and tests.
 - `tools/preview.sh` renders the GUI headlessly to a PNG; use it to check UI changes.

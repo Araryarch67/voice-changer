@@ -47,7 +47,7 @@ impl Setup {
     }
 }
 
-fn megabytes(bytes: u64) -> String {
+pub(super) fn megabytes(bytes: u64) -> String {
     format!("{:.0} MB", bytes as f64 / 1_048_576.0)
 }
 
@@ -425,7 +425,7 @@ fn model_row(
 
 /// M3 linear progress indicator: active track, a gap, the inactive track and its
 /// stop dot.
-fn linear_progress(ui: &mut egui::Ui, fraction: f32) {
+pub(super) fn linear_progress(ui: &mut egui::Ui, fraction: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 8.0), Sense::hover());
     let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 4.0));
     let x = egui::lerp(track.left()..=track.right(), fraction.clamp(0.0, 1.0));

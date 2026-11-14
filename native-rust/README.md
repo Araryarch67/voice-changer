@@ -20,10 +20,10 @@ The application does not launch Python, a browser, or a server. It uses eframe/e
 - Pitch detection with RMVPE, CREPE (`crepe_full.onnx` / `crepe_tiny.onnx` beside the RMVPE model), FCPE (`fcpe.onnx` beside the RMVPE model), WORLD's Harvest and DIO, or built-in YIN. CREPE, Harvest and DIO reproduce the reference's output on the same audio. The reference runs FCPE through PyTorch, so the voice engine dialog offers an ONNX export of the same weights ([Scicom-intl/fcpe-onnx](https://huggingface.co/Scicom-intl/fcpe-onnx), MIT), decoded as the reference decodes it.
 - Built-in virtual microphone on Linux: **Settings → Virtual microphone** creates a "Voice Changer Mic" input (a null sink plus a remapped monitor source, through `pactl` on PipeWire or PulseAudio) that Discord, OBS or games can select. It stays while you are logged in, even with the app closed, so those apps never lose it and fall back to the real microphone; it carries silence while the voice changer is off. While the app is open, a guard checks every second that the microphone still reads only the app's output and moves it back (or mutes it) otherwise. Switching the option off removes it.
 - Optional CUDA execution provider, selected in Settings when the loaded ONNX Runtime is a GPU build with matching CUDA and cuDNN libraries (on Arch: `onnxruntime-cuda` and `cudnn`, with `ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so`); a CPU runtime only offers CPU.
-- Offline WAV conversion and CLI device enumeration.
+- A command line for scripts and AI agents (`--json` output, exit codes, no prompts): voice import and deletion, shared model downloads, device listing, offline WAV conversion and live conversion.
 - Android NativeActivity entry point and runtime microphone permission request; iOS entry point, permission/audio-session integration and XcodeGen project.
 
-This is **not yet feature parity** with the reference. non-standard RVC checkpoint architectures (and the WebUI `params` checkpoint format), FAISS index types other than L2 IVF-Flat, FP16 model inputs, the FCPE pitch detector, training, soundboard and the other VC engines are not implemented. Model import currently accepts a JSON path, rather than downloading models; checkpoints are converted with `--export-rvc` (below). The portable bank does exhaustive nearest-neighbor search and is intended for small banks; IVF indexes search the stored `nprobe` closest lists, like the reference.
+This is **not yet feature parity** with the reference. non-standard RVC checkpoint architectures (and the WebUI `params` checkpoint format), FAISS index types other than L2 IVF-Flat, FP16 model inputs, the FCPE pitch detector, training, soundboard and the other VC engines are not implemented. Model import currently accepts a JSON path, rather than downloading models; checkpoints are converted with `--export-rvc` or `voices import` (below). The portable bank does exhaustive nearest-neighbor search and is intended for small banks; IVF indexes search the stored `nprobe` closest lists, like the reference.
 
 ## Run on desktop
 
@@ -33,7 +33,7 @@ On Windows, run the setup executable; it installs for the current user and adds 
 
 The standard Windows download (`voice-changer-windows-x64`) includes the DirectML build of ONNX Runtime, so any DirectX 12 GPU (NVIDIA, AMD or Intel) can be used with nothing else to install: choose **GPU (DirectML)** in Settings. On laptops with two GPUs the discrete one is used, and Settings shows its name. DirectML is usually somewhat slower than CUDA on NVIDIA.
 
-For the fastest NVIDIA path on Windows, use `voice-changer-windows-x64-cuda-setup.exe` (or its ZIP) instead. It bundles the CUDA build of ONNX Runtime 1.22, which needs a recent NVIDIA driver, [CUDA 12.x](https://developer.nvidia.com/cuda-downloads) and [cuDNN 9.x for CUDA 12](https://developer.nvidia.com/cudnn-downloads) installed separately. The app adds cuDNN's install folder (`C:\Program Files\NVIDIA\CUDNN\v9.*\bin\12.*`) and `%CUDA_PATH%\bin` to its search path, so they do not have to be on `PATH`; DLLs copied into the app's `lib\` folder also work. A GPU is selected automatically on first launch (CUDA first, then DirectML); if CUDA cannot start, Start reports it instead of quietly using the CPU, and CPU can still be chosen in Settings. RTX 50 (Blackwell) GPUs need driver 570 or newer, CUDA 12.8+ and cuDNN 9.8+; the first conversion on them is slower while CUDA compiles its kernels, which are then cached. To check that the GPU is used, compare `voice-changer-native --benchmark models/<voice>/model.json 250 20 cuda` (or `directml`) with the same command ending in `cpu`.
+For the fastest NVIDIA path on Windows, use `voice-changer-windows-x64-cuda-setup.exe` (or its ZIP) instead. It bundles the CUDA build of ONNX Runtime 1.22, which needs a recent NVIDIA driver, [CUDA 12.x](https://developer.nvidia.com/cuda-downloads) and [cuDNN 9.x for CUDA 12](https://developer.nvidia.com/cudnn-downloads) installed separately, or let the app fetch them: when an NVIDIA driver is present and these libraries are missing, **Settings → Processing → Set up CUDA** (also offered under the error when CUDA cannot start) downloads only the libraries ONNX Runtime loads (CUDA runtime, cuBLAS and cuFFT 12.9, cuDNN 9.12; about 1.2 GB) from NVIDIA's redistributable archives, after showing NVIDIA's license agreements. Each archive is checked against NVIDIA's published size and SHA-256, and the libraries go to `%LOCALAPPDATA%\voice-changer\cuda12` (`${XDG_DATA_HOME:-~/.local/share}/voice-changer/cuda12` on Linux, which also gets cuRAND and NVRTC); delete that folder to remove them. CUDA is retried right after, so Start works without a restart unless the app says otherwise. The app adds cuDNN's install folder (`C:\Program Files\NVIDIA\CUDNN\v9.*\bin\12.*`) and `%CUDA_PATH%\bin` to its search path, so they do not have to be on `PATH`; DLLs copied into the app's `lib\` folder also work. A GPU is selected automatically on first launch (CUDA first, then DirectML); if CUDA cannot start, Start reports it instead of quietly using the CPU, and CPU can still be chosen in Settings. RTX 50 (Blackwell) GPUs need driver 570 or newer, CUDA 12.8+ and cuDNN 9.8+; the first conversion on them is slower while CUDA compiles its kernels, which are then cached. To check that the GPU is used, compare `voice-changer-native --benchmark models/<voice>/model.json 250 20 cuda` (or `directml`) with the same command ending in `cpu`.
 
 Use a recent stable Rust toolchain. On Linux install the ALSA development package and a working Vulkan or OpenGL driver; Wayland and X11 are enabled. Windows uses WASAPI.
 
@@ -85,17 +85,53 @@ RVC v1 needs the embedder's projected layer-9 features (256 channels); v2 needs 
 
 `feature_bank`, when set, is either an RVC training index (`added_IVF*_Flat_*.index`, a FAISS `IndexIVFFlat` with L2 metric and in-memory lists; other FAISS index types are rejected) or a binary sequence of little-endian float32 rows with `channels` values per row. Its vectors must match the voice. Like the reference pipeline, retrieval takes the single nearest stored vector (k=1) from the index's `nprobe` closest lists; when those lists are all empty it scans every list instead of returning FAISS's id -1. Set retrieval ratio to zero when no bank is available.
 
-## CLI
+## Command line
+
+Run without arguments, the program opens the GUI. With a command it works without a window, so scripts and AI agents can use everything the GUI does. `voice-changer-native --help` lists the commands and `voice-changer-native COMMAND --help` explains one (from source: `cargo run --release -- COMMAND ...`).
+
+| Command | What it does |
+| --- | --- |
+| `status` | Version, models folders, whether the voice engine is installed, voice count, ONNX Runtime and the execution devices it offers (`cpu`, `cuda`, `directml`) |
+| `setup status` / `setup download [MODEL...] [--all]` | Shared models in `models/shared/`: `contentvec` and `rmvpe` (required), `crepe_tiny`, `crepe_full`, `fcpe` (optional). With no names, downloads the recommended set; each file is checked against its size and SHA-256 |
+| `voices list` / `voices show VOICE` | Installed voices: name, id (folder name), manifest, sample rate, v1/v2, pitch, index, whether it can be deleted |
+| `voices import FILE [--index FILE.index] [--name NAME]` | Imports an RVC `.pth` or a `.zip` holding one, like **Import model** |
+| `voices set-index VOICE (INDEX \| --none)` | Replaces or removes a voice's index |
+| `voices delete VOICE --yes` | Deletes the voice's folder (only folders directly inside a models folder, never `shared`) |
+| `devices [--input \| --output]` | Audio device IDs and names |
+| `convert VOICE IN.wav OUT.wav [SETTINGS]` | Converts a WAV file; `--analyze` also writes diagnostics, `--overwrite` replaces OUT.wav |
+| `live VOICE [--input DEV] [--output DEV] [--monitor DEV\|default] [--virtual-mic] [--duration S] [SETTINGS]` | Real-time conversion until `--duration` ends or the process is stopped |
+| `analyze IN.wav [OUT.wav]` | JSON and PNG diagnostics for a recording or an input/output pair |
+| `export-rvc MODEL.pth OUT.onnx [--realtime]` | Checkpoint to ONNX only, without a voice folder |
+| `benchmark VOICE [--blocks N] [SETTINGS]` | Times conversion on a device; a real-time factor below 1 keeps up |
+
+`VOICE` is a voice's name or folder name as `voices list` shows them (case does not matter), a voice folder, or a `model.json` path. A device is an ID from `devices`, its exact name, or a unique part of the name.
+
+The settings flags use the GUI's options; the reference's names are in brackets: `--semitones` [TUNE], `--index-ratio` [INDEX], `--f0 rmvpe|fcpe|crepe_tiny|crepe_full|harvest|dio|yin` [F0 Det.], `--protect`, `--block-ms` [CHUNK], `--context-ms` [EXTRA], `--overlap-ms`, `--search-ms`, `--silence-threshold` [S.Thresh], `--noise off|sup1|sup2` [NOISE], `--input-gain`, `--output-gain` [GAIN], `--speaker-id`, `--echo`, and `--device cpu|cuda|directml|auto` [GPU]. `--settings FILE.json` starts from a JSON object with the same fields in snake_case, and flags given with it override it. Values are checked before anything runs.
+
+WAV input is downmixed to mono; output is mono PCM16 at the input sample rate. Inference runs in blocks, including warm-up/context and crossfade, so the output is not sample-aligned with the source.
+
+### For AI agents and scripts
+
+- Add `--json` anywhere on the line. stdout then holds exactly one JSON object, `{"ok":true,"data":{...}}` on success or `{"ok":false,"error":{"kind":"usage"|"failure","message":"..."}}` on failure. Logs and download progress go to stderr; `-q` silences progress and `-v` adds log lines.
+- Exit codes: `0` success, `1` the command ran and failed (missing file, model error, download failure), `2` the command line is wrong (unknown command or option, a value out of range, a missing `--yes`, an existing output without `--overwrite`).
+- Nothing waits for input. `voices delete` requires `--yes`; `convert` never replaces a file without `--overwrite`.
+- `live --json` prints one JSON object per line: `{"event":"ready",...}` when audio flows, `{"event":"status",...}` every `--status-every` seconds (levels, processing time per block, dropped samples), then the final `{"ok":...}` object when `--duration` ends or audio fails. Stopping it with a signal ends it without the final object, so give `--duration` when the result matters.
+- Paths in the output are absolute.
+
+A typical first run:
 
 ```sh
-cargo run --release -- --devices
-cargo run --release -- --bypass input.wav output.wav
-cargo run --release -- --convert examples/model.json input.wav output.wav 12
-# Optional fifth argument: index/retrieval ratio 0..1 (needs feature_bank)
-cargo run --release -- --convert examples/model.json input.wav output.wav 12 0.75
+voice-changer-native status --json               # is engine_ready true?
+voice-changer-native setup download --json       # ContentVec, RMVPE, CREPE tiny
+voice-changer-native voices import kobo.zip --name Kobo --json
+voice-changer-native voices list --json
+voice-changer-native convert Kobo in.wav out.wav --semitones 12 --index-ratio 0.75 --f0 rmvpe --json
+voice-changer-native devices --json
+voice-changer-native live Kobo --input "Microphone" --output "CABLE Input" --duration 60 --json
+voice-changer-native voices delete Kobo --yes --json
 ```
 
-WAV input is downmixed to mono; output is mono PCM16 at the input sample rate. Inference is performed in blocks, including warm-up/context and crossfade behavior, so output should not be treated as sample-aligned ground truth for the source recording.
+The older flag-style commands still work for existing scripts: `--devices`, `--bypass IN.wav OUT.wav`, `--convert MODEL.json IN.wav OUT.wav [SEMITONES [INDEX_RATIO]] [...]`, `--analyze`, `--benchmark` and `--export-rvc`.
 
 ## Mobile
 
@@ -157,6 +193,6 @@ On Windows, run `target/debug/examples/capture OUT.png 1100 760` directly; it op
 
 ## Source map
 
-`app.rs` owns the egui UI; `audio.rs` owns device streams, bounded queues and the worker; `engine.rs` applies gains/bypass and enforces output validity; `rvc.rs` implements the ONNX conversion pipeline; `dsp.rs` contains resampling and SOLA; `retrieval.rs` reads FAISS IVF-Flat indexes and feature banks; `pth.rs` reads PyTorch checkpoints; `export.rs` converts RVC checkpoints to ONNX; `platform.rs` handles mobile permissions/audio sessions; `wav.rs` provides offline conversion.
+`app.rs` owns the egui UI; `audio.rs` owns device streams, bounded queues and the worker; `engine.rs` applies gains/bypass and enforces output validity; `rvc.rs` implements the ONNX conversion pipeline; `dsp.rs` contains resampling and SOLA; `retrieval.rs` reads FAISS IVF-Flat indexes and feature banks; `pth.rs` reads PyTorch checkpoints; `export.rs` converts RVC checkpoints to ONNX; `platform.rs` handles mobile permissions/audio sessions; `wav.rs` provides offline conversion; `cli.rs` is the command line.
 
 The original `reference/server/` and `reference/client/` (git-ignored) remain reference code. Existing upstream licenses in the repository remain applicable to those sources and any derivatives. No pretrained voice weights or third-party product branding are included.

@@ -28,7 +28,24 @@ pub fn import_pair(checkpoint: &Path, index: Option<&Path>) -> Result<PathBuf> {
     import_pair_into(&root, checkpoint, index)
 }
 
-fn import_pair_into(root: &Path, checkpoint: &Path, index: Option<&Path>) -> Result<PathBuf> {
+/// Imports `source` (a `.pth` or a `.zip` holding one) as a voice, optionally with an
+/// index the caller chose (only with a `.pth`) and a display name; the command line's
+/// `voices import`. Without `index`, a `.pth` takes the index beside it, like
+/// [`import_voice`].
+pub fn import_with(source: &Path, index: Option<&Path>, name: Option<&str>) -> Result<PathBuf> {
+    let root = runtime::models_root().context(
+        "The voice engine (shared/contentvec.onnx and shared/rmvpe.onnx) is not set up yet; run `setup download` first",
+    )?;
+    match index {
+        Some(_) => {
+            validate_pair(source, index)?;
+            import_checkpoint(&root, source, index, false, name)
+        }
+        None => import_named(&root, source, name),
+    }
+}
+
+fn validate_pair(checkpoint: &Path, index: Option<&Path>) -> Result<()> {
     let has = |path: &Path, wanted: &str| {
         path.extension()
             .is_some_and(|e| e.eq_ignore_ascii_case(wanted))
@@ -50,6 +67,11 @@ fn import_pair_into(root: &Path, checkpoint: &Path, index: Option<&Path>) -> Res
             index.display()
         );
     }
+    Ok(())
+}
+
+fn import_pair_into(root: &Path, checkpoint: &Path, index: Option<&Path>) -> Result<PathBuf> {
+    validate_pair(checkpoint, index)?;
     import_checkpoint(root, checkpoint, index, false, None)
 }
 

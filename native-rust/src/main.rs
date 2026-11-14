@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use voice_changer::{
-    analyze,
+    analyze, cli,
     config::{Device, F0Detector, Noise, Settings},
     engine::{self, Engine},
 };
@@ -203,6 +203,30 @@ fn run_convert(args: &[String]) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Subcommands (`voices list`, `convert`, ...) and `--help`; no arguments opens the
+    // GUI and the older `--flag` commands below keep working.
+    let legacy = args
+        .first()
+        .is_some_and(|first| cli::LEGACY_FLAGS.contains(&first.as_str()));
+    if !args.is_empty() && !legacy {
+        let code = match cli::parse(&args) {
+            Ok(invocation) => {
+                // Only warnings on stderr unless asked, so scripts see a quiet stream.
+                let filter = if invocation.verbose {
+                    "warn,voice_changer=info"
+                } else {
+                    "warn,ort=error"
+                };
+                env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(filter))
+                    .format_timestamp_millis()
+                    .init();
+                cli::execute(&invocation)
+            }
+            Err(error) => cli::report_usage_error(args.iter().any(|a| a == "--json"), &error),
+        };
+        std::process::exit(code);
+    }
     // The terminal shows what the app does; RUST_LOG=debug shows more, RUST_LOG=warn less.
     env_logger::Builder::from_env(
         // Graphics libraries only report real failures; their warnings are noise here.
@@ -218,10 +242,13 @@ fn main() -> Result<()> {
         std::env::consts::OS,
         std::env::consts::ARCH
     );
-    let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--benchmark") if (2..=5).contains(&args.len()) => {
-            let block_ms = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(Settings::default().block_ms);
+            let block_ms = args
+                .get(2)
+                .map(|s| s.parse())
+                .transpose()?
+                .unwrap_or(Settings::default().block_ms);
             let blocks = args.get(3).map(|s| s.parse()).transpose()?.unwrap_or(6);
             let device = match args.get(4).map(String::as_str) {
                 None | Some("cpu") => Device::Cpu,
@@ -229,27 +256,54 @@ fn main() -> Result<()> {
                 Some("directml") => Device::DirectMl,
                 Some(other) => bail!("Unknown device {other}; use cpu, cuda or directml"),
             };
-            let settings = Settings { block_ms, device, ..Settings::default() };
-            println!("{}", serde_json::to_string_pretty(&voice_changer::benchmark::run(Path::new(&args[1]), &settings, blocks)?)?);
+            let settings = Settings {
+                block_ms,
+                device,
+                ..Settings::default()
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&voice_changer::benchmark::run(
+                    Path::new(&args[1]),
+                    &settings,
+                    blocks
+                )?)?
+            );
         }
         Some("--analyze") => run_analyze(&args[1..])?,
-        Some("--help" | "-h") => println!(
-            "Voice Changer\n  (no arguments)              Open egui app\n  --devices                   List audio device IDs\n  --convert MODEL.json IN.wav OUT.wav [SEMITONES [INDEX_RATIO]] [--gpu|--directml|--cpu] [--block-ms MS] [--context-ms MS] [--f0 METHOD] [--protect VAL] [--analyze]\n  --analyze IN.wav [OUT.wav] [--out PREFIX]  Generate JSON + PNG waveform/spectrogram/pitch diagnostics\n  --benchmark MODEL.json [BLOCK_MS [BLOCKS [cpu|cuda|directml]]]  Time conversion on a device\n  --bypass IN.wav OUT.wav      Test audio pipeline without models\n  --export-rvc MODEL.pth OUT.onnx [--realtime]  Convert an RVC v2 checkpoint to ONNX\n\nONNX: set ORT_DYLIB_PATH to ONNX Runtime 1.22 shared library."
-        ),
         Some("--export-rvc") if args.len() == 3 || (args.len() == 4 && args[3] == "--realtime") => {
             #[cfg(feature = "export")]
-            println!("{}", serde_json::to_string(&voice_changer::export::export_rvc(Path::new(&args[1]), Path::new(&args[2]), args.len() == 4)?)?);
+            println!(
+                "{}",
+                serde_json::to_string(&voice_changer::export::export_rvc(
+                    Path::new(&args[1]),
+                    Path::new(&args[2]),
+                    args.len() == 4
+                )?)?
+            );
             #[cfg(not(feature = "export"))]
             bail!("Build with the export feature");
         }
         Some("--devices") => {
             #[cfg(feature = "audio")]
-            for device in voice_changer::audio::devices()? { println!("{}\t{}\t{}", if device.input { "input" } else { "output" }, device.id, device.name); }
+            for device in voice_changer::audio::devices()? {
+                println!(
+                    "{}\t{}\t{}",
+                    if device.input { "input" } else { "output" },
+                    device.id,
+                    device.name
+                );
+            }
             #[cfg(not(feature = "audio"))]
             bail!("Build with the audio feature");
         }
         Some("--bypass") if args.len() == 3 => {
-            voice_changer::wav::convert(&mut Engine::new(None), Path::new(&args[1]), Path::new(&args[2]), &Settings::default())?;
+            voice_changer::wav::convert(
+                &mut Engine::new(None),
+                Path::new(&args[1]),
+                Path::new(&args[2]),
+                &Settings::default(),
+            )?;
         }
         Some("--convert") => run_convert(&args[1..])?,
         None => {
@@ -260,16 +314,22 @@ fn main() -> Result<()> {
                 viewport: eframe::egui::ViewportBuilder::default()
                     .with_title("Voice Changer")
                     .with_app_id("voice-changer")
-                    .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/hicolor/256x256/apps/voice-changer.png")).expect("bundled icon is a valid PNG"))
+                    .with_icon(
+                        eframe::icon_data::from_png_bytes(include_bytes!(
+                            "../assets/hicolor/256x256/apps/voice-changer.png"
+                        ))
+                        .expect("bundled icon is a valid PNG"),
+                    )
                     .with_inner_size([1060.0, 760.0])
                     .with_min_inner_size([360.0, 540.0]),
                 // In the middle of the screen the first time; after that the window
                 // comes back where it was left.
                 centered: true,
                 ..Default::default()
-            }).map_err(|e| anyhow::anyhow!("{e}"))?;
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             #[cfg(not(feature = "gui"))]
-            bail!("GUI disabled; use --help for CLI options");
+            bail!("This build has no GUI; run with --help for the command line");
         }
         _ => bail!("Unknown arguments; use --help"),
     }

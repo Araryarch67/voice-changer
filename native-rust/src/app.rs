@@ -11,6 +11,8 @@ use std::{path::PathBuf, sync::mpsc};
 
 #[cfg(feature = "catalog")]
 mod browse;
+#[cfg(all(feature = "catalog", any(feature = "onnx", feature = "onnx-static")))]
+mod cuda;
 #[cfg(feature = "catalog")]
 mod setup;
 
@@ -135,6 +137,9 @@ pub struct VoiceApp {
     /// Downloads the shared models on first start.
     #[cfg(feature = "catalog")]
     setup: setup::Setup,
+    /// Downloads NVIDIA's CUDA libraries when GPU (CUDA) is missing them.
+    #[cfg(all(feature = "catalog", any(feature = "onnx", feature = "onnx-static")))]
+    cuda: cuda::CudaSetup,
     import_checkpoint: String,
     import_index: String,
     file_output: String,
@@ -222,6 +227,8 @@ impl VoiceApp {
             browse: Default::default(),
             #[cfg(feature = "catalog")]
             setup: setup::Setup::on_start(),
+            #[cfg(all(feature = "catalog", any(feature = "onnx", feature = "onnx-static")))]
+            cuda: Default::default(),
             import_checkpoint: String::new(),
             import_index: String::new(),
             file_output: String::new(),
@@ -1711,6 +1718,8 @@ impl VoiceApp {
             } else {
                 t("Only the CPU is available with this ONNX Runtime. On Windows, the standard download includes DirectML for any GPU.")
             }));
+            #[cfg(all(feature = "catalog", any(feature = "onnx", feature = "onnx-static")))]
+            self.cuda_status(ui);
             #[cfg(feature = "catalog")]
             self.setup_status(ui);
         });
@@ -2530,6 +2539,13 @@ impl eframe::App for VoiceApp {
                 self.setup_dialog(ctx);
             }
         }
+        #[cfg(all(feature = "catalog", any(feature = "onnx", feature = "onnx-static")))]
+        {
+            self.poll_cuda_setup(ctx);
+            if self.cuda.open {
+                self.cuda_dialog(ctx);
+            }
+        }
         self.show_toast(ctx);
         if self.running() || self.work.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
@@ -2609,6 +2625,8 @@ impl VoiceApp {
         }) {
             self.error = None;
         }
+        #[cfg(all(feature = "catalog", any(feature = "onnx", feature = "onnx-static")))]
+        self.cuda_offer(ui);
         if self.message.is_some() || self.error.is_some() {
             ui.add_space(8.0);
         }

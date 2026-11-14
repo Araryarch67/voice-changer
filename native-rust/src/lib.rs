@@ -6,7 +6,10 @@ pub mod audio;
 pub mod benchmark;
 #[cfg(feature = "catalog")]
 pub mod catalog;
+pub mod cli;
 pub mod config;
+#[cfg(feature = "catalog")]
+pub mod cuda_setup;
 pub mod denoise;
 pub mod dsp;
 pub mod echo;

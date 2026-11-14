@@ -196,6 +196,8 @@ pub fn preload_gpu_libraries() {
     #[cfg(target_os = "linux")]
     {
         use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
+        // Not once: the app's CUDA folder can be filled while it runs.
+        preload_cuda_folder();
         static LOADED: std::sync::Once = std::sync::Once::new();
         LOADED.call_once(|| {
             // SAFETY: cuDNN's initialisers have no preconditions; the handle is leaked
@@ -209,10 +211,188 @@ pub fn preload_gpu_libraries() {
     }
 }
 
+/// The folder the app downloads NVIDIA's CUDA 12 and cuDNN 9 libraries into
+/// (`cuda_setup`), per user so it is writable wherever the app is installed:
+/// `%LOCALAPPDATA%\voice-changer\cuda12` on Windows,
+/// `${XDG_DATA_HOME:-~/.local/share}/voice-changer/cuda12` on Linux.
+pub fn cuda_library_folder() -> Option<PathBuf> {
+    let data = if cfg!(target_os = "windows") {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "linux") {
+        std::env::var_os("XDG_DATA_HOME")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+            })
+    } else {
+        None
+    }?;
+    Some(data.join("voice-changer").join("cuda12"))
+}
+
+/// The CUDA and cuDNN libraries the CUDA build of ONNX Runtime 1.22 loads, in an
+/// order where each one's dependencies come before it. From the imports of
+/// `onnxruntime_providers_cuda` (Windows: cuBLAS, cuFFT, the CUDA runtime and cuDNN;
+/// Linux adds cuRAND and NVRTC), plus the parts cuDNN loads by itself.
+pub fn cuda_libraries() -> &'static [&'static str] {
+    if cfg!(target_os = "windows") {
+        &[
+            "cudart64_12.dll",
+            "cublasLt64_12.dll",
+            "cublas64_12.dll",
+            "cufft64_11.dll",
+            "cudnn_graph64_9.dll",
+            "cudnn_engines_precompiled64_9.dll",
+            "cudnn_engines_runtime_compiled64_9.dll",
+            "cudnn_heuristic64_9.dll",
+            "cudnn_ops64_9.dll",
+            "cudnn_cnn64_9.dll",
+            "cudnn_adv64_9.dll",
+            "cudnn64_9.dll",
+        ]
+    } else if cfg!(target_os = "linux") {
+        &[
+            "libcudart.so.12",
+            "libcublasLt.so.12",
+            "libcublas.so.12",
+            "libcurand.so.10",
+            "libcufft.so.11",
+            "libnvrtc-builtins.so.12.9",
+            "libnvrtc.so.12",
+            "libcudnn_graph.so.9",
+            "libcudnn_engines_precompiled.so.9",
+            "libcudnn_engines_runtime_compiled.so.9",
+            "libcudnn_heuristic.so.9",
+            "libcudnn_ops.so.9",
+            "libcudnn_cnn.so.9",
+            "libcudnn_adv.so.9",
+            "libcudnn.so.9",
+        ]
+    } else {
+        &[]
+    }
+}
+
+/// The libraries the CUDA provider needs that cannot be found; empty when CUDA
+/// has everything. The cuDNN parts it loads by itself are only checked through
+/// cuDNN, as a separate install may split them differently.
+pub fn missing_cuda_libraries() -> Vec<&'static str> {
+    preload_gpu_libraries();
+    let needed = cuda_libraries()
+        .iter()
+        .copied()
+        .filter(|name| !name.contains("cudnn_") && !name.contains("nvrtc-builtins"));
+    #[cfg(target_os = "windows")]
+    {
+        // Windows also searches the executable's folder.
+        let folders: Vec<PathBuf> = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(PathBuf::from))
+            .into_iter()
+            .chain(
+                std::env::var_os("PATH")
+                    .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            )
+            .collect();
+        needed
+            .filter(|name| !folders.iter().any(|folder| folder.join(name).is_file()))
+            .collect()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use libloading::os::unix::{Library, RTLD_LAZY};
+        // SAFETY: only CUDA's own libraries, whose initialisers have no preconditions.
+        needed
+            .filter(|name| unsafe { Library::open(Some(*name), RTLD_LAZY) }.is_err())
+            .collect()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        needed.collect()
+    }
+}
+
+/// Whether an NVIDIA driver is installed: the CUDA driver library it ships.
+pub fn nvidia_driver_present() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let system = std::env::var_os("SystemRoot")
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from)
+            .join("System32");
+        system.join("nvcuda.dll").is_file()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use libloading::os::unix::{Library, RTLD_LAZY};
+        // SAFETY: the driver library's initialisers have no preconditions.
+        unsafe { Library::open(Some("libcuda.so.1"), RTLD_LAZY) }.is_ok()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+/// Starts the CUDA execution provider without a model, which loads its libraries;
+/// the error says what is missing.
+#[cfg(any(feature = "onnx", feature = "onnx-static"))]
+pub fn check_cuda() -> Result<()> {
+    use ort::{execution_providers::CUDAExecutionProvider, session::Session};
+    std::panic::catch_unwind(|| -> Result<()> {
+        initialize()?;
+        preload_gpu_libraries();
+        Session::builder()?
+            .with_execution_providers([CUDAExecutionProvider::default().build().error_on_failure()])
+            .context("Start CUDA")?;
+        Ok(())
+    })
+    .unwrap_or_else(|_| anyhow::bail!("ONNX Runtime stopped while starting CUDA"))
+}
+
+/// Loads the libraries in the app's CUDA folder by their full paths, so the CUDA
+/// provider finds them by name (`LD_LIBRARY_PATH` is only read at start). Each stays
+/// loaded for the life of the process. One whose dependencies are not loaded yet is
+/// tried again after the others.
+#[cfg(target_os = "linux")]
+fn preload_cuda_folder() {
+    use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
+    use std::sync::Mutex;
+    static LOADED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let Some(folder) = cuda_library_folder() else {
+        return;
+    };
+    let Ok(mut loaded) = LOADED.lock() else {
+        return;
+    };
+    loop {
+        let mut progressed = false;
+        for name in cuda_libraries() {
+            let path = folder.join(name);
+            if loaded.contains(name) || !path.is_file() {
+                continue;
+            }
+            // SAFETY: NVIDIA's libraries from the pinned archives; their initialisers
+            // have no preconditions.
+            if let Ok(library) = unsafe { Library::open(Some(&path), RTLD_NOW | RTLD_GLOBAL) } {
+                std::mem::forget(library);
+                loaded.push(name);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+}
+
 /// Folders that hold the CUDA and cuDNN DLLs on Windows, newest cuDNN first.
 #[cfg(target_os = "windows")]
 fn cuda_folders() -> Vec<PathBuf> {
     let mut folders = Vec::new();
+    // Searched even before it exists, so libraries downloaded later are found.
+    folders.extend(cuda_library_folder());
     if let Some(ort_dir) = std::env::var_os("ORT_DYLIB_PATH")
         .map(PathBuf::from)
         .and_then(|path| path.parent().map(PathBuf::from))
