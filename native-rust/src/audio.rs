@@ -832,30 +832,17 @@ fn run_devices(
             monitor.push(&processed);
         }
         let processed = rate_converter.push(&processed);
-        // A quarter block of lead silence, so a block that takes longer than the
-        // first one does not run the output dry.
-        let lead = output_rate as usize * live.settings.block_ms as usize / 4000;
-        if !output_started {
-            for _ in 0..lead {
-                let _ = output.push(0.0);
-            }
-        } else if output.len() > lead * 2 {
-            // Just before a block is added the queue holds about the lead. More means
-            // the output fell behind: it played silence through a slow block, or the
-            // output device's clock runs slower than the microphone's. Drop the oldest
-            // audio so the delay returns to the lead instead of growing for good.
-            while output.len() > lead {
-                if output.pop().is_some() {
-                    metrics.dropped_output.fetch_add(1, Ordering::Relaxed);
-                }
-            }
+        let max_queued = (output_rate as usize * live.settings.block_ms as usize / 1000) * 3;
+        let lead_silence = if output_started {
+            0
+        } else {
+            output_rate as usize * live.settings.block_ms as usize / 4000
+        };
+        let (dropped, queued_len) =
+            push_output_block(&output, &processed, lead_silence, max_queued);
+        if dropped > 0 {
+            metrics.dropped_output.fetch_add(dropped, Ordering::Relaxed);
         }
-        for sample in processed {
-            if output.push(sample).is_err() {
-                metrics.dropped_output.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        let queued_len = output.len();
         if let Some(active) = &mut recorder {
             active.record_block_health(took, queued_len);
         }
@@ -1060,5 +1047,60 @@ impl Monitor {
             }
             let _ = self.queue.push(sample);
         }
+    }
+}
+
+/// Enqueues `lead_silence` zeros and `processed` samples while capping total queue depth at `max_queued`.
+fn push_output_block(
+    output: &ArrayQueue<f32>,
+    processed: &[f32],
+    lead_silence: usize,
+    max_queued: usize,
+) -> (u64, usize) {
+    let incoming = processed.len().saturating_add(lead_silence);
+    let target_queued = max_queued.saturating_sub(incoming);
+    let mut dropped = 0u64;
+    while output.len() > target_queued {
+        if output.pop().is_some() {
+            dropped += 1;
+        } else {
+            break;
+        }
+    }
+    for _ in 0..lead_silence {
+        if output.push(0.0).is_err() {
+            dropped += 1;
+        }
+    }
+    for &sample in processed {
+        if output.push(sample).is_err() {
+            dropped += 1;
+        }
+    }
+    (dropped, output.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_queue_cap_includes_incoming_block() {
+        let block = 1200;
+        let max_queued = block * 3;
+        let q = ArrayQueue::new(block * 8);
+        // Pre-fill right up to 3 blocks, then push a 4th block: final length must stay <= 3 blocks.
+        let samples = vec![0.25_f32; block];
+        let (d1, len1) = push_output_block(&q, &samples, block / 4, max_queued);
+        assert_eq!(d1, 0);
+        assert_eq!(len1, block + block / 4);
+        let (_, _) = push_output_block(&q, &samples, 0, max_queued);
+        let (_, _) = push_output_block(&q, &samples, 0, max_queued);
+        let (dropped, len_final) = push_output_block(&q, &samples, 0, max_queued);
+        assert!(dropped > 0);
+        assert!(
+            len_final <= max_queued,
+            "queue exceeded 3-block cap: {len_final} > {max_queued}"
+        );
     }
 }
