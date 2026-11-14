@@ -3,6 +3,7 @@ pub mod analyze;
 pub mod app;
 #[cfg(feature = "audio")]
 pub mod audio;
+pub mod audio_file;
 pub mod benchmark;
 #[cfg(feature = "catalog")]
 pub mod catalog;
@@ -35,6 +36,8 @@ pub mod retrieval;
 pub mod runtime;
 #[cfg(any(feature = "onnx", feature = "onnx-static"))]
 pub mod rvc;
+#[cfg(any(feature = "onnx", feature = "onnx-static"))]
+pub mod separate;
 #[cfg(feature = "catalog")]
 pub mod setup;
 #[cfg(all(feature = "audio", target_os = "linux"))]

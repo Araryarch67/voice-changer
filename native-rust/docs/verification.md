@@ -50,6 +50,14 @@ Host: Windows 11 x86_64; Rust 1.100.
 - `cargo test`: all tests passed. `tests/fcpe.rs` (ignored by default) passed against the downloaded FCPE model with ONNX Runtime 1.22: tones with eight harmonics at 110, 220 and 440 Hz read within 1 %, silence read as unvoiced, and the pipeline ran with FCPE beside the synthetic voice. FCPE is unsure of a bare sine below about 120 Hz (peak salience 0.02 to 0.05), so the test uses harmonic tones.
 - GUI screenshots were taken on Windows with `examples/capture` from a folder of placeholder voices (empty ONNX files): Voices, Studio, Convert and Settings at 1100×760 and 390×844, menus open, in English and Indonesian. No voice was converted and no audio device was opened.
 
+## Update — vocal separation and covers (2026-11-14)
+
+- Kim Vocal 2 (`Kim_Vocal_2.onnx` from UVR's model repository, 66,759,214 bytes, SHA-256 `ce74ef3b…de9c8b`). Its settings were read from UVR's `mdx_model_data` by UVR's own model hash (MD5 of the last 10 MB, `970b3f94…`): `n_fft` 7680, `dim_f` 3072, `dim_t` 2^8, `compensate` 1.009.
+- Unit tests: the STFT and its inverse give back a test signal within 1e-3; the model tensor layout round-trips; stereo float and 16-bit WAV round-trip, mono fills both channels, a non-audio file is refused; the CLI parses `split` and `cover`.
+- `tests/separate.rs` (ignored by default) with the real model and ONNX Runtime 1.22 on CPU, release build: a synthetic sung vowel (pulse train with vibrato through "ah" formants) came out 97.7 % as vocals, a bass line with a kick drum 0.0 %, and the vocals separated from their mix differed from the vowel alone by 0.1 % of its energy; silence stays silent. 8 s of audio took about 2.6 s.
+- Release CLI on a 10 s synthetic song: `split` wrote both stems in 2.7 s; a second `split` without `--overwrite` was refused as a usage error; `cover` with the synthetic test voice from `tests/fixtures` (not a real voice), `--semitones 12 --keep-stems`, wrote the cover and three stems in 4.3 s.
+- Not checked: a real song and a real RVC voice (none on this machine), and the result's sound. The Split and Cover pages were checked as screenshots only (wide and narrow, English and Indonesian), without running a job from the window.
+
 ## Before 1.0: checks by hand
 
 None of these has been run with real audio yet. Each needs a real RVC voice, a microphone and headphones.
@@ -69,6 +77,7 @@ Voices and files
 - [ ] Find online: search, add a voice from Hugging Face, Google Drive and MediaFire.
 - [ ] Add slot past eight; move a card earlier and later and remove one (right-click, and press and hold on a touch screen); the selected voice and its tuning stay with it.
 - [ ] Convert: a WAV converts with the chosen voice and the report is written; dropping a `.wav` opens Convert with it.
+- [ ] Split and Cover on real songs (MP3 and WAV) with a real voice: the vocals and music are clean, the cover sounds in tune, Cancel stops a job, and CUDA/DirectML work for separation.
 
 Setup and settings
 - [ ] First start without models: the voice engine dialog downloads ContentVec and RMVPE; a failed download says which model failed.

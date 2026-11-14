@@ -28,6 +28,29 @@ pub fn read_mono(path: &Path) -> Result<(u32, Vec<f32>)> {
     Ok((spec.sample_rate, mono))
 }
 
+/// Converts mono `samples` at `sample_rate` block by block, as live audio is;
+/// `on_block` hears how many blocks are done out of how many.
+pub fn convert_samples(
+    engine: &mut Engine,
+    samples: &[f32],
+    sample_rate: u32,
+    settings: &Settings,
+    on_block: &mut dyn FnMut(usize, usize),
+) -> Result<Vec<f32>> {
+    settings.validate()?;
+    let block = (sample_rate as usize * settings.block_ms as usize / 1000).max(1);
+    let blocks = samples.len().div_ceil(block);
+    let mut converted = Vec::with_capacity(samples.len());
+    for (index, chunk) in samples.chunks(block).enumerate() {
+        let mut padded = chunk.to_vec();
+        padded.resize(block, 0.0);
+        let audio = engine.process(&padded, sample_rate, settings)?;
+        converted.extend_from_slice(&audio[..chunk.len()]);
+        on_block(index + 1, blocks);
+    }
+    Ok(converted)
+}
+
 pub fn convert(
     engine: &mut Engine,
     input: &Path,
@@ -43,15 +66,8 @@ pub fn convert(
         );
     }
     let (sample_rate, mono) = read_mono(input)?;
-    let block = (sample_rate as usize * settings.block_ms as usize / 1000).max(1);
     // Process before creating output so a model failure cannot leave a partial result.
-    let mut converted = Vec::with_capacity(mono.len());
-    for chunk in mono.chunks(block) {
-        let mut padded = chunk.to_vec();
-        padded.resize(block, 0.0);
-        let audio = engine.process(&padded, sample_rate, settings)?;
-        converted.extend_from_slice(&audio[..chunk.len()]);
-    }
+    let converted = convert_samples(engine, &mono, sample_rate, settings, &mut |_, _| {})?;
     let mut writer = hound::WavWriter::create(
         output,
         hound::WavSpec {

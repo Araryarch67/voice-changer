@@ -26,7 +26,7 @@ pub struct SharedModel {
     pub recommended: bool,
 }
 
-pub const SHARED: [SharedModel; 5] = [
+pub const SHARED: [SharedModel; 6] = [
     SharedModel {
         file: "contentvec.onnx",
         title: "ContentVec",
@@ -79,6 +79,18 @@ pub const SHARED: [SharedModel; 5] = [
         url: "https://huggingface.co/Scicom-intl/fcpe-onnx/resolve/11b6e6f968224227acd682cee8397ebe5b1821e5/fcpe.onnx",
         bytes: 47_798_721,
         sha256: "1a36aeb24b8695dce42fb18c432deb2ca9cd46567afb1a12e0e16301d524b925",
+        required: false,
+        recommended: false,
+    },
+    // Ultimate Vocal Remover's own download of Kim Jensen's MDX-Net vocal model
+    // (training code MIT); its settings are in separate.rs.
+    SharedModel {
+        file: "kim_vocal_2.onnx",
+        title: "Kim Vocal 2",
+        purpose: "Separates the vocals of a song from its music, for the Split and Cover pages",
+        url: "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/Kim_Vocal_2.onnx",
+        bytes: 66_759_214,
+        sha256: "ce74ef3b6a6024ce44211a07be9cf8bc6d87728cc852a68ab34eb8e58cde9c8b",
         required: false,
         recommended: false,
     },
@@ -201,11 +213,11 @@ mod tests {
     #[test]
     fn models_come_from_the_reference_weights() {
         for model in &SHARED {
-            // FCPE has no ONNX model there; see its entry.
-            let source = if model.file == "fcpe.onnx" {
-                "https://huggingface.co/Scicom-intl/fcpe-onnx/resolve/"
-            } else {
-                "https://huggingface.co/wok000/"
+            // FCPE and the vocal model have no ONNX model there; see their entries.
+            let source = match model.file {
+                "fcpe.onnx" => "https://huggingface.co/Scicom-intl/fcpe-onnx/resolve/",
+                "kim_vocal_2.onnx" => "https://github.com/TRvlvr/model_repo/releases/download/",
+                _ => "https://huggingface.co/wok000/",
             };
             assert!(model.url.starts_with(source), "{}", model.url);
             assert!(model.file.ends_with(".onnx"));

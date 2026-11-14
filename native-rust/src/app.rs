@@ -17,6 +17,8 @@ mod clone;
 mod cuda;
 #[cfg(feature = "catalog")]
 mod setup;
+#[cfg(any(feature = "onnx", feature = "onnx-static"))]
+mod songs;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct ModelSlot {
@@ -109,6 +111,10 @@ impl Default for Saved {
 enum Page {
     Voices,
     Studio,
+    #[cfg(any(feature = "onnx", feature = "onnx-static"))]
+    Cover,
+    #[cfg(any(feature = "onnx", feature = "onnx-static"))]
+    Split,
     Convert,
     #[cfg(feature = "audio")]
     Clone,
@@ -146,6 +152,8 @@ pub struct VoiceApp {
     cuda: cuda::CudaSetup,
     #[cfg(feature = "audio")]
     clone: clone::CloneState,
+    #[cfg(any(feature = "onnx", feature = "onnx-static"))]
+    songs: songs::SongsState,
     import_checkpoint: String,
     import_index: String,
     file_output: String,
@@ -237,6 +245,8 @@ impl VoiceApp {
             cuda: Default::default(),
             #[cfg(feature = "audio")]
             clone: Default::default(),
+            #[cfg(any(feature = "onnx", feature = "onnx-static"))]
+            songs: Default::default(),
             import_checkpoint: String::new(),
             import_index: String::new(),
             file_output: String::new(),
@@ -508,16 +518,24 @@ impl VoiceApp {
         let pages = [
             (Page::Voices, icons::GRAPHIC_EQ, t("Voices")),
             (Page::Studio, icons::TUNE, t("Studio")),
+            #[cfg(any(feature = "onnx", feature = "onnx-static"))]
+            (Page::Cover, icons::LIBRARY_MUSIC, t("Cover")),
+            #[cfg(any(feature = "onnx", feature = "onnx-static"))]
+            (Page::Split, icons::CALL_SPLIT, t("Split")),
             (Page::Convert, icons::AUDIO_FILE, t("Convert")),
             #[cfg(feature = "audio")]
             (Page::Clone, icons::VOICE, t("Clone")),
             (Page::Settings, icons::SETTINGS, t("Settings")),
         ];
         if compact {
+            // More than five destinations do not fit with labels: only the
+            // active one keeps its label, as M3 navigation bars do.
+            let all_labels = pages.len() <= 5;
             ui.columns(pages.len(), |columns| {
                 for (column, (page, glyph, name)) in columns.iter_mut().zip(pages) {
                     column.vertical_centered(|ui| {
-                        if m3::nav_item(ui, glyph, name, self.page == page).clicked() {
+                        let active = self.page == page;
+                        if m3::nav_item(ui, glyph, name, active, all_labels || active).clicked() {
                             self.page = page;
                         }
                     });
@@ -540,7 +558,7 @@ impl VoiceApp {
             );
             ui.add_space(16.0);
             for (page, glyph, name) in pages {
-                if m3::nav_item(ui, glyph, name, self.page == page).clicked() {
+                if m3::nav_item(ui, glyph, name, self.page == page, true).clicked() {
                     self.page = page;
                 }
             }
@@ -637,6 +655,13 @@ impl VoiceApp {
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
+        #[cfg(any(feature = "onnx", feature = "onnx-static"))]
+        if songs::is_song(&path)
+            && (extension != "wav" || matches!(self.page, Page::Cover | Page::Split))
+        {
+            self.drop_song(&path);
+            return;
+        }
         match extension.as_str() {
             "pth" => self.choose_checkpoint(path),
             "index" => self.import_index = path.to_string_lossy().into_owned(),
@@ -2205,12 +2230,19 @@ impl VoiceApp {
         m3::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing = Vec2::splat(8.0);
+            self.voice_picker(ui, !busy);
+            self.file_conversion(ui, busy);
+        });
+    }
+    /// Picks the voice a file or song is converted with; it is also the live voice.
+    fn voice_picker(&mut self, ui: &mut egui::Ui, enabled: bool) {
+        {
             m3::field_label(ui, t("Voice"));
             let ready: Vec<usize> = (0..self.saved.slots.len())
                 .filter(|&i| !self.saved.slots[i].manifest.trim().is_empty())
                 .collect();
             let mut picked = None;
-            ui.add_enabled_ui(!busy && !ready.is_empty(), |ui| {
+            ui.add_enabled_ui(enabled && !ready.is_empty(), |ui| {
                 let width = ui.available_width().min(440.0);
                 let current = &self.saved.slots[self.saved.selected];
                 let name = if current.manifest.trim().is_empty() {
@@ -2235,8 +2267,7 @@ impl VoiceApp {
             } else {
                 t("The voice the whole file is converted with. It is also the voice selected for live use.")
             }));
-            self.file_conversion(ui, busy);
-        });
+        }
     }
     fn file_conversion(&mut self, ui: &mut egui::Ui, busy: bool) {
         {
@@ -2431,6 +2462,8 @@ impl eframe::App for VoiceApp {
         {
             self.error = Some(problem);
         }
+        #[cfg(any(feature = "onnx", feature = "onnx-static"))]
+        self.poll_songs();
         self.follow_voice();
         #[cfg(feature = "audio")]
         self.follow_devices();
@@ -2528,6 +2561,10 @@ impl eframe::App for VoiceApp {
                                     Page::Convert => self.convert_page(ui),
                                     #[cfg(feature = "audio")]
                                     Page::Clone => self.clone_page(ui),
+                                    #[cfg(any(feature = "onnx", feature = "onnx-static"))]
+                                    Page::Cover => self.cover_page(ui),
+                                    #[cfg(any(feature = "onnx", feature = "onnx-static"))]
+                                    Page::Split => self.split_page(ui),
                                     Page::Settings => self.settings(ui),
                                 }
                             });

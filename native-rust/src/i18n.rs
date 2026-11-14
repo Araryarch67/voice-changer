@@ -132,8 +132,10 @@ mod tests {
         let sources = [
             include_str!("app.rs"),
             include_str!("app/browse.rs"),
+            include_str!("app/clone.rs"),
             include_str!("app/cuda.rs"),
             include_str!("app/setup.rs"),
+            include_str!("app/songs.rs"),
             include_str!("m3.rs"),
         ];
         let map = lookup();

@@ -63,6 +63,12 @@ On Windows set `ORT_DYLIB_PATH` to `onnxruntime.dll` in PowerShell (`$env:ORT_DY
 
 **Import model** (or dropping a `.pth` or `.index` on the window) opens a dialog with separate fields for the RVC `.pth` checkpoint and its `.index`; the index is optional, and the one beside the checkpoint is filled in when there is one. The checkpoint is exported to `models/<name>/voice-realtime.onnx`, the index is copied into the same folder, and a manifest is written that uses `models/shared/contentvec.onnx` and `models/shared/rmvpe.onnx`, which must already exist. **Edit → Change index** replaces or removes a voice's index later. **Find online** searches [voice-models.com](https://voice-models.com) and adds a voice in one step: it downloads the voice's ZIP from its host (Hugging Face, Google Drive or MediaFire, which cover about 96% of listed voices), takes the `.pth` and `.index` out of it and converts it like an import. There is no official API, so this reads the site's own search and may stop working if the site changes; voices on Mega open in the browser instead, and GPT-SoVITS or other non-RVC models are marked as unsupported. A `portrait.png` (or `.jpg`, `.jpeg`, `.webp`) in a voice's folder is shown on its card; **Edit → Choose picture** copies one there.
 
+## Song covers and vocal separation
+
+**Split** separates a song into its vocals and its music; **Cover** sings a song in one of your voices. Both read WAV, MP3, FLAC, OGG Vorbis and M4A/AAC (decoded with Symphonia), and a song dropped on the window opens Cover (or fills Split when it is open). They need the optional **Kim Vocal 2** model (64 MB), offered by the voice engine dialog and `setup download kim_vocal_2`; it comes from Ultimate Vocal Remover's model repository and is checked against its SHA-256.
+
+Separation follows UVR and AICoverGen for this MDX-Net model (`src/separate.rs`): the song is resampled to 44.1 kHz stereo and peak-normalised, cut into chunks of 261,120 samples that overlap by 3,840 on each side, and each chunk's STFT (`n_fft` 7680, hop 1024, periodic Hann, centred with reflect padding, the lowest 3,072 bins as left/right real/imaginary planes) goes through the model, which returns the vocals' spectrum; the inverse STFT turns it back into audio. The instrumental is the song minus the vocals times 1.009, the model's compensation in UVR's model list. Split writes `SONG-vocals.wav` and `SONG-instrumental.wav` (32-bit float). Cover converts the mid of the vocals with the chosen voice and the Studio settings (Tune, Index, Protect, F0 detector) block by block as the Convert page does, mixes it over the instrumental with the **Voice volume** and **Music volume**, and writes 16-bit stereo WAV, turned down as a whole if it would clip; **Keep the separated parts** also writes the vocals, the instrumental and the new vocals. On a CPU a song separates at about three times real time.
+
 ## Cloning your own voice
 
 The **Clone** page makes an RVC v2 voice from your own recordings. The app does not train (training needs PyTorch and a GPU for an hour or more); it prepares the recordings for a Google Colab notebook that trains on Colab's free GPU, and imports what it produces.
@@ -102,13 +108,15 @@ Run without arguments, the program opens the GUI. With a command it works withou
 | Command | What it does |
 | --- | --- |
 | `status` | Version, models folders, whether the voice engine is installed, voice count, ONNX Runtime and the execution devices it offers (`cpu`, `cuda`, `directml`) |
-| `setup status` / `setup download [MODEL...] [--all]` | Shared models in `models/shared/`: `contentvec` and `rmvpe` (required), `crepe_tiny`, `crepe_full`, `fcpe` (optional). With no names, downloads the recommended set; each file is checked against its size and SHA-256 |
+| `setup status` / `setup download [MODEL...] [--all]` | Shared models in `models/shared/`: `contentvec` and `rmvpe` (required), `crepe_tiny`, `crepe_full`, `fcpe`, `kim_vocal_2` (optional). With no names, downloads the recommended set; each file is checked against its size and SHA-256 |
 | `voices list` / `voices show VOICE` | Installed voices: name, id (folder name), manifest, sample rate, v1/v2, pitch, index, whether it can be deleted |
 | `voices import FILE [--index FILE.index] [--name NAME]` | Imports an RVC `.pth` or a `.zip` holding one, like **Import model** |
 | `voices set-index VOICE (INDEX \| --none)` | Replaces or removes a voice's index |
 | `voices delete VOICE --yes` | Deletes the voice's folder (only folders directly inside a models folder, never `shared`) |
 | `devices [--input \| --output]` | Audio device IDs and names |
 | `convert VOICE IN.wav OUT.wav [SETTINGS]` | Converts a WAV file; `--analyze` also writes diagnostics, `--overwrite` replaces OUT.wav |
+| `split SONG [--out-dir DIR] [--device DEV]` | Separates a song into `SONG-vocals.wav` and `SONG-instrumental.wav`, like **Split** |
+| `cover VOICE SONG [OUT.wav] [--voice-gain G] [--music-gain G] [--keep-stems] [SETTINGS]` | Sings a song in a voice, like **Cover**; default output `SONG-cover.wav` |
 | `live VOICE [--input DEV] [--output DEV] [--monitor DEV\|default] [--virtual-mic] [--duration S] [SETTINGS]` | Real-time conversion until `--duration` ends or the process is stopped |
 | `analyze IN.wav [OUT.wav]` | JSON and PNG diagnostics for a recording or an input/output pair |
 | `export-rvc MODEL.pth OUT.onnx [--realtime]` | Checkpoint to ONNX only, without a voice folder |
@@ -207,6 +215,6 @@ On Windows, run `target/debug/examples/capture OUT.png 1100 760` directly; it op
 
 ## Source map
 
-`app.rs` owns the egui UI; `audio.rs` owns device streams, bounded queues and the worker; `engine.rs` applies gains/bypass and enforces output validity; `rvc.rs` implements the ONNX conversion pipeline; `dsp.rs` contains resampling and SOLA; `retrieval.rs` reads FAISS IVF-Flat indexes and feature banks; `pth.rs` reads PyTorch checkpoints; `export.rs` converts RVC checkpoints to ONNX; `platform.rs` handles mobile permissions/audio sessions; `wav.rs` provides offline conversion; `cli.rs` is the command line; `dataset.rs` and `recorder.rs` collect recordings for cloning a voice, `app/clone.rs` is the Clone page, and `colab/train_voice.ipynb` trains them.
+`app.rs` owns the egui UI; `audio.rs` owns device streams, bounded queues and the worker; `engine.rs` applies gains/bypass and enforces output validity; `rvc.rs` implements the ONNX conversion pipeline; `dsp.rs` contains resampling and SOLA; `retrieval.rs` reads FAISS IVF-Flat indexes and feature banks; `pth.rs` reads PyTorch checkpoints; `export.rs` converts RVC checkpoints to ONNX; `platform.rs` handles mobile permissions/audio sessions; `wav.rs` provides offline conversion; `audio_file.rs` reads songs and writes stems, `separate.rs` separates vocals and makes covers and `app/songs.rs` holds the Split and Cover pages; `cli.rs` is the command line; `dataset.rs` and `recorder.rs` collect recordings for cloning a voice, `app/clone.rs` is the Clone page, and `colab/train_voice.ipynb` trains them.
 
 The original `reference/server/` and `reference/client/` (git-ignored) remain reference code. Existing upstream licenses in the repository remain applicable to those sources and any derivatives. No pretrained voice weights or third-party product branding are included.

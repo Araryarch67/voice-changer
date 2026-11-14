@@ -17,7 +17,7 @@ use std::path::Path;
 /// found in earlier blocks, as the reference's "silence front" does.
 const PITCH_MARGIN_FRAMES: usize = 16;
 
-fn open_session(file: &Path, threads: usize, device: Device) -> Result<Session> {
+pub(crate) fn open_session(file: &Path, threads: usize, device: Device) -> Result<Session> {
     anyhow::ensure!(
         crate::runtime::available_devices().contains(&device),
         "{} is not available with this ONNX Runtime on this system; choose another device",

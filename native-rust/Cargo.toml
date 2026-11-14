@@ -49,6 +49,10 @@ sha2 = { version = "0.10", optional = true }
 # Unpack NVIDIA's Linux CUDA archives (.tar.xz) for the CUDA setup.
 tar = { version = "0.4", default-features = false, optional = true }
 lzma-rs = { version = "0.3", optional = true }
+# Vocal separation's spectra (any FFT size; the model's is 7680).
+rustfft = "6"
+# Reads songs for vocal separation and covers: MP3, FLAC, OGG Vorbis, M4A/AAC, WAV.
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "ogg", "vorbis", "aac", "isomp4", "wav", "pcm"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }

@@ -57,6 +57,7 @@ pub mod icons {
     pub const VOICE: char = '\u{e91f}';
     pub const DEVICES: char = '\u{e1b1}';
     pub const RECORD: char = '\u{e061}';
+    pub const CALL_SPLIT: char = '\u{e0b6}';
 }
 
 pub fn medium() -> FontFamily {
@@ -1012,8 +1013,17 @@ pub fn avatar(
 }
 
 /// Navigation rail / bar destination: icon in a pill indicator with a label below.
-pub fn nav_item(ui: &mut Ui, glyph: char, label: &str, active: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(72.0, 56.0), Sense::click());
+/// M3 navigation item: an icon in a pill, its label below. With `label_shown`
+/// false (a bar with more destinations than fit) the label shows on hover only.
+pub fn nav_item(
+    ui: &mut Ui,
+    glyph: char,
+    label: &str,
+    active: bool,
+    label_shown: bool,
+) -> Response {
+    let width = ui.available_width().clamp(48.0, 72.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 56.0), Sense::click());
     let enabled = ui.is_enabled();
     response.widget_info(|| WidgetInfo::selected(WidgetType::Button, enabled, active, label));
     let t = ui.ctx().animate_bool_responsive(response.id, active);
@@ -1032,18 +1042,24 @@ pub fn nav_item(ui: &mut Ui, glyph: char, label: &str, active: bool) -> Response
         ON_SURFACE_VARIANT
     };
     paint_icon(ui, center, glyph, 24.0, active, content);
-    painter.text(
-        egui::pos2(rect.center().x, rect.top() + 46.0),
-        Align2::CENTER_CENTER,
-        label,
-        FontId::new(12.0, medium()),
-        if active {
-            ON_SURFACE
-        } else {
-            ON_SURFACE_VARIANT
-        },
-    );
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    if label_shown {
+        painter.text(
+            egui::pos2(rect.center().x, rect.top() + 46.0),
+            Align2::CENTER_CENTER,
+            label,
+            FontId::new(12.0, medium()),
+            if active {
+                ON_SURFACE
+            } else {
+                ON_SURFACE_VARIANT
+            },
+        );
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(label)
+    }
 }
 
 /// M3 checkbox: an 18 px box, filled with the primary colour and a check mark when
@@ -1396,6 +1412,37 @@ pub fn menu_button(ui: &mut Ui, hint: &str, width: f32, add: impl FnOnce(&mut Ui
     response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text(hint)
+}
+
+/// M3 linear progress indicator: active track, a gap, the inactive track and its
+/// stop dot.
+pub fn linear_progress(ui: &mut egui::Ui, fraction: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 8.0), Sense::hover());
+    let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 4.0));
+    let x = egui::lerp(track.left()..=track.right(), fraction.clamp(0.0, 1.0));
+    let painter = ui.painter();
+    if x + 4.0 < track.right() {
+        painter.rect_filled(
+            Rect::from_min_max(
+                egui::pos2((x + 4.0).max(track.left()), track.top()),
+                track.max,
+            ),
+            2.0,
+            SECONDARY_CONTAINER,
+        );
+        painter.circle_filled(
+            egui::pos2(track.right() - 2.0, track.center().y),
+            2.0,
+            PRIMARY,
+        );
+    }
+    if x > track.left() {
+        painter.rect_filled(
+            Rect::from_min_max(track.min, egui::pos2(x, track.bottom())),
+            2.0,
+            PRIMARY,
+        );
+    }
 }
 
 pub fn text_edit<'a>(text: &'a mut String, hint: &str, width: f32) -> egui::TextEdit<'a> {

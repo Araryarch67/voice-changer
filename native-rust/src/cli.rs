@@ -117,6 +117,22 @@ pub enum Command {
         overwrite: bool,
     },
     Live(LiveArgs),
+    Split {
+        input: PathBuf,
+        out_dir: Option<PathBuf>,
+        tuning: Tuning,
+        overwrite: bool,
+    },
+    Cover {
+        voice: String,
+        input: PathBuf,
+        output: Option<PathBuf>,
+        tuning: Tuning,
+        vocal_gain: f32,
+        music_gain: f32,
+        keep_stems: bool,
+        overwrite: bool,
+    },
     Analyze {
         input: PathBuf,
         output: Option<PathBuf>,
@@ -177,12 +193,16 @@ Commands:
   voices delete VOICE --yes
                          Delete a voice's folder from disk
   devices                List audio input and output devices
-  setup status           Which shared models (ContentVec, RMVPE, CREPE, FCPE) are installed
+  setup status           Which shared models (ContentVec, RMVPE, CREPE, FCPE, Kim Vocal 2)
+                         are installed
   setup download [MODEL...]
                          Download the shared models the voices need
   convert VOICE IN.wav OUT.wav [SETTINGS]
                          Convert a WAV file with a voice
   live VOICE [SETTINGS]  Convert the microphone in real time until stopped
+  split SONG             Separate a song's vocals from its music (two WAV files)
+  cover VOICE SONG [OUT.wav] [SETTINGS]
+                         Sing a song in a voice: split, convert the vocals, mix back
   analyze IN.wav [OUT.wav]
                          Write JSON and PNG diagnostics for a recording
   export-rvc MODEL.pth OUT.onnx [--realtime]
@@ -287,6 +307,7 @@ Shared models live in <models>/shared/ and every voice uses them:
   crepe_tiny   optional   light CREPE pitch detector (2 MB)
   crepe_full   optional   precise CREPE pitch detector (89 MB)
   fcpe         optional   FCPE pitch detector (48 MB)
+  kim_vocal_2  optional   vocal separation for `split` and `cover` (67 MB)
 
 download fetches the named models (or, with none named, --recommended: contentvec,
 rmvpe and crepe_tiny), skipping those already installed, and checks each against its
@@ -321,6 +342,30 @@ signal). With --json, each line on stdout is a JSON object: {{\"event\":\"ready\
 audio flows, {{\"event\":\"status\",...}} every --status-every seconds (default 1 with
 --json, 5 otherwise; 0 turns them off), and the final {{\"ok\":...}} result when it ends
 by --duration or an error.
+
+{SETTINGS_HELP}"
+        ),
+        "split" => "\
+Usage: split SONG [--out-dir DIR] [--device DEV] [--overwrite] [--json]
+
+Separates SONG (WAV, MP3, FLAC, OGG Vorbis or M4A/AAC) into SONG-vocals.wav and
+SONG-instrumental.wav (32-bit float, 44.1 kHz stereo) beside it, or in --out-dir.
+Uses the Kim Vocal 2 MDX-Net model as Ultimate Vocal Remover does; install it with
+`setup download kim_vocal_2`. --device is cpu (default), cuda, directml or auto.
+Existing stems are only replaced with --overwrite. Progress goes to stderr."
+            .to_owned(),
+        "cover" => format!(
+            "\
+Usage: cover VOICE SONG [OUT.wav] [--voice-gain G] [--music-gain G] [--keep-stems]
+             [SETTINGS] [--overwrite] [--json]
+
+Sings SONG in VOICE: its vocals are separated (as `split` does), converted with the
+voice, and mixed back over the instrumental into OUT.wav (16-bit stereo, 44.1 kHz;
+default SONG-cover.wav beside the song, turned down as a whole if it would clip).
+--voice-gain and --music-gain (0..2, default 1) set the balance. --keep-stems also
+writes OUT-vocals.wav, OUT-instrumental.wav and OUT-new-vocals.wav. Use --semitones
+to move the song to the voice's range and --f0 rmvpe (the default) for singing.
+Needs `setup download kim_vocal_2`. Progress goes to stderr.
 
 {SETTINGS_HELP}"
         ),
@@ -662,6 +707,8 @@ pub fn parse(args: &[String]) -> Result<Invocation, UsageError> {
         "setup" => parse_setup(&mut cursor)?,
         "convert" => parse_convert(&mut cursor)?,
         "live" => parse_live(&mut cursor)?,
+        "split" => parse_split(&mut cursor)?,
+        "cover" => parse_cover(&mut cursor)?,
         "analyze" => {
             let mut positional = Vec::new();
             let mut prefix = None;
@@ -1028,6 +1075,73 @@ fn parse_convert(cursor: &mut Cursor) -> Result<Command, UsageError> {
     })
 }
 
+fn parse_split(cursor: &mut Cursor) -> Result<Command, UsageError> {
+    let mut tuning = TuningFlags::default();
+    let mut positional = Vec::new();
+    let (mut out_dir, mut overwrite) = (None, false);
+    while let Some(arg) = cursor.next() {
+        match arg.as_str() {
+            "--out-dir" | "-o" => out_dir = Some(cursor.value(&arg)?.into()),
+            "--overwrite" | "--force" => overwrite = true,
+            // Only the device matters for a split.
+            "--device" => {
+                tuning.take(&arg, cursor)?;
+            }
+            flag if flag.starts_with("--") => return Err(unknown(flag, "split")),
+            _ => positional.push(arg),
+        }
+    }
+    positional_count("split", &positional, 1..=1)?;
+    Ok(Command::Split {
+        input: positional.remove(0).into(),
+        out_dir,
+        tuning: tuning.build()?,
+        overwrite,
+    })
+}
+
+fn parse_cover(cursor: &mut Cursor) -> Result<Command, UsageError> {
+    let mut tuning = TuningFlags::default();
+    let mut positional = Vec::new();
+    let (mut voice, mut vocal_gain, mut music_gain) = (None, 1.0_f32, 1.0_f32);
+    let (mut keep_stems, mut overwrite) = (false, false);
+    let gain = |flag: &str, value: String| -> Result<f32, UsageError> {
+        let gain: f32 = number(flag, &value)?;
+        if !(0.0..=2.0).contains(&gain) {
+            return usage(format!("{flag} must be 0..2"));
+        }
+        Ok(gain)
+    };
+    while let Some(arg) = cursor.next() {
+        match arg.as_str() {
+            "--voice" => voice = Some(cursor.value(&arg)?),
+            "--voice-gain" => vocal_gain = gain(&arg, cursor.value(&arg)?)?,
+            "--music-gain" => music_gain = gain(&arg, cursor.value(&arg)?)?,
+            "--keep-stems" => keep_stems = true,
+            "--overwrite" | "--force" => overwrite = true,
+            flag if tuning.take(flag, cursor)? => {}
+            flag if flag.starts_with("--") => return Err(unknown(flag, "cover")),
+            _ => positional.push(arg),
+        }
+    }
+    let least = 1 + usize::from(voice.is_none());
+    positional_count("cover", &positional, least..=least + 1)?;
+    let mut positional = positional.into_iter();
+    let voice = pick(voice, &mut positional)
+        .ok_or_else(|| UsageError("`cover` needs VOICE SONG; see `cover --help`".into()))?;
+    let input = positional.next().expect("counted").into();
+    Ok(Command::Cover {
+        voice,
+        input,
+        output: positional.next().map(PathBuf::from),
+        tuning: tuning.build()?,
+        vocal_gain,
+        music_gain,
+        keep_stems,
+        overwrite,
+    })
+}
+
 fn parse_live(cursor: &mut Cursor) -> Result<Command, UsageError> {
     let mut tuning = TuningFlags::default();
     let mut positional = Vec::new();
@@ -1214,6 +1328,45 @@ fn run(invocation: &Invocation) -> Result<Report> {
             overwrite,
         } => convert(voice, input, output, tuning, *analyze, *overwrite),
         Command::Live(args) => live(args, invocation),
+        Command::Split {
+            input,
+            out_dir,
+            tuning,
+            overwrite,
+        } => split(
+            input,
+            out_dir.as_deref(),
+            tuning,
+            *overwrite,
+            invocation.quiet,
+        ),
+        #[cfg(not(any(feature = "onnx", feature = "onnx-static")))]
+        Command::Cover { .. } => {
+            bail!("This build cannot make covers (built without ONNX Runtime)")
+        }
+        #[cfg(any(feature = "onnx", feature = "onnx-static"))]
+        Command::Cover {
+            voice,
+            input,
+            output,
+            tuning,
+            vocal_gain,
+            music_gain,
+            keep_stems,
+            overwrite,
+        } => cover(
+            &CoverArgs {
+                voice,
+                input,
+                output: output.as_deref(),
+                tuning,
+                vocal_gain: *vocal_gain,
+                music_gain: *music_gain,
+                keep_stems: *keep_stems,
+                overwrite: *overwrite,
+            },
+            invocation.quiet,
+        ),
         Command::Analyze {
             input,
             output,
@@ -1746,13 +1899,7 @@ fn convert(
 ) -> Result<Report> {
     let manifest = resolve_voice(voice)?;
     anyhow::ensure!(input.is_file(), "No such input file: {}", input.display());
-    if output.exists() && !overwrite {
-        return Err(UsageError(format!(
-            "{} already exists; pass --overwrite to replace it",
-            output.display()
-        ))
-        .into());
-    }
+    check_overwrite(&[output], overwrite)?;
     let settings = resolved_settings(tuning);
     check_detector(&settings, &manifest)?;
     let started = std::time::Instant::now();
@@ -1807,6 +1954,173 @@ fn convert(
         }
     }
     Ok(Report { data, text })
+}
+
+/// Refuses to replace `paths` unless `overwrite`.
+fn check_overwrite(paths: &[&Path], overwrite: bool) -> Result<()> {
+    if let Some(path) = paths
+        .iter()
+        .find(|path| path.exists())
+        .filter(|_| !overwrite)
+    {
+        return Err(UsageError(format!(
+            "{} already exists; pass --overwrite to replace it",
+            path.display()
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// Runs `work` on a thread and prints its progress on stderr every two seconds.
+#[cfg(any(feature = "onnx", feature = "onnx-static"))]
+fn with_progress<T: Send>(
+    quiet: bool,
+    progress: &crate::separate::Progress,
+    work: impl FnOnce() -> Result<T> + Send,
+) -> Result<T> {
+    use crate::separate::{CONVERTING, SEPARATING};
+    use std::sync::atomic::Ordering;
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(work);
+        let mut last = std::time::Instant::now();
+        while !worker.is_finished() {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if !quiet && last.elapsed() >= std::time::Duration::from_secs(2) {
+                last = std::time::Instant::now();
+                let stage = match progress.stage.load(Ordering::Relaxed) {
+                    SEPARATING => "Separating the vocals",
+                    CONVERTING => "Converting the vocals",
+                    _ => "Saving",
+                };
+                eprintln!("{stage}: {:.0}%", progress.fraction() * 100.0);
+            }
+        }
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("The job stopped unexpectedly"))?
+    })
+}
+
+#[cfg(any(feature = "onnx", feature = "onnx-static"))]
+fn split(
+    input: &Path,
+    out_dir: Option<&Path>,
+    tuning: &Tuning,
+    overwrite: bool,
+    quiet: bool,
+) -> Result<Report> {
+    anyhow::ensure!(input.is_file(), "No such song: {}", input.display());
+    let model = crate::separate::require_model()?;
+    let (vocals, instrumental) = crate::separate::stem_paths(input, out_dir);
+    check_overwrite(&[&vocals, &instrumental], overwrite)?;
+    if let Some(folder) = out_dir {
+        std::fs::create_dir_all(folder)?;
+    }
+    let device = resolved_settings(tuning).device;
+    let started = std::time::Instant::now();
+    let progress = crate::separate::Progress::default();
+    let seconds = with_progress(quiet, &progress, || {
+        crate::separate::split_file(&model, device, input, &vocals, &instrumental, &progress)
+    })?;
+    let elapsed = started.elapsed().as_secs_f64();
+    Ok(Report {
+        text: format!(
+            "Split {} ({seconds:.1} s in {elapsed:.1} s on {})\nVocals: {}\nInstrumental: {}",
+            input.display(),
+            device_name(device),
+            vocals.display(),
+            instrumental.display()
+        ),
+        data: json!({
+            "input": absolute(input),
+            "vocals": absolute(&vocals),
+            "instrumental": absolute(&instrumental),
+            "duration_s": seconds,
+            "elapsed_ms": elapsed * 1000.0,
+            "device": device_name(device),
+            "model": display(&model),
+        }),
+    })
+}
+
+#[cfg(not(any(feature = "onnx", feature = "onnx-static")))]
+fn split(_: &Path, _: Option<&Path>, _: &Tuning, _: bool, _: bool) -> Result<Report> {
+    bail!("This build cannot separate vocals (built without ONNX Runtime)")
+}
+
+/// What `cover` was asked for.
+#[cfg(any(feature = "onnx", feature = "onnx-static"))]
+struct CoverArgs<'a> {
+    voice: &'a str,
+    input: &'a Path,
+    output: Option<&'a Path>,
+    tuning: &'a Tuning,
+    vocal_gain: f32,
+    music_gain: f32,
+    keep_stems: bool,
+    overwrite: bool,
+}
+
+#[cfg(any(feature = "onnx", feature = "onnx-static"))]
+fn cover(args: &CoverArgs, quiet: bool) -> Result<Report> {
+    let manifest = resolve_voice(args.voice)?;
+    anyhow::ensure!(
+        args.input.is_file(),
+        "No such song: {}",
+        args.input.display()
+    );
+    let model = crate::separate::require_model()?;
+    let output = args.output.map(Path::to_path_buf).unwrap_or_else(|| {
+        let stem = args.input.file_stem().unwrap_or_default().to_string_lossy();
+        args.input.with_file_name(format!("{stem}-cover.wav"))
+    });
+    check_overwrite(&[&output], args.overwrite)?;
+    let settings = resolved_settings(args.tuning);
+    check_detector(&settings, &manifest)?;
+    let started = std::time::Instant::now();
+    let progress = crate::separate::Progress::default();
+    let files = with_progress(quiet, &progress, || {
+        crate::separate::cover(
+            &crate::separate::CoverJob {
+                separation_model: &model,
+                voice: &manifest,
+                settings: &settings,
+                input: args.input,
+                output: &output,
+                vocal_gain: args.vocal_gain,
+                music_gain: args.music_gain,
+                keep_stems: args.keep_stems,
+            },
+            &progress,
+        )
+    })?;
+    let elapsed = started.elapsed().as_secs_f64();
+    let mut text = format!(
+        "Cover of {} in {} -> {} ({:.1} s in {elapsed:.1} s on {})",
+        args.input.display(),
+        display(&manifest),
+        files.cover.display(),
+        files.seconds,
+        device_name(settings.device)
+    );
+    for stem in &files.stems {
+        text.push_str(&format!("\n{}", stem.display()));
+    }
+    Ok(Report {
+        text,
+        data: json!({
+            "voice": voice_entry(&manifest),
+            "input": absolute(args.input),
+            "output": absolute(&files.cover),
+            "stems": files.stems.iter().map(|p| absolute(p)).collect::<Vec<_>>(),
+            "duration_s": files.seconds,
+            "elapsed_ms": elapsed * 1000.0,
+            "voice_gain": args.vocal_gain,
+            "music_gain": args.music_gain,
+            "settings": settings_json(&settings),
+        }),
+    })
 }
 
 fn analyze(input: &Path, output: Option<&Path>, prefix: Option<&Path>) -> Result<Report> {
@@ -2187,6 +2501,58 @@ mod tests {
 
     fn rejected(line: &str) -> String {
         parse(&args(line)).map(|_| ()).unwrap_err().0
+    }
+
+    #[test]
+    fn split_and_cover_read_their_options() {
+        match parsed("split song.mp3 --out-dir stems --device cpu --overwrite").command {
+            Command::Split {
+                input,
+                out_dir,
+                tuning,
+                overwrite,
+            } => {
+                assert_eq!(input, PathBuf::from("song.mp3"));
+                assert_eq!(out_dir, Some(PathBuf::from("stems")));
+                assert_eq!(tuning.settings.device, Device::Cpu);
+                assert!(overwrite);
+            }
+            _ => panic!("not a split"),
+        }
+        match parsed(
+            "cover Aria song.flac out.wav --semitones 12 --voice-gain 1.25 --keep-stems --json",
+        )
+        .command
+        {
+            Command::Cover {
+                voice,
+                input,
+                output,
+                tuning,
+                vocal_gain,
+                music_gain,
+                keep_stems,
+                overwrite,
+            } => {
+                assert_eq!(voice, "Aria");
+                assert_eq!(input, PathBuf::from("song.flac"));
+                assert_eq!(output, Some(PathBuf::from("out.wav")));
+                assert_eq!(tuning.settings.semitones, 12.0);
+                assert_eq!((vocal_gain, music_gain), (1.25, 1.0));
+                assert!(keep_stems && !overwrite);
+            }
+            _ => panic!("not a cover"),
+        }
+        assert!(matches!(
+            parsed("cover --voice Aria song.mp3").command,
+            Command::Cover { output: None, .. }
+        ));
+        assert!(rejected("split").contains("split"));
+        assert!(rejected("split a.mp3 b.mp3").contains("split"));
+        assert!(rejected("split a.mp3 --semitones 3").contains("--semitones"));
+        assert!(rejected("cover Aria").contains("cover"));
+        assert!(rejected("cover Aria song.mp3 --music-gain 3").contains("0..2"));
+        assert!(command_help("split").is_some() && command_help("cover").is_some());
     }
 
     #[test]

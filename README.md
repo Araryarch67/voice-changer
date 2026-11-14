@@ -30,6 +30,7 @@ Voice Changer converts your microphone into another voice as you speak, using [R
 - **Pitch detectors**: RMVPE, CREPE, FCPE, Harvest, DIO and YIN.
 - **GPU or CPU**: CUDA through ONNX Runtime where available, CPU everywhere else.
 - **One-step import**: pick an RVC `.pth` or `.zip` and the app converts it to ONNX, finds its index and adds the voice, no Python needed. Each voice can have its own picture.
+- **Song covers and vocal separation**: the **Cover** page sings a song (MP3, FLAC, OGG, M4A or WAV) in one of your voices, and the **Split** page separates a song's vocals from its music, with the Kim Vocal 2 MDX-Net model that Ultimate Vocal Remover uses.
 - **Recording** of the microphone and the converted voice to WAV, and a **Convert** page that changes the voice in a WAV file (drop a `.wav` on the window to open it).
 - **Material 3 interface** with a plain-language hint under every option.
 
@@ -125,7 +126,8 @@ cargo test
 
 - [w-okada/voice-changer](https://github.com/w-okada/voice-changer), the project this is ported from.
 - [RVC-Project](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI) for the voice conversion models.
-- [nnnoiseless](https://github.com/jneem/nnnoiseless) (RNNoise), [egui](https://github.com/emilk/egui), [CPAL](https://github.com/RustAudio/cpal) and [ort](https://github.com/pykeio/ort).
+- [nnnoiseless](https://github.com/jneem/nnnoiseless) (RNNoise), [egui](https://github.com/emilk/egui), [CPAL](https://github.com/RustAudio/cpal), [ort](https://github.com/pykeio/ort), [RustFFT](https://github.com/ejmahler/RustFFT) and [Symphonia](https://github.com/pdeljanov/Symphonia) (MPL-2.0, reads songs).
+- [Ultimate Vocal Remover](https://github.com/Anjok07/ultimatevocalremovergui) and Kimberley Jensen's [MDX-Net](https://github.com/KimberleyJensen/mdx-net) Kim Vocal 2 model, downloaded from UVR's model repository on request.
 - [Roboto](https://fonts.google.com/specimen/Roboto) and [Material Symbols](https://fonts.google.com/icons), bundled under their own licenses in `native-rust/assets/fonts`.
 
 ## License

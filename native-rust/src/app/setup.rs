@@ -4,7 +4,7 @@
 use super::{icons, m3, VoiceApp};
 use crate::i18n::{t, tf};
 use crate::{catalog::Progress, setup};
-use eframe::egui::{self, FontId, Rect, Sense, Vec2};
+use eframe::egui::{self, FontId, Sense, Vec2};
 use std::sync::{atomic::Ordering, mpsc, Arc};
 
 pub(super) struct Setup {
@@ -78,9 +78,13 @@ impl VoiceApp {
 
     /// Opens the dialog with the model `detector` needs ticked.
     pub(super) fn offer_detector(&mut self, detector: crate::config::F0Detector) {
-        let Some(file) = detector.model_file() else {
-            return;
-        };
+        if let Some(file) = detector.model_file() {
+            self.offer_model(file);
+        }
+    }
+
+    /// Opens the dialog with the shared model `file` ticked.
+    pub(super) fn offer_model(&mut self, file: &str) {
         for (model, chosen) in setup::SHARED.iter().zip(&mut self.setup.chosen) {
             if model.file == file {
                 *chosen = true;
@@ -180,8 +184,9 @@ impl VoiceApp {
                 icons::SPEED,
                 icons::MEMORY,
                 icons::TUNE,
+                icons::CALL_SPLIT,
             ];
-            let mut size = 0;
+            let (mut size, mut from_github) = (0, false);
             for ((model, glyph), chosen) in
                 setup::SHARED.iter().zip(glyphs).zip(&mut self.setup.chosen)
             {
@@ -192,6 +197,7 @@ impl VoiceApp {
                 model_row(ui, glyph, model, ready, chosen, downloading);
                 if *chosen && !ready {
                     size += model.bytes;
+                    from_github |= model.url.starts_with("https://github.com/");
                 }
             }
             ui.add_space(8.0);
@@ -224,8 +230,13 @@ impl VoiceApp {
                         });
                     });
             } else if size > 0 {
+                let template = if from_github {
+                    "{} in total, from Hugging Face and GitHub. Saved in {}."
+                } else {
+                    "{} in total, from Hugging Face. Saved in {}."
+                };
                 ui.label(m3::supporting(&tf(
-                    "{} in total, from Hugging Face. Saved in {}.",
+                    template,
                     &[&megabytes(size), &folder.display()],
                 )));
             } else {
@@ -423,33 +434,7 @@ fn model_row(
     ui.add_space(2.0);
 }
 
-/// M3 linear progress indicator: active track, a gap, the inactive track and its
-/// stop dot.
+/// Kept here for the dialogs that use it; it lives in `m3`.
 pub(super) fn linear_progress(ui: &mut egui::Ui, fraction: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 8.0), Sense::hover());
-    let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 4.0));
-    let x = egui::lerp(track.left()..=track.right(), fraction.clamp(0.0, 1.0));
-    let painter = ui.painter();
-    if x + 4.0 < track.right() {
-        painter.rect_filled(
-            Rect::from_min_max(
-                egui::pos2((x + 4.0).max(track.left()), track.top()),
-                track.max,
-            ),
-            2.0,
-            m3::SECONDARY_CONTAINER,
-        );
-        painter.circle_filled(
-            egui::pos2(track.right() - 2.0, track.center().y),
-            2.0,
-            m3::PRIMARY,
-        );
-    }
-    if x > track.left() {
-        painter.rect_filled(
-            Rect::from_min_max(track.min, egui::pos2(x, track.bottom())),
-            2.0,
-            m3::PRIMARY,
-        );
-    }
+    m3::linear_progress(ui, fraction);
 }

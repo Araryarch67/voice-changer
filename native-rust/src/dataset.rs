@@ -5,7 +5,7 @@
 //! Each take is trimmed of leading and trailing silence and its peak set to -1 dBFS
 //! when it is saved; slicing into short clips is left to the trainer (Applio's
 //! preprocess), which also filters and resamples.
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use std::path::{Path, PathBuf};
 
 /// Less than this is refused when packing: the voice would not be usable.
@@ -190,6 +190,8 @@ fn write_wav(path: &Path, rate: u32, samples: impl Iterator<Item = f32>) -> Resu
 /// `dataset/` and [`MANIFEST`] with the voice's `name`. Returns the length packed.
 #[cfg(feature = "export")]
 pub fn pack(folder: &Path, name: &str, output: &Path) -> Result<f64> {
+    // Packing needs the exporter (ZIP); only it gives up early.
+    use anyhow::bail;
     use std::io::Write;
     let name = safe_name(name);
     ensure!(!name.is_empty(), "Give the voice a name");
