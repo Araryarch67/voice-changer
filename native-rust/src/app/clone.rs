@@ -14,6 +14,9 @@ pub(super) struct CloneState {
     recorder: Option<Recorder>,
     /// Which sentence to read next.
     prompt: usize,
+    /// The language of the sentences; the app's language until one is picked. The
+    /// voice learns the accent of what is read, so it is chosen apart from the app's.
+    reading: Option<Lang>,
     /// The takes of `listed`, read again when the name changes or a take is saved.
     takes: Vec<Take>,
     listed: Option<PathBuf>,
@@ -62,9 +65,9 @@ pub(super) fn open_external(path: &str) {
     }
 }
 
-/// Sentences to read aloud, chosen to cover the sounds of each language.
-fn prompts() -> &'static [&'static str] {
-    match crate::i18n::current() {
+/// Sentences to read aloud in `lang`, chosen to cover the sounds of the language.
+fn prompts(lang: Lang) -> &'static [&'static str] {
+    match lang {
         Lang::En => &[
             "The quick brown fox jumps over the lazy dog near the riverbank.",
             "She sells seashells by the seashore every summer morning.",
@@ -180,7 +183,19 @@ impl VoiceApp {
                 "The name of your new voice. Recordings are kept in the datasets folder under this name; the same name continues an earlier recording.",
             )));
             ui.add_space(4.0);
-            let sentences = prompts();
+            let reading = self.clone.reading.unwrap_or_else(crate::i18n::current);
+            m3::field_label(ui, t("Sentence language"));
+            ui.horizontal_wrapped(|ui| {
+                for lang in Lang::ALL {
+                    if m3::filter_chip(ui, lang.name(), lang == reading).clicked() {
+                        self.clone.reading = Some(lang);
+                    }
+                }
+            });
+            ui.label(m3::supporting(t(
+                "Read in the language you will speak through the voice: it learns your accent from what you read.",
+            )));
+            let sentences = prompts(reading);
             let sentence = sentences[self.clone.prompt % sentences.len()];
             m3::field_label(ui, t("Read aloud"));
             egui::Frame::new()

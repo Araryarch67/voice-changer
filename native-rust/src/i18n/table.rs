@@ -341,4 +341,6 @@ pub static TABLE: &[(&str, &str, &str)] = &[
     ("Import trained voice…", "Impor suara hasil training…", "学習したボイスを取り込む…"),
     ("Trained voice", "Suara hasil training", "学習したボイス"),
     ("Imported {}", "{} diimpor", "{} を取り込みました"),
+    ("Sentence language", "Bahasa kalimat", "文の言語"),
+    ("Read in the language you will speak through the voice: it learns your accent from what you read.", "Baca dalam bahasa yang akan kamu pakai saat memakai suara ini: logatmu dipelajari dari apa yang kamu baca.", "このボイスで話す言語で読んでください。読んだ内容からあなたのアクセントを学びます。"),
 ];
