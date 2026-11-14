@@ -11,3 +11,4 @@
 /platforms/android/runtime-libs/**/*.so
 /platforms/ios/vendor/
 /platforms/ios/*.xcodeproj/
+/datasets/

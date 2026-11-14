@@ -175,6 +175,7 @@ impl VoiceApp {
                 }));
             }
             egui::ScrollArea::vertical()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .max_height(400.0)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {

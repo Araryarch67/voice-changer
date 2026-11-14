@@ -1266,6 +1266,7 @@ pub fn menu(anchor: &Response, width: f32, add: impl FnOnce(&mut Ui)) {
             let opening = frames < 3;
             ui.set_width(width);
             egui::ScrollArea::vertical()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .max_height(304.0)
                 .show(ui, |ui| {
                     ui.set_width(width);

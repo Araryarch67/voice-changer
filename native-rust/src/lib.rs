@@ -10,6 +10,7 @@ pub mod cli;
 pub mod config;
 #[cfg(feature = "catalog")]
 pub mod cuda_setup;
+pub mod dataset;
 pub mod denoise;
 pub mod dsp;
 pub mod echo;
@@ -28,6 +29,8 @@ pub mod pitch;
 pub mod platform;
 #[cfg(feature = "export")]
 pub mod pth;
+#[cfg(feature = "audio")]
+pub mod recorder;
 pub mod retrieval;
 pub mod runtime;
 #[cfg(any(feature = "onnx", feature = "onnx-static"))]

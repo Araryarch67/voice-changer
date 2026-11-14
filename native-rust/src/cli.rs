@@ -132,6 +132,28 @@ pub enum Command {
         tuning: Tuning,
         blocks: usize,
     },
+    DatasetList,
+    DatasetShow {
+        name: String,
+    },
+    DatasetAdd {
+        name: String,
+        files: Vec<PathBuf>,
+    },
+    DatasetRecord {
+        name: String,
+        seconds: f64,
+        input: Option<String>,
+    },
+    DatasetPack {
+        name: String,
+        output: Option<PathBuf>,
+        overwrite: bool,
+    },
+    DatasetDelete {
+        name: String,
+    },
+    DatasetColab,
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +189,9 @@ Commands:
                          Convert an RVC checkpoint to ONNX only (no voice folder)
   benchmark VOICE [SETTINGS]
                          Time conversion of synthetic audio on a device
+  dataset list|show|add|record|pack|delete|colab
+                         Clone a voice: collect recordings, pack them for the
+                         Colab training notebook (see `dataset --help`)
   version                Print the version
   help [COMMAND]         Help for a command (also COMMAND --help)
 
@@ -320,6 +345,30 @@ Loads the voice on --device and converts N (3..100, default 6) blocks of synthet
 audio, reporting load time, per-block time and the real-time factor (below 1 keeps up).
 
 {SETTINGS_HELP}"
+        ),
+        "dataset" => format!(
+            "\
+Usage:
+  dataset list [--json]
+  dataset show NAME [--json]
+  dataset add NAME FILE.wav... [--json]
+  dataset record NAME --seconds N [--input DEVICE] [--json]
+  dataset pack NAME [--out FILE.zip] [--overwrite] [--json]
+  dataset delete NAME --yes [--json]   (also removes <datasets>/NAME.zip)
+  dataset colab [--json]
+
+Clones a voice in three steps, like the GUI's Clone page:
+  1. Collect at least {min} s (10 minutes or more is recommended) of one speaker in
+     <datasets>/NAME/: `add` copies WAV files in, `record` records the microphone.
+     Each take is trimmed of silence and its peak set to -1 dBFS.
+  2. `pack` writes <datasets>/NAME.zip (or --out). Open the notebook that `colab`
+     prints, choose a T4 GPU, run its four steps and upload the ZIP in step 2.
+     Training takes about 1-3 hours on Colab's free GPU.
+  3. Step 4 downloads NAME-rvc.zip; `voices import NAME-rvc.zip` installs it.
+
+NAME may contain letters, digits, - and _; other characters become _. Only clone
+voices you have the right to use.",
+            min = crate::dataset::MINIMUM_SECONDS
         ),
         "version" => "Usage: version [--json]".to_owned(),
         "help" => "Usage: help [COMMAND]".to_owned(),
@@ -598,6 +647,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, UsageError> {
             Command::Status
         }
         "voices" => parse_voices(&mut cursor)?,
+        "dataset" | "datasets" => parse_dataset(&mut cursor)?,
         "devices" => {
             let mut direction = None;
             while let Some(arg) = cursor.next() {
@@ -684,6 +734,102 @@ pub fn parse(args: &[String]) -> Result<Invocation, UsageError> {
         other => return usage(format!("Unknown command `{other}`; see `--help`")),
     };
     Ok(invocation(command))
+}
+
+fn parse_dataset(cursor: &mut Cursor) -> Result<Command, UsageError> {
+    let Some(action) = cursor.next() else {
+        return usage("`dataset` needs an action: list, show, add, record, pack, delete or colab");
+    };
+    let action = match action.as_str() {
+        "ls" => "list",
+        "info" => "show",
+        "remove" | "rm" => "delete",
+        other => other,
+    }
+    .to_owned();
+    let command = format!("dataset {action}");
+    let mut positional = Vec::new();
+    let (mut seconds, mut input, mut output) = (None, None, None);
+    let (mut overwrite, mut yes) = (false, false);
+    while let Some(arg) = cursor.next() {
+        match (action.as_str(), arg.as_str()) {
+            ("record", "--seconds") => seconds = Some(number(&arg, &cursor.value(&arg)?)?),
+            ("record", "--input") => input = Some(cursor.value(&arg)?),
+            ("pack", "--out") => output = Some(PathBuf::from(cursor.value(&arg)?)),
+            ("pack", "--overwrite") => overwrite = true,
+            ("delete", "--yes" | "-y") => yes = true,
+            (_, flag) if flag.starts_with("--") => return Err(unknown(flag, &command)),
+            _ => positional.push(arg),
+        }
+    }
+    let name = |positional: &[String]| -> Result<String, UsageError> {
+        let name = crate::dataset::safe_name(&positional[0]);
+        if name.is_empty() {
+            return usage(format!("`{command}`: NAME needs letters or digits"));
+        }
+        Ok(name)
+    };
+    Ok(match action.as_str() {
+        "list" => {
+            positional_count(&command, &positional, 0..=0)?;
+            Command::DatasetList
+        }
+        "colab" => {
+            positional_count(&command, &positional, 0..=0)?;
+            Command::DatasetColab
+        }
+        "show" => {
+            positional_count(&command, &positional, 1..=1)?;
+            Command::DatasetShow {
+                name: name(&positional)?,
+            }
+        }
+        "add" => {
+            positional_count(&command, &positional, 2..=usize::MAX)?;
+            Command::DatasetAdd {
+                name: name(&positional)?,
+                files: positional[1..].iter().map(PathBuf::from).collect(),
+            }
+        }
+        "record" => {
+            positional_count(&command, &positional, 1..=1)?;
+            let Some(seconds) = seconds else {
+                return usage("`dataset record` needs --seconds N (how long to record)");
+            };
+            if !(1.0..=600.0).contains(&seconds) {
+                return usage("`dataset record`: --seconds must be 1..600");
+            }
+            Command::DatasetRecord {
+                name: name(&positional)?,
+                seconds,
+                input,
+            }
+        }
+        "pack" => {
+            positional_count(&command, &positional, 1..=1)?;
+            Command::DatasetPack {
+                name: name(&positional)?,
+                output,
+                overwrite,
+            }
+        }
+        "delete" => {
+            positional_count(&command, &positional, 1..=1)?;
+            if !yes {
+                return usage(
+                    "`dataset delete` removes the recordings from disk; add --yes to confirm",
+                );
+            }
+            Command::DatasetDelete {
+                name: name(&positional)?,
+            }
+        }
+        other => {
+            return usage(format!(
+            "Unknown action `dataset {other}`; use list, show, add, record, pack, delete or colab"
+        ))
+        }
+    })
 }
 
 fn parse_voices(cursor: &mut Cursor) -> Result<Command, UsageError> {
@@ -1078,6 +1224,29 @@ fn run(invocation: &Invocation) -> Result<Report> {
             output,
             realtime,
         } => export_rvc(checkpoint, output, *realtime),
+        Command::DatasetList => dataset_list(),
+        Command::DatasetShow { name } => dataset_show(name),
+        Command::DatasetAdd { name, files } => dataset_add(name, files),
+        Command::DatasetRecord {
+            name,
+            seconds,
+            input,
+        } => dataset_record(name, *seconds, input.as_deref(), invocation.quiet),
+        Command::DatasetPack {
+            name,
+            output,
+            overwrite,
+        } => dataset_pack(name, output.as_deref(), *overwrite),
+        Command::DatasetDelete { name } => dataset_delete(name),
+        Command::DatasetColab => {
+            let url = crate::dataset::colab_url();
+            Ok(Report {
+                text: format!(
+                    "{url}\nChoose Runtime > Change runtime type > T4 GPU, run the four steps and upload the ZIP from `dataset pack` in step 2. Then `voices import NAME-rvc.zip`."
+                ),
+                data: json!({ "url": url }),
+            })
+        }
         Command::Benchmark {
             voice,
             tuning,
@@ -1664,6 +1833,187 @@ fn analyze(input: &Path, output: Option<&Path>, prefix: Option<&Path>) -> Result
     })
 }
 
+/// A dataset folder as JSON: its name, folder, takes and length.
+fn dataset_entry(name: &str) -> Value {
+    let folder = crate::dataset::root().join(name);
+    let takes = crate::dataset::takes(&folder);
+    let seconds = crate::dataset::total_seconds(&takes);
+    json!({
+        "name": name,
+        "folder": display(&folder),
+        "takes": takes.iter().map(|take| json!({
+            "file": display(&take.path),
+            "seconds": (take.seconds * 10.0).round() / 10.0,
+        })).collect::<Vec<_>>(),
+        "seconds": seconds.round(),
+        "ready": seconds >= crate::dataset::MINIMUM_SECONDS,
+        "recommended_seconds": crate::dataset::RECOMMENDED_SECONDS,
+    })
+}
+
+fn dataset_line(entry: &Value) -> String {
+    let seconds = entry["seconds"].as_f64().unwrap_or_default();
+    format!(
+        "{}: {} takes, {}:{:02}{}",
+        entry["name"].as_str().unwrap_or_default(),
+        entry["takes"].as_array().map_or(0, Vec::len),
+        seconds as u64 / 60,
+        seconds as u64 % 60,
+        if entry["ready"].as_bool().unwrap_or_default() {
+            ""
+        } else {
+            " (too short to train)"
+        }
+    )
+}
+
+fn dataset_list() -> Result<Report> {
+    let root = crate::dataset::root();
+    let mut names: Vec<String> = std::fs::read_dir(&root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().is_dir())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    let entries: Vec<Value> = names.iter().map(|name| dataset_entry(name)).collect();
+    let text = if entries.is_empty() {
+        format!("No datasets in {}", display(&root))
+    } else {
+        entries
+            .iter()
+            .map(dataset_line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok(Report {
+        data: json!({ "root": display(&root), "datasets": entries }),
+        text,
+    })
+}
+
+fn dataset_show(name: &str) -> Result<Report> {
+    let entry = dataset_entry(name);
+    let mut text = dataset_line(&entry);
+    for take in entry["takes"].as_array().into_iter().flatten() {
+        text.push_str(&format!(
+            "\n  {} ({} s)",
+            take["file"].as_str().unwrap_or_default(),
+            take["seconds"]
+        ));
+    }
+    Ok(Report { data: entry, text })
+}
+
+fn dataset_add(name: &str, files: &[PathBuf]) -> Result<Report> {
+    let folder = crate::dataset::root().join(name);
+    let mut added = Vec::new();
+    for file in files {
+        let report = crate::dataset::add_file(&folder, file)
+            .with_context(|| format!("Could not add {}", display(file)))?;
+        added.push(take_json(&report));
+    }
+    let entry = dataset_entry(name);
+    Ok(Report {
+        text: format!("Added {} file(s). {}", added.len(), dataset_line(&entry)),
+        data: json!({ "added": added, "dataset": entry }),
+    })
+}
+
+fn take_json(report: &crate::dataset::TakeReport) -> Value {
+    json!({
+        "file": display(&report.take.path),
+        "seconds": (report.take.seconds * 10.0).round() / 10.0,
+        "clipped": report.clipped,
+        "quiet": report.quiet,
+    })
+}
+
+#[cfg(feature = "audio")]
+fn dataset_record(name: &str, seconds: f64, input: Option<&str>, quiet: bool) -> Result<Report> {
+    let device = input.map(|spec| resolve_device(spec, true)).transpose()?;
+    let recorder = crate::recorder::Recorder::start(&device)?;
+    if !quiet {
+        eprintln!("Recording for {seconds:.0} s; speak now.");
+    }
+    std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
+    let (rate, samples) = recorder.finish();
+    let folder = crate::dataset::root().join(name);
+    let report = crate::dataset::save_take(&folder, rate, &samples)?;
+    let entry = dataset_entry(name);
+    let mut text = format!(
+        "Saved {} ({:.1} s of voice). {}",
+        display(&report.take.path),
+        report.take.seconds,
+        dataset_line(&entry)
+    );
+    if report.clipped {
+        text.push_str("\nwarning: the take clipped; lower the microphone gain");
+    } else if report.quiet {
+        text.push_str("\nwarning: the take is very quiet; raise the microphone gain");
+    }
+    Ok(Report {
+        text,
+        data: json!({ "take": take_json(&report), "dataset": entry }),
+    })
+}
+#[cfg(not(feature = "audio"))]
+fn dataset_record(_: &str, _: f64, _: Option<&str>, _: bool) -> Result<Report> {
+    bail!("This build cannot record (built without the audio feature)")
+}
+
+#[cfg(feature = "export")]
+fn dataset_pack(name: &str, output: Option<&Path>, overwrite: bool) -> Result<Report> {
+    let folder = crate::dataset::root().join(name);
+    anyhow::ensure!(
+        folder.is_dir(),
+        "No dataset named {name}; see `dataset list`"
+    );
+    let output = output
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| crate::dataset::root().join(format!("{name}.zip")));
+    if output.exists() && !overwrite {
+        return Err(UsageError(format!(
+            "{} exists; add --overwrite to replace it",
+            display(&output)
+        ))
+        .into());
+    }
+    let seconds = crate::dataset::pack(&folder, name, &output)?;
+    let url = crate::dataset::colab_url();
+    Ok(Report {
+        text: format!(
+            "Packed {seconds:.0} s into {}\nUpload it in step 2 of {url}",
+            display(&output)
+        ),
+        data: json!({ "zip": display(&output), "seconds": seconds.round(), "colab": url }),
+    })
+}
+#[cfg(not(feature = "export"))]
+fn dataset_pack(_: &str, _: Option<&Path>, _: bool) -> Result<Report> {
+    bail!("This build cannot pack datasets (built without the export feature)")
+}
+
+fn dataset_delete(name: &str) -> Result<Report> {
+    let folder = crate::dataset::root().join(name);
+    anyhow::ensure!(
+        folder.is_dir(),
+        "No dataset named {name}; see `dataset list`"
+    );
+    std::fs::remove_dir_all(&folder)
+        .with_context(|| format!("Could not delete {}", display(&folder)))?;
+    // The ZIP `dataset pack` made by default goes with it.
+    let packed = crate::dataset::root().join(format!("{name}.zip"));
+    let _ = std::fs::remove_file(&packed);
+    Ok(Report {
+        text: format!("Deleted {}", display(&folder)),
+        data: json!({ "deleted": display(&folder) }),
+    })
+}
+
 fn export_rvc(checkpoint: &Path, output: &Path, realtime: bool) -> Result<Report> {
     #[cfg(feature = "export")]
     {
@@ -1840,6 +2190,36 @@ mod tests {
     }
 
     #[test]
+    fn dataset_commands_parse() {
+        assert!(matches!(parsed("dataset ls").command, Command::DatasetList));
+        match parsed("dataset add My.Voice a.wav b.wav").command {
+            Command::DatasetAdd { name, files } => {
+                assert_eq!(name, "My_Voice");
+                assert_eq!(files.len(), 2);
+            }
+            other => panic!("{other:?}"),
+        }
+        match parsed("dataset record me --seconds=30 --input mic").command {
+            Command::DatasetRecord { seconds, input, .. } => {
+                assert_eq!(seconds, 30.0);
+                assert_eq!(input.as_deref(), Some("mic"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(rejected("dataset record me").contains("--seconds"));
+        assert!(rejected("dataset delete me").contains("--yes"));
+        assert!(rejected("dataset add me").contains("missing"));
+        assert!(rejected("dataset show ..").contains("NAME"));
+        assert!(matches!(
+            parsed("dataset pack me --overwrite").command,
+            Command::DatasetPack {
+                overwrite: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn global_flags_go_anywhere() {
         let invocation = parsed("voices --json list -v");
         assert!(invocation.json && invocation.verbose && !invocation.quiet);
@@ -1860,6 +2240,7 @@ mod tests {
             "analyze",
             "export-rvc",
             "benchmark",
+            "dataset",
             "version",
             "help",
         ] {

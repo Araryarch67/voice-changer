@@ -11,6 +11,8 @@ use std::{path::PathBuf, sync::mpsc};
 
 #[cfg(feature = "catalog")]
 mod browse;
+#[cfg(feature = "audio")]
+mod clone;
 #[cfg(all(feature = "catalog", any(feature = "onnx", feature = "onnx-static")))]
 mod cuda;
 #[cfg(feature = "catalog")]
@@ -108,6 +110,8 @@ enum Page {
     Voices,
     Studio,
     Convert,
+    #[cfg(feature = "audio")]
+    Clone,
     Settings,
 }
 /// What a voice card's menu does with its slot.
@@ -140,6 +144,8 @@ pub struct VoiceApp {
     /// Downloads NVIDIA's CUDA libraries when GPU (CUDA) is missing them.
     #[cfg(all(feature = "catalog", any(feature = "onnx", feature = "onnx-static")))]
     cuda: cuda::CudaSetup,
+    #[cfg(feature = "audio")]
+    clone: clone::CloneState,
     import_checkpoint: String,
     import_index: String,
     file_output: String,
@@ -229,6 +235,8 @@ impl VoiceApp {
             setup: setup::Setup::on_start(),
             #[cfg(all(feature = "catalog", any(feature = "onnx", feature = "onnx-static")))]
             cuda: Default::default(),
+            #[cfg(feature = "audio")]
+            clone: Default::default(),
             import_checkpoint: String::new(),
             import_index: String::new(),
             file_output: String::new(),
@@ -501,6 +509,8 @@ impl VoiceApp {
             (Page::Voices, icons::GRAPHIC_EQ, t("Voices")),
             (Page::Studio, icons::TUNE, t("Studio")),
             (Page::Convert, icons::AUDIO_FILE, t("Convert")),
+            #[cfg(feature = "audio")]
+            (Page::Clone, icons::VOICE, t("Clone")),
             (Page::Settings, icons::SETTINGS, t("Settings")),
         ];
         if compact {
@@ -2506,6 +2516,9 @@ impl eframe::App for VoiceApp {
                     .inner_margin(if compact { 16 } else { 28 })
                     .show(ui, |ui| {
                         egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            )
                             .auto_shrink(false)
                             .show(ui, |ui| {
                                 self.notices(ui);
@@ -2513,6 +2526,8 @@ impl eframe::App for VoiceApp {
                                     Page::Voices => self.gallery(ui),
                                     Page::Studio => self.voice_controls(ui),
                                     Page::Convert => self.convert_page(ui),
+                                    #[cfg(feature = "audio")]
+                                    Page::Clone => self.clone_page(ui),
                                     Page::Settings => self.settings(ui),
                                 }
                             });

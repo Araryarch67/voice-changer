@@ -379,7 +379,11 @@ fn voice_output(host: &cpal::Host, options: &AudioOptions) -> Result<cpal::Devic
     }
 }
 
-fn select_device(host: &cpal::Host, id: &Option<String>, input: bool) -> Result<cpal::Device> {
+pub(crate) fn select_device(
+    host: &cpal::Host,
+    id: &Option<String>,
+    input: bool,
+) -> Result<cpal::Device> {
     if let Some(id) = id {
         return host
             .device_by_id(&id.parse()?)

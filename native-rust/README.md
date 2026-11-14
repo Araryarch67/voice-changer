@@ -63,6 +63,16 @@ On Windows set `ORT_DYLIB_PATH` to `onnxruntime.dll` in PowerShell (`$env:ORT_DY
 
 **Import model** (or dropping a `.pth` or `.index` on the window) opens a dialog with separate fields for the RVC `.pth` checkpoint and its `.index`; the index is optional, and the one beside the checkpoint is filled in when there is one. The checkpoint is exported to `models/<name>/voice-realtime.onnx`, the index is copied into the same folder, and a manifest is written that uses `models/shared/contentvec.onnx` and `models/shared/rmvpe.onnx`, which must already exist. **Edit → Change index** replaces or removes a voice's index later. **Find online** searches [voice-models.com](https://voice-models.com) and adds a voice in one step: it downloads the voice's ZIP from its host (Hugging Face, Google Drive or MediaFire, which cover about 96% of listed voices), takes the `.pth` and `.index` out of it and converts it like an import. There is no official API, so this reads the site's own search and may stop working if the site changes; voices on Mega open in the browser instead, and GPT-SoVITS or other non-RVC models are marked as unsupported. A `portrait.png` (or `.jpg`, `.jpeg`, `.webp`) in a voice's folder is shown on its card; **Edit → Choose picture** copies one there.
 
+## Cloning your own voice
+
+The **Clone** page makes an RVC v2 voice from your own recordings. The app does not train (training needs PyTorch and a GPU for an hour or more); it prepares the recordings for a Google Colab notebook that trains on Colab's free GPU, and imports what it produces.
+
+1. **Record.** Give the voice a name and read the sentences shown, or speak or sing freely. Each take is trimmed of silence, its peak set to -1 dBFS, and kept in `datasets/<name>/` beside the models folder; a take that clipped or was very quiet is flagged. **Add WAV recordings…** adds recordings you already have. At least one minute is needed; ten minutes or more of only your voice, in a quiet room, gives a good voice.
+2. **Train on Google Colab.** **Pack for Colab** writes `datasets/<name>.zip` (the takes plus `voice-changer-dataset.json` with the name). **Open Colab notebook** opens [`colab/train_voice.ipynb`](colab/train_voice.ipynb) at this app's version. In Colab choose a T4 GPU and run its four steps: install the trainer ([Applio](https://github.com/IAHispano/Applio) 3.7.1, pinned), upload the ZIP, train (RMVPE pitch, ContentVec, HiFi-GAN, 40 kHz, 300 epochs by default, about 1–3 hours), and download `<name>-rvc.zip`. With **keep_in_drive** on, training is saved to `MyDrive/VoiceChanger/<name>` and continues after a disconnect.
+3. **Import the trained voice** takes that ZIP like any other voice.
+
+Only clone voices you have the right to use. Training on your own computer is planned as a later step.
+
 ## Model contract
 
 Copy [examples/model.json](examples/model.json), point its files to actual ONNX models and set the voice model's real sample rate. Relative paths resolve against the manifest directory. RVC v1 (256-channel) and v2 (768-channel) checkpoints, with or without f0, at 32, 40 or 48 kHz (the standard architectures) are converted to the voice model without Python:
@@ -103,6 +113,10 @@ Run without arguments, the program opens the GUI. With a command it works withou
 | `analyze IN.wav [OUT.wav]` | JSON and PNG diagnostics for a recording or an input/output pair |
 | `export-rvc MODEL.pth OUT.onnx [--realtime]` | Checkpoint to ONNX only, without a voice folder |
 | `benchmark VOICE [--blocks N] [SETTINGS]` | Times conversion on a device; a real-time factor below 1 keeps up |
+| `dataset list` / `dataset show NAME` | Recordings collected for cloning a voice, with their length and whether there is enough to train |
+| `dataset add NAME FILE.wav...` / `dataset record NAME --seconds N [--input DEV]` | Adds WAV files or records the microphone into `datasets/NAME/`, trimmed and normalized like the Clone page |
+| `dataset pack NAME [--out FILE.zip] [--overwrite]` / `dataset colab` | Packs the recordings for the Colab notebook and prints its URL; import the trained `NAME-rvc.zip` with `voices import` |
+| `dataset delete NAME --yes` | Deletes the recordings and their packed ZIP |
 
 `VOICE` is a voice's name or folder name as `voices list` shows them (case does not matter), a voice folder, or a `model.json` path. A device is an ID from `devices`, its exact name, or a unique part of the name.
 
@@ -114,7 +128,7 @@ WAV input is downmixed to mono; output is mono PCM16 at the input sample rate. I
 
 - Add `--json` anywhere on the line. stdout then holds exactly one JSON object, `{"ok":true,"data":{...}}` on success or `{"ok":false,"error":{"kind":"usage"|"failure","message":"..."}}` on failure. Logs and download progress go to stderr; `-q` silences progress and `-v` adds log lines.
 - Exit codes: `0` success, `1` the command ran and failed (missing file, model error, download failure), `2` the command line is wrong (unknown command or option, a value out of range, a missing `--yes`, an existing output without `--overwrite`).
-- Nothing waits for input. `voices delete` requires `--yes`; `convert` never replaces a file without `--overwrite`.
+- Nothing waits for input. `voices delete` and `dataset delete` require `--yes`; `convert` never replaces a file without `--overwrite`.
 - `live --json` prints one JSON object per line: `{"event":"ready",...}` when audio flows, `{"event":"status",...}` every `--status-every` seconds (levels, processing time per block, dropped samples), then the final `{"ok":...}` object when `--duration` ends or audio fails. Stopping it with a signal ends it without the final object, so give `--duration` when the result matters.
 - Paths in the output are absolute.
 
@@ -193,6 +207,6 @@ On Windows, run `target/debug/examples/capture OUT.png 1100 760` directly; it op
 
 ## Source map
 
-`app.rs` owns the egui UI; `audio.rs` owns device streams, bounded queues and the worker; `engine.rs` applies gains/bypass and enforces output validity; `rvc.rs` implements the ONNX conversion pipeline; `dsp.rs` contains resampling and SOLA; `retrieval.rs` reads FAISS IVF-Flat indexes and feature banks; `pth.rs` reads PyTorch checkpoints; `export.rs` converts RVC checkpoints to ONNX; `platform.rs` handles mobile permissions/audio sessions; `wav.rs` provides offline conversion; `cli.rs` is the command line.
+`app.rs` owns the egui UI; `audio.rs` owns device streams, bounded queues and the worker; `engine.rs` applies gains/bypass and enforces output validity; `rvc.rs` implements the ONNX conversion pipeline; `dsp.rs` contains resampling and SOLA; `retrieval.rs` reads FAISS IVF-Flat indexes and feature banks; `pth.rs` reads PyTorch checkpoints; `export.rs` converts RVC checkpoints to ONNX; `platform.rs` handles mobile permissions/audio sessions; `wav.rs` provides offline conversion; `cli.rs` is the command line; `dataset.rs` and `recorder.rs` collect recordings for cloning a voice, `app/clone.rs` is the Clone page, and `colab/train_voice.ipynb` trains them.
 
 The original `reference/server/` and `reference/client/` (git-ignored) remain reference code. Existing upstream licenses in the repository remain applicable to those sources and any derivatives. No pretrained voice weights or third-party product branding are included.
