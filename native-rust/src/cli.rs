@@ -131,6 +131,7 @@ pub enum Command {
         vocal_gain: f32,
         music_gain: f32,
         keep_stems: bool,
+        auto_tune: Option<crate::config::Register>,
         overwrite: bool,
     },
     Analyze {
@@ -357,14 +358,19 @@ Existing stems are only replaced with --overwrite. Progress goes to stderr."
         "cover" => format!(
             "\
 Usage: cover VOICE SONG [OUT.wav] [--voice-gain G] [--music-gain G] [--keep-stems]
-             [SETTINGS] [--overwrite] [--json]
+             [--auto-tune female|male] [SETTINGS] [--overwrite] [--json]
 
 Sings SONG in VOICE: its vocals are separated (as `split` does), converted with the
 voice, and mixed back over the instrumental into OUT.wav (16-bit stereo, 44.1 kHz;
 default SONG-cover.wav beside the song, turned down as a whole if it would clip).
 --voice-gain and --music-gain (0..2, default 1) set the balance. --keep-stems also
-writes OUT-vocals.wav, OUT-instrumental.wav and OUT-new-vocals.wav. Use --semitones
-to move the song to the voice's range and --f0 rmvpe (the default) for singing.
+writes OUT-vocals.wav, OUT-instrumental.wav and OUT-new-vocals.wav.
+--auto-tune measures how high the song is sung and picks --semitones for a female
+or male voice, in whole octaves so the voice stays in key with the music; it
+replaces --semitones and is reported with the song's pitch. Otherwise use
+--semitones (0, 12 or -12 keep the key) to move the song to the voice's range.
+Echo cancellation and noise suppression are not used; --f0 rmvpe (the default)
+suits singing.
 Needs `setup download kim_vocal_2`. Progress goes to stderr.
 
 {SETTINGS_HELP}"
@@ -1104,7 +1110,7 @@ fn parse_cover(cursor: &mut Cursor) -> Result<Command, UsageError> {
     let mut tuning = TuningFlags::default();
     let mut positional = Vec::new();
     let (mut voice, mut vocal_gain, mut music_gain) = (None, 1.0_f32, 1.0_f32);
-    let (mut keep_stems, mut overwrite) = (false, false);
+    let (mut keep_stems, mut overwrite, mut auto_tune) = (false, false, None);
     let gain = |flag: &str, value: String| -> Result<f32, UsageError> {
         let gain: f32 = number(flag, &value)?;
         if !(0.0..=2.0).contains(&gain) {
@@ -1118,6 +1124,14 @@ fn parse_cover(cursor: &mut Cursor) -> Result<Command, UsageError> {
             "--voice-gain" => vocal_gain = gain(&arg, cursor.value(&arg)?)?,
             "--music-gain" => music_gain = gain(&arg, cursor.value(&arg)?)?,
             "--keep-stems" => keep_stems = true,
+            "--auto-tune" => {
+                let value = cursor.value(&arg)?;
+                auto_tune = Some(match value.to_ascii_lowercase().as_str() {
+                    "female" | "f" => crate::config::Register::Female,
+                    "male" | "m" => crate::config::Register::Male,
+                    _ => return usage(format!("--auto-tune must be female or male, not {value}")),
+                });
+            }
             "--overwrite" | "--force" => overwrite = true,
             flag if tuning.take(flag, cursor)? => {}
             flag if flag.starts_with("--") => return Err(unknown(flag, "cover")),
@@ -1138,6 +1152,7 @@ fn parse_cover(cursor: &mut Cursor) -> Result<Command, UsageError> {
         vocal_gain,
         music_gain,
         keep_stems,
+        auto_tune,
         overwrite,
     })
 }
@@ -1353,6 +1368,7 @@ fn run(invocation: &Invocation) -> Result<Report> {
             vocal_gain,
             music_gain,
             keep_stems,
+            auto_tune,
             overwrite,
         } => cover(
             &CoverArgs {
@@ -1363,6 +1379,7 @@ fn run(invocation: &Invocation) -> Result<Report> {
                 vocal_gain: *vocal_gain,
                 music_gain: *music_gain,
                 keep_stems: *keep_stems,
+                auto_tune: *auto_tune,
                 overwrite: *overwrite,
             },
             invocation.quiet,
@@ -1979,7 +1996,7 @@ fn with_progress<T: Send>(
     progress: &crate::separate::Progress,
     work: impl FnOnce() -> Result<T> + Send,
 ) -> Result<T> {
-    use crate::separate::{CONVERTING, SEPARATING};
+    use crate::separate::{CONVERTING, MEASURING, SEPARATING};
     use std::sync::atomic::Ordering;
     std::thread::scope(|scope| {
         let worker = scope.spawn(work);
@@ -1991,6 +2008,7 @@ fn with_progress<T: Send>(
                 let stage = match progress.stage.load(Ordering::Relaxed) {
                     SEPARATING => "Separating the vocals",
                     CONVERTING => "Converting the vocals",
+                    MEASURING => "Measuring the song's pitch",
                     _ => "Saving",
                 };
                 eprintln!("{stage}: {:.0}%", progress.fraction() * 100.0);
@@ -2059,6 +2077,7 @@ struct CoverArgs<'a> {
     vocal_gain: f32,
     music_gain: f32,
     keep_stems: bool,
+    auto_tune: Option<crate::separate::Register>,
     overwrite: bool,
 }
 
@@ -2091,6 +2110,7 @@ fn cover(args: &CoverArgs, quiet: bool) -> Result<Report> {
                 vocal_gain: args.vocal_gain,
                 music_gain: args.music_gain,
                 keep_stems: args.keep_stems,
+                auto_tune: args.auto_tune,
             },
             &progress,
         )
@@ -2104,6 +2124,12 @@ fn cover(args: &CoverArgs, quiet: bool) -> Result<Report> {
         files.seconds,
         device_name(settings.device)
     );
+    if let Some(pitch) = files.pitch {
+        text.push_str(&format!(
+            "\nThe song is sung around {:.0} Hz (high notes {:.0} Hz): Tune {:+.0}",
+            pitch.median_hz, pitch.high_hz, files.semitones
+        ));
+    }
     for stem in &files.stems {
         text.push_str(&format!("\n{}", stem.display()));
     }
@@ -2118,6 +2144,11 @@ fn cover(args: &CoverArgs, quiet: bool) -> Result<Report> {
             "elapsed_ms": elapsed * 1000.0,
             "voice_gain": args.vocal_gain,
             "music_gain": args.music_gain,
+            "semitones": files.semitones,
+            "song_pitch": files.pitch.map(|p| json!({
+                "median_hz": p.median_hz,
+                "high_hz": p.high_hz,
+            })),
             "settings": settings_json(&settings),
         }),
     })
@@ -2532,6 +2563,7 @@ mod tests {
                 vocal_gain,
                 music_gain,
                 keep_stems,
+                auto_tune,
                 overwrite,
             } => {
                 assert_eq!(voice, "Aria");
@@ -2540,9 +2572,19 @@ mod tests {
                 assert_eq!(tuning.settings.semitones, 12.0);
                 assert_eq!((vocal_gain, music_gain), (1.25, 1.0));
                 assert!(keep_stems && !overwrite);
+                assert_eq!(auto_tune, None);
             }
             _ => panic!("not a cover"),
         }
+        assert!(matches!(
+            parsed("cover Aria song.mp3 --auto-tune Male").command,
+            Command::Cover {
+                auto_tune: Some(crate::config::Register::Male),
+                ..
+            }
+        ));
+        assert!(rejected("cover Aria song.mp3 --auto-tune high").contains("female or male"));
+        assert!(rejected("cover Aria song.mp3 --auto-tune").contains("--auto-tune"));
         assert!(matches!(
             parsed("cover --voice Aria song.mp3").command,
             Command::Cover { output: None, .. }

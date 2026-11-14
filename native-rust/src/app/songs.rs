@@ -18,6 +18,12 @@ pub(super) struct SongsState {
     vocal_gain: f32,
     music_gain: f32,
     keep_stems: bool,
+    /// The cover's own Tune: the song's singer is not the person at the
+    /// microphone, so Studio's Tune does not suit it.
+    semitones: f32,
+    /// Choose Tune from the song's pitch for a voice in `register`.
+    auto_tune: bool,
+    register: separate::Register,
     /// The running split or cover.
     progress: Option<Arc<Progress>>,
 }
@@ -31,6 +37,9 @@ impl Default for SongsState {
             vocal_gain: 1.0,
             music_gain: 1.0,
             keep_stems: false,
+            semitones: 0.0,
+            auto_tune: true,
+            register: separate::Register::Female,
             progress: None,
         }
     }
@@ -102,6 +111,7 @@ impl VoiceApp {
             let stage = match progress.stage.load(Ordering::Relaxed) {
                 separate::SEPARATING => t("Separating the vocals…"),
                 separate::CONVERTING => t("Singing it in the new voice…"),
+                separate::MEASURING => t("Measuring how high the song is…"),
                 _ => t("Saving…"),
             };
             let fraction = progress.fraction();
@@ -270,20 +280,42 @@ impl VoiceApp {
                     }
                 });
                 ui.add_space(8.0);
-                let s = &mut self.saved.settings;
-                m3::setting(
+                ui.horizontal(|ui| {
+                    m3::switch(ui, &mut self.songs.auto_tune, t("Automatic Tune"));
+                    ui.label(t("Automatic Tune"));
+                });
+                ui.label(m3::supporting(t(
+                    "Measures how high the song is sung and moves it by whole octaves to suit the voice, so it stays in key with the music.",
+                )));
+                if self.songs.auto_tune {
+                    m3::field_label(ui, t("The chosen voice (RVC model) is"));
+                    ui.horizontal_wrapped(|ui| {
+                        for (register, name) in [
+                            (separate::Register::Female, t("A female voice")),
+                            (separate::Register::Male, t("A male voice")),
+                        ] {
+                            if m3::filter_chip(ui, name, self.songs.register == register).clicked() {
+                                self.songs.register = register;
+                            }
+                        }
+                    });
+                    ui.label(m3::supporting(t(
+                        "Pick the voice you sing with, not the song's singer: the singer's pitch is measured from the song.",
+                    )));
+                }
+                ui.add_enabled_ui(!self.songs.auto_tune, |ui| m3::setting(
                     ui,
                     t("Tune"),
-                    t("Moves the song to suit the voice. +12 is one octave up, -12 one octave down; 0 keeps the song's key."),
+                    t("Moves the song for the voice; Studio's Tune is not used here. The music is not moved, so 0, +12 (one octave up) and -12 (one octave down) keep the voice in key with it."),
                     m3::Format::new(t(" semitones"))
-                        .tip(t("Recommended: +12 for a female voice, -2.5 for a male voice."))
+                        .tip(t("A man's song in a female voice: try +12. A woman's song in a male voice: try -12. High notes break up or go quiet when they end up too high for the voice, so if they vanish, go lower."))
                         .decimals(1)
                         .signed()
-                        .presets(&[-12.0, -8.0, -5.0, 0.0, 5.0, 8.0, 12.0]),
-                    &mut s.semitones,
+                        .presets(&[-24.0, -12.0, 0.0, 12.0, 24.0]),
+                    &mut self.songs.semitones,
                     -24.0..=24.0,
                     0.1,
-                );
+                ));
                 m3::setting(
                     ui,
                     t("Voice volume"),
@@ -336,7 +368,11 @@ impl VoiceApp {
                 let voice = PathBuf::from(self.saved.slots[self.saved.selected].manifest.trim());
                 let song = PathBuf::from(self.songs.cover_input.trim());
                 let output = PathBuf::from(self.songs.cover_output.trim());
-                let settings = self.saved.settings.clone();
+                let settings = crate::config::Settings {
+                    semitones: self.songs.semitones,
+                    ..self.saved.settings.clone()
+                };
+                let auto_tune = self.songs.auto_tune.then_some(self.songs.register);
                 let (vocal_gain, music_gain, keep_stems) = (
                     self.songs.vocal_gain,
                     self.songs.music_gain,
@@ -356,10 +392,21 @@ impl VoiceApp {
                             vocal_gain,
                             music_gain,
                             keep_stems,
+                            auto_tune,
                         },
                         &progress,
                     )?;
-                    Ok(tf("Cover saved: {}", &[&files.cover.display()]))
+                    Ok(match files.pitch {
+                        Some(pitch) => tf(
+                            "Cover saved: {} (the song is sung around {} Hz, so Tune {})",
+                            &[
+                                &files.cover.display(),
+                                &format!("{:.0}", pitch.median_hz),
+                                &format!("{:+.0}", files.semitones),
+                            ],
+                        ),
+                        None => tf("Cover saved: {}", &[&files.cover.display()]),
+                    })
                 });
             }
         });

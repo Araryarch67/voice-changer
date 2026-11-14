@@ -64,6 +64,12 @@ Host: Windows 11 x86_64; Rust 1.100.
 - On the Android 15 x86_64 emulator: the app first closed at once, because egui asked the GPU for wgpu's default limits (64 KB uniform buffers) and the emulator's Vulkan offers 16 KB; it now asks only for limits the GPU has (`lib.rs`). The interface then drew under the status bar; it now leaves room for the status and navigation bars (`platform::system_bar_insets`). After that the app opened, every page showed, Japanese text rendered, the microphone permission was asked, and Start opened AAudio input and output and went live in bypass.
 - Not checked: a real phone, a voice converting live (no voice was copied to the device), Split and Cover on a phone, and speed. The emulator crashed in its own OpenGL code with `-gpu swiftshader_indirect`; `-gpu host` worked.
 
+## Update — Cover Tune (2026-11-15)
+
+- Cover used Studio's Tune (+12 to +14 in the tester's voices, meant for their own voice), which pushed a song's high notes far above what a voice sings. Cover now has its own Tune, and **Automatic Tune** measures the separated vocals with Harvest and picks whole octaves for a female or male voice (`separate::song_pitch`, `automatic_semitones`, `cover --auto-tune`). Echo cancellation and noise suppression are off for covers; RNNoise was measured first and kept 89 to 100 % of a sung vowel from 150 to 1100 Hz, so it was not the cause.
+- A real song ("From The Start", Laufey, 171 s WAV) separated with Kim Vocal 2 measured: median 310 Hz (D#4), 95th percentile 449 Hz, peak 713 Hz. `cover --auto-tune female` chose +0 and `--auto-tune male` −12, about 86 s each on CPU. The voice was the synthetic test voice, so the sound was not judged.
+- Unit tests: octave choice, pitch measurement of harmonic tones with quiet bleed ignored, the cover settings, and the CLI flag. fmt, clippy (`-D warnings`) and `cargo test` passed; the Cover page was checked as a screenshot.
+
 ## Before 1.0: checks by hand
 
 None of these has been run with real audio yet. Each needs a real RVC voice, a microphone and headphones.

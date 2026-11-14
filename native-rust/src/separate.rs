@@ -46,6 +46,7 @@ pub struct Progress {
 pub const SEPARATING: usize = 0;
 pub const CONVERTING: usize = 1;
 pub const MIXING: usize = 2;
+pub const MEASURING: usize = 3;
 impl Progress {
     fn begin(&self, stage: usize, total: usize) {
         self.stage.store(stage, Ordering::Relaxed);
@@ -123,6 +124,97 @@ pub struct CoverJob<'a> {
     /// Also write the vocals, the instrumental and the converted vocals beside the
     /// output.
     pub keep_stems: bool,
+    /// Choose Tune from the song's own pitch for a voice in this register instead
+    /// of using `settings.semitones`.
+    pub auto_tune: Option<Register>,
+}
+
+pub use crate::config::Register;
+
+impl Register {
+    /// The middle of a melody sung comfortably in this register: E4 and E3.
+    fn centre_hz(self) -> f32 {
+        match self {
+            Register::Female => 330.0,
+            Register::Male => 165.0,
+        }
+    }
+
+    /// Above this (A5 and A4) high notes start to thin out or break up in voices
+    /// trained on this register.
+    fn ceiling_hz(self) -> f32 {
+        match self {
+            Register::Female => 880.0,
+            Register::Male => 440.0,
+        }
+    }
+}
+
+/// How high a song's vocals are sung.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SongPitch {
+    /// The middle of the sung notes.
+    pub median_hz: f32,
+    /// The high notes: 95 % of sung frames are at or below this.
+    pub high_hz: f32,
+}
+
+/// The pitch of separated vocals (`rate` Hz, mono): each 10 ms frame that is sung,
+/// that is voiced and within 30 dB of the loudest frame so bleed from the music
+/// does not count. `None` when less than a second is sung.
+pub fn song_pitch(vocals: &[f32], rate: u32) -> Option<SongPitch> {
+    let audio = crate::dsp::resample(vocals, rate, 16_000);
+    #[cfg(feature = "world")]
+    let f0 = crate::pitch::harvest(&audio);
+    #[cfg(not(feature = "world"))]
+    let f0 = crate::pitch::yin(&audio, audio.len() / 160);
+    let loudness: Vec<f32> = (0..f0.len())
+        .map(|frame| {
+            let start = (frame * 160).min(audio.len());
+            crate::dsp::rms(&audio[start..(start + 320).min(audio.len())])
+        })
+        .collect();
+    let loudest = loudness.iter().copied().fold(0.0, f32::max);
+    let mut sung: Vec<f32> = f0
+        .iter()
+        .zip(&loudness)
+        .filter(|(hz, level)| **hz > 0.0 && **level > loudest * 0.03)
+        .map(|(hz, _)| *hz)
+        .collect();
+    if sung.len() < 100 {
+        return None;
+    }
+    sung.sort_by(f32::total_cmp);
+    let at = |share: usize| sung[(sung.len() - 1) * share / 100];
+    Some(SongPitch {
+        median_hz: at(50),
+        high_hz: at(95),
+    })
+}
+
+/// Tune for singing `pitch` in a voice of `register`: whole octaves only, because
+/// the music keeps its key; the octave that brings the melody's middle nearest the
+/// register's, then lower while the high notes would go above what it sings well.
+pub fn automatic_semitones(pitch: &SongPitch, register: Register) -> f32 {
+    let octaves = (register.centre_hz() / pitch.median_hz).log2().round();
+    let mut octaves = octaves.clamp(-2.0, 2.0);
+    while octaves > -2.0 && pitch.high_hz * 2.0_f32.powf(octaves) > register.ceiling_hz() {
+        octaves -= 1.0;
+    }
+    octaves * 12.0
+}
+
+/// The Studio settings as a cover uses them. The separated vocals are already
+/// clean, so the microphone's clean-up stays off: echo cancellation would take
+/// the voice's own previous block out of the next one, and noise suppression
+/// can thin out long held notes.
+pub fn song_settings(studio: &crate::config::Settings) -> crate::config::Settings {
+    crate::config::Settings {
+        bypass: false,
+        echo: false,
+        noise: crate::config::Noise::Off,
+        ..studio.clone()
+    }
 }
 
 /// Files a cover wrote.
@@ -130,6 +222,10 @@ pub struct CoverFiles {
     pub cover: std::path::PathBuf,
     pub stems: Vec<std::path::PathBuf>,
     pub seconds: f64,
+    /// The Tune the voice sang with.
+    pub semitones: f32,
+    /// The song's pitch, when Tune was chosen from it.
+    pub pitch: Option<SongPitch>,
 }
 
 /// A cover of a song in another voice: the vocals are separated, converted with
@@ -147,10 +243,15 @@ pub fn cover(job: &CoverJob, progress: &Progress) -> Result<CoverFiles> {
         .zip(&stems.vocals.channels[1])
         .map(|(left, right)| (left + right) / 2.0)
         .collect();
-    let settings = crate::config::Settings {
-        bypass: false,
-        ..job.settings.clone()
-    };
+    let mut settings = song_settings(job.settings);
+    let mut pitch = None;
+    if let Some(register) = job.auto_tune {
+        progress.begin(MEASURING, 1);
+        let measured = song_pitch(&vocals, RATE)
+            .context("No singing was found in the song to choose Tune from; set Tune yourself")?;
+        settings.semitones = automatic_semitones(&measured, register);
+        pitch = Some(measured);
+    }
     let converter = crate::engine::load_converter_on(job.voice, settings.device)?;
     let mut engine = crate::engine::Engine::new(Some(converter));
     progress.begin(CONVERTING, 1);
@@ -196,6 +297,8 @@ pub fn cover(job: &CoverJob, progress: &Progress) -> Result<CoverFiles> {
         cover: job.output.to_path_buf(),
         stems: written,
         seconds: song.seconds(),
+        semitones: settings.semitones,
+        pitch,
     })
 }
 
@@ -415,6 +518,69 @@ pub fn separate(model: &Path, device: Device, song: &Stereo, progress: &Progress
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_tune_moves_whole_octaves_to_the_voice() {
+        let pitch = |median_hz, high_hz| SongPitch { median_hz, high_hz };
+        // A low female singer (measured: "From The Start", median 310 Hz, high 449 Hz).
+        let laufey = pitch(310.0, 449.0);
+        assert_eq!(automatic_semitones(&laufey, Register::Female), 0.0);
+        assert_eq!(automatic_semitones(&laufey, Register::Male), -12.0);
+        // A male singer in a female voice goes up, unless the high notes would be
+        // too high.
+        assert_eq!(
+            automatic_semitones(&pitch(160.0, 260.0), Register::Female),
+            12.0
+        );
+        assert_eq!(
+            automatic_semitones(&pitch(240.0, 480.0), Register::Female),
+            0.0
+        );
+        // A high soprano in a male voice drops two octaves at most.
+        assert_eq!(
+            automatic_semitones(&pitch(700.0, 1400.0), Register::Male),
+            -24.0
+        );
+    }
+
+    #[test]
+    fn song_pitch_reads_a_sung_tone_and_ignores_quiet_bleed() {
+        let rate = 44_100;
+        let tone = |hz: f32, level: f32, seconds: f32| -> Vec<f32> {
+            (0..(rate as f32 * seconds) as usize)
+                .map(|i| {
+                    let t = i as f32 / rate as f32;
+                    (1..=6)
+                        .map(|h| (std::f32::consts::TAU * hz * h as f32 * t).sin() / h as f32)
+                        .sum::<f32>()
+                        * level
+                })
+                .collect()
+        };
+        let mut vocals = tone(220.0, 0.3, 1.5);
+        vocals.extend(tone(440.0, 0.3, 0.5));
+        vocals.extend(tone(1000.0, 0.003, 1.0));
+        let pitch = song_pitch(&vocals, rate).expect("sung");
+        assert!((pitch.median_hz - 220.0).abs() < 5.0, "{pitch:?}");
+        assert!((pitch.high_hz - 440.0).abs() < 10.0, "{pitch:?}");
+        assert!(song_pitch(&vec![0.0; rate as usize], rate).is_none());
+    }
+
+    #[test]
+    fn a_cover_keeps_the_tuning_but_not_the_microphone_clean_up() {
+        let studio = crate::config::Settings {
+            bypass: true,
+            echo: true,
+            noise: crate::config::Noise::Sup2,
+            semitones: -5.0,
+            index_ratio: 0.5,
+            ..Default::default()
+        };
+        let song = song_settings(&studio);
+        assert!(!song.bypass && !song.echo);
+        assert_eq!(song.noise, crate::config::Noise::Off);
+        assert_eq!((song.semitones, song.index_ratio), (-5.0, 0.5));
+    }
 
     #[test]
     fn the_spectrum_turns_back_into_the_same_audio() {

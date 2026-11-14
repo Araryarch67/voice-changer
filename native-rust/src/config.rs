@@ -63,6 +63,14 @@ impl Device {
     }
 }
 
+/// The register a voice sings in, for a cover's automatic Tune.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Register {
+    Female,
+    Male,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
