@@ -185,21 +185,31 @@ impl VoiceApp {
                 icons::MEMORY,
                 icons::TUNE,
                 icons::CALL_SPLIT,
+                icons::LIBRARY_MUSIC,
             ];
             let (mut size, mut from_github) = (0, false);
-            for ((model, glyph), chosen) in
-                setup::SHARED.iter().zip(glyphs).zip(&mut self.setup.chosen)
-            {
-                let ready = setup::installed(&folder, model);
-                if model.required {
-                    *chosen = true;
-                }
-                model_row(ui, glyph, model, ready, chosen, downloading);
-                if *chosen && !ready {
-                    size += model.bytes;
-                    from_github |= model.url.starts_with("https://github.com/");
-                }
-            }
+            // Only the list scrolls in a short window, so the explanation, the total
+            // and the buttons stay in view; the rest of the dialog is about 250 px.
+            let list_height = (m3::dialog_body_height(ui.ctx()) - 250.0).max(120.0);
+            egui::ScrollArea::vertical()
+                .id_salt("setup-models")
+                .max_height(list_height)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    for ((model, glyph), chosen) in
+                        setup::SHARED.iter().zip(glyphs).zip(&mut self.setup.chosen)
+                    {
+                        let ready = setup::installed(&folder, model);
+                        if model.required {
+                            *chosen = true;
+                        }
+                        model_row(ui, glyph, model, ready, chosen, downloading);
+                        if *chosen && !ready {
+                            size += model.bytes;
+                            from_github |= model.url.starts_with("https://github.com/");
+                        }
+                    }
+                });
             ui.add_space(8.0);
             if let Some((received, total, fraction)) = self.setup.amounts() {
                 linear_progress(ui, fraction);

@@ -3,6 +3,7 @@ use crate::{
     denoise::Denoiser,
     dsp,
     echo::EchoCanceller,
+    pitch::OctaveGuard,
 };
 use anyhow::{bail, Result};
 
@@ -22,6 +23,7 @@ pub struct Engine {
     echo: Option<EchoCanceller>,
     /// The previous block as it was sent to the output: the echo canceller's reference.
     played: Vec<f32>,
+    octave_guard: OctaveGuard,
 }
 impl Engine {
     pub fn reset(&mut self) {
@@ -38,6 +40,11 @@ impl Engine {
         self.output_denoise.reset();
         self.echo = None;
         self.played.clear();
+        self.octave_guard.reset();
+    }
+    /// The octaves Auto octave adds to Tune now (0 or negative).
+    pub fn auto_octave(&self) -> i32 {
+        self.octave_guard.octaves()
     }
     /// Replaces the voice; the next block starts it afresh.
     pub fn set_converter(&mut self, converter: Box<dyn Converter>) {
@@ -54,6 +61,7 @@ impl Engine {
             output_denoise: Denoiser::default(),
             echo: None,
             played: Vec::new(),
+            octave_guard: OctaveGuard::default(),
         }
     }
     pub fn process(&mut self, audio: &[f32], rate: u32, settings: &Settings) -> Result<Vec<f32>> {
@@ -122,7 +130,29 @@ impl Engine {
             let Some(converter) = &mut self.converter else {
                 bail!("Load a model or enable bypass before starting");
             };
-            converter.process(&input, rate, settings)?
+            match settings.auto_octave {
+                Some(register) => {
+                    // The singer's pitch, from the block as the voice will hear it; the
+                    // same loudest-20-ms gate as the voices decides what is a pause.
+                    let audio = dsp::resample(&input, rate, 16_000);
+                    let f0 = crate::pitch::yin(&audio, audio.len() / 160);
+                    let loudest = input
+                        .chunks((rate as usize / 50).max(1))
+                        .map(dsp::rms)
+                        .fold(0.0, f32::max);
+                    let silent = loudest <= 0.0 || loudest < settings.silence_threshold;
+                    let block_ms = input.len() as f32 * 1000.0 / rate as f32;
+                    self.octave_guard
+                        .update(&f0, block_ms, silent, settings.semitones, register);
+                    let mut shifted = settings.clone();
+                    shifted.semitones += 12.0 * self.octave_guard.octaves() as f32;
+                    converter.process(&input, rate, &shifted)?
+                }
+                None => {
+                    self.octave_guard.reset();
+                    converter.process(&input, rate, settings)?
+                }
+            }
         };
         if settings.noise == Noise::Sup2 && !settings.bypass {
             out = self.output_denoise.process(&out, rate, false);
@@ -195,7 +225,16 @@ pub fn load_converter(path: &std::path::Path) -> Result<Box<dyn Converter>> {
 pub fn load_converter_on(path: &std::path::Path, device: Device) -> Result<Box<dyn Converter>> {
     #[cfg(any(feature = "onnx", feature = "onnx-static"))]
     {
-        Ok(Box::new(crate::rvc::Rvc::load_on(path, device)?))
+        let manifest = crate::config::ModelManifest::load(path)?;
+        Ok(match manifest.engine {
+            crate::config::VoiceEngine::Rvc => Box::new(crate::rvc::Rvc::load_on(path, device)?),
+            crate::config::VoiceEngine::DiffusionSvc => {
+                Box::new(crate::diffusion_svc::DiffusionSvc::load_on(path, device)?)
+            }
+            crate::config::VoiceEngine::DdspSvc => {
+                Box::new(crate::ddsp_svc::DdspSvc::load_on(path, device)?)
+            }
+        })
     }
     #[cfg(not(any(feature = "onnx", feature = "onnx-static")))]
     {
@@ -312,5 +351,45 @@ mod tests {
         assert!(saw_nonzero.load(Ordering::Relaxed));
         assert_eq!(resets.load(Ordering::Relaxed), 2);
         assert!(engine.was_bypass);
+    }
+
+    #[test]
+    fn auto_octave_lowers_the_tune_the_voice_gets_after_a_high_phrase() {
+        use std::sync::{Arc, Mutex};
+        struct TuneSpy(Arc<Mutex<Vec<f32>>>);
+        impl Converter for TuneSpy {
+            fn process(&mut self, audio: &[f32], _: u32, settings: &Settings) -> Result<Vec<f32>> {
+                self.0.lock().unwrap().push(settings.semitones);
+                Ok(audio.to_vec())
+            }
+            fn reset(&mut self) {}
+        }
+        let tunes = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = Engine::new(Some(Box::new(TuneSpy(tunes.clone()))));
+        let settings = Settings {
+            bypass: false,
+            semitones: 12.0,
+            auto_octave: Some(crate::config::Register::Female),
+            ..Settings::default()
+        };
+        let rate = 48_000;
+        let block = rate as usize * settings.block_ms as usize / 1000;
+        // 600 Hz sung with Tune +12 would land at 1200 Hz, above A5.
+        let tone: Vec<f32> = (0..block)
+            .map(|i| 0.3 * (std::f32::consts::TAU * 600.0 * i as f32 / rate as f32).sin())
+            .collect();
+        for _ in 0..6 {
+            engine.process(&tone, rate, &settings).unwrap();
+        }
+        // A pause: the high-pass filter's tail keeps the first quiet block above
+        // the gate, so this takes three blocks.
+        for _ in 0..3 {
+            engine.process(&vec![0.0; block], rate, &settings).unwrap();
+        }
+        engine.process(&tone, rate, &settings).unwrap();
+        let tunes = tunes.lock().unwrap();
+        assert!(tunes[..6].iter().all(|t| *t == 12.0), "{tunes:?}");
+        assert_eq!(*tunes.last().unwrap(), 0.0, "{tunes:?}");
+        assert_eq!(engine.auto_octave(), -1);
     }
 }

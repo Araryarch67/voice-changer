@@ -91,6 +91,8 @@ pub enum Command {
     VoicesImport {
         source: PathBuf,
         index: Option<PathBuf>,
+        /// A DDSP-SVC voice's diffusion model.
+        diffusion: Option<PathBuf>,
         name: Option<String>,
     },
     VoicesDelete {
@@ -188,7 +190,8 @@ Commands:
   status                 Version, models folder, voice engine and ONNX Runtime state
   voices list            List installed voices
   voices show VOICE      Details of one voice
-  voices import FILE     Import an RVC .pth checkpoint or a .zip holding one
+  voices import FILE     Import an RVC .pth checkpoint (or a .zip holding one), a
+                         Diffusion-SVC .ptc combo model or a DDSP-SVC .pt model
   voices set-index VOICE (INDEX | --none)
                          Give a voice another .index file, or remove its index
   voices delete VOICE --yes
@@ -258,6 +261,18 @@ Settings (all optional; the GUI's names in brackets):
   --output-gain G        0..4 (default 1)  [GAIN out]
   --speaker-id N         Speaker of a multi-speaker voice (default 0)
   --echo                 Echo cancellation, for speakers instead of headphones
+  --diffusion on|off     Diffusion-SVC and DDSP-SVC voices: refine with the
+                         diffusion model (default on; off is faster)
+  --diffusion-steps N    Diffusion sampler steps, 0 for the model's default
+                         (Diffusion-SVC: usually 2; DDSP-SVC: depth / 20)
+  --diffusion-depth N    Diffusion depth (kStep), 0 for the model's default
+                         (Diffusion-SVC: its maximum; DDSP-SVC: 120)
+  --enhancer on|off      DDSP-SVC voices without diffusion: re-render the sound with
+                         NSF-HiFiGAN (default on; off is faster)
+  --auto-octave off|female|male
+                         After a phrase whose high notes go above what a voice of
+                         that register sings well (A5 / A4), sing the next one an
+                         octave lower; changes only in pauses (default off)
   --device DEV           cpu (default), cuda, directml or auto (a GPU when available)
                          [GPU]";
 
@@ -275,7 +290,7 @@ Start here: if engine_ready is false, run `setup download`."
 Usage:
   voices list [--json]
   voices show VOICE [--json]
-  voices import FILE [--index FILE.index] [--name NAME] [--json]
+  voices import FILE [--index FILE.index] [--diffusion FILE.pt] [--name NAME] [--json]
   voices set-index VOICE (INDEX.index | --none) [--json]
   voices delete VOICE --yes [--json]
 
@@ -286,6 +301,15 @@ import     FILE is an RVC .pth checkpoint or a .zip holding one. The checkpoint 
            exported to ONNX into models/<name>/ with a model.json. The index is taken
            from --index, else from the zip, else the one beside the .pth. --name sets
            the voice's name (default: the file name). Needs `setup download` first.
+           FILE may also be a Diffusion-SVC .ptc combo model (contentvec768l12, 44.1
+           kHz; made by Diffusion-SVC's combo.py): its graphs are built for its own
+           configuration, and it needs `setup download nsf_hifigan` (the vocoder, CC
+           BY-NC-SA 4.0: not for commercial use). It takes no index.
+           FILE may also be a DDSP-SVC 3.0 model (Sins, CombSub or CombSubFast):
+           the model_*.pt with the config.yaml it was trained with beside it.
+           --diffusion adds the shallow-diffusion model trained for it (its own
+           model_*.pt beside its config.yaml). DDSP-SVC voices also need
+           `setup download nsf_hifigan`; --name defaults to the model's folder.
 set-index  Copies INDEX.index into the voice's folder and uses it; --none removes it.
            The change is undone if the voice does not load with it.
 delete     Removes the voice's whole folder from disk. Only folders directly inside a
@@ -309,6 +333,8 @@ Shared models live in <models>/shared/ and every voice uses them:
   crepe_full   optional   precise CREPE pitch detector (89 MB)
   fcpe         optional   FCPE pitch detector (48 MB)
   kim_vocal_2  optional   vocal separation for `split` and `cover` (67 MB)
+  nsf_hifigan  optional   vocoder for Diffusion-SVC and DDSP-SVC voices (54 MB;
+                          CC BY-NC-SA 4.0, not for commercial use)
 
 download fetches the named models (or, with none named, --recommended: contentvec,
 rmvpe and crepe_tiny), skipping those already installed, and checks each against its
@@ -467,6 +493,15 @@ fn number<T: std::str::FromStr>(flag: &str, value: &str) -> Result<T, UsageError
         .map_err(|_| UsageError(format!("{flag}: `{value}` is not a valid number")))
 }
 
+/// An on/off flag's value.
+fn switch(flag: &str, value: &str) -> Result<bool, UsageError> {
+    match value.to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" => Ok(true),
+        "off" | "false" | "0" => Ok(false),
+        other => usage(format!("{flag} must be on or off, not {other}")),
+    }
+}
+
 pub fn parse_f0(name: &str) -> Result<F0Detector, UsageError> {
     match name.to_ascii_lowercase().replace('-', "_").as_str() {
         "rmvpe" => Ok(F0Detector::Rmvpe),
@@ -556,6 +591,11 @@ impl TuningFlags {
             | "--input-gain"
             | "--output-gain"
             | "--speaker-id"
+            | "--diffusion"
+            | "--diffusion-steps"
+            | "--diffusion-depth"
+            | "--enhancer"
+            | "--auto-octave"
             | "--device" => {
                 let value = cursor.value(flag)?;
                 self.flags.push((flag.to_owned(), value));
@@ -601,6 +641,22 @@ impl TuningFlags {
                 "--input-gain" => settings.input_gain = number(flag, value)?,
                 "--output-gain" => settings.output_gain = number(flag, value)?,
                 "--speaker-id" => settings.speaker_id = number(flag, value)?,
+                "--diffusion" => settings.diffusion = switch(flag, value)?,
+                "--enhancer" => settings.enhancer = switch(flag, value)?,
+                "--auto-octave" => {
+                    settings.auto_octave = match value.to_ascii_lowercase().as_str() {
+                        "off" | "none" => None,
+                        "female" => Some(crate::config::Register::Female),
+                        "male" => Some(crate::config::Register::Male),
+                        other => {
+                            return usage(format!(
+                                "--auto-octave must be off, female or male, not {other}"
+                            ))
+                        }
+                    }
+                }
+                "--diffusion-steps" => settings.diffusion_sampler_steps = number(flag, value)?,
+                "--diffusion-depth" => settings.diffusion_steps = number(flag, value)?,
                 "--device" => match parse_device(value)? {
                     Some(device) => {
                         settings.device = device;
@@ -900,6 +956,7 @@ fn parse_voices(cursor: &mut Cursor) -> Result<Command, UsageError> {
     let command = format!("voices {action}");
     let mut positional = Vec::new();
     let mut index = None;
+    let mut diffusion = None;
     let mut name = None;
     let mut none = false;
     let mut yes = false;
@@ -907,6 +964,7 @@ fn parse_voices(cursor: &mut Cursor) -> Result<Command, UsageError> {
         match (action.as_str(), arg.as_str()) {
             ("import", "--index") => index = Some(PathBuf::from(cursor.value(&arg)?)),
             ("import", "--name") => name = Some(cursor.value(&arg)?),
+            ("import", "--diffusion") => diffusion = Some(PathBuf::from(cursor.value(&arg)?)),
             ("set-index", "--none") => none = true,
             ("delete", "--yes" | "-y") => yes = true,
             (_, flag) if flag.starts_with("--") => return Err(unknown(flag, &command)),
@@ -927,9 +985,15 @@ fn parse_voices(cursor: &mut Cursor) -> Result<Command, UsageError> {
         }
         "import" => {
             positional_count(&command, &positional, 1..=1)?;
+            if index.is_some() && diffusion.is_some() {
+                return usage(
+                    "`voices import` takes --index (RVC) or --diffusion (DDSP-SVC), not both",
+                );
+            }
             Command::VoicesImport {
                 source: args.next().expect("counted").into(),
                 index,
+                diffusion,
                 name,
             }
         }
@@ -1309,8 +1373,14 @@ fn run(invocation: &Invocation) -> Result<Report> {
         Command::VoicesImport {
             source,
             index,
+            diffusion,
             name,
-        } => voices_import(source, index.as_deref(), name.as_deref()),
+        } => voices_import(
+            source,
+            index.as_deref(),
+            diffusion.as_deref(),
+            name.as_deref(),
+        ),
         Command::VoicesDelete { voice } => voices_delete(voice),
         Command::VoicesSetIndex { voice, index } => {
             let manifest = resolve_voice(voice)?;
@@ -1514,8 +1584,14 @@ fn voice_entry(manifest: &Path) -> Value {
             "id": id,
             "manifest": display(manifest),
             "folder": display(folder),
+            "engine": model.engine.label(),
             "sample_rate": model.sample_rate,
-            "version": if model.channels == 256 { "v1" } else { "v2" },
+            // RVC's version; other engines have none.
+            "version": match model.engine {
+                crate::config::VoiceEngine::Rvc if model.channels == 256 => json!("v1"),
+                crate::config::VoiceEngine::Rvc => json!("v2"),
+                _ => Value::Null,
+            },
             "use_f0": model.use_f0,
             "index": model.feature_bank.as_deref().map(display),
             "deletable": deletable,
@@ -1546,12 +1622,15 @@ fn voice_text(entry: &Value) -> String {
         );
     }
     format!(
-        "{}\n  id: {}\n  manifest: {}\n  {} Hz, RVC {}, pitch {}\n  index: {}\n  deletable: {}",
+        "{}\n  id: {}\n  manifest: {}\n  {} Hz, {}, pitch {}\n  index: {}\n  deletable: {}",
         field("name"),
         field("id"),
         field("manifest"),
         field("sample_rate"),
-        field("version"),
+        match entry["version"].as_str() {
+            Some(version) => format!("{} {version}", field("engine")),
+            None => field("engine"),
+        },
         if entry["use_f0"] == json!(true) {
             "yes"
         } else {
@@ -1590,18 +1669,31 @@ fn voices_list() -> Result<Report> {
     })
 }
 
-fn voices_import(source: &Path, index: Option<&Path>, name: Option<&str>) -> Result<Report> {
+fn voices_import(
+    source: &Path,
+    index: Option<&Path>,
+    diffusion: Option<&Path>,
+    name: Option<&str>,
+) -> Result<Report> {
     #[cfg(feature = "export")]
     {
         anyhow::ensure!(source.is_file(), "No such file: {}", source.display());
-        let manifest = crate::import::import_with(source, index, name)?;
+        let ddsp = diffusion.is_some()
+            || source
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("pt"));
+        let manifest = if ddsp {
+            crate::import::import_ddsp(source, diffusion, name)?
+        } else {
+            crate::import::import_with(source, index, name)?
+        };
         let entry = voice_entry(&manifest);
         let text = format!("Imported\n{}", voice_text(&entry));
         Ok(Report { data: entry, text })
     }
     #[cfg(not(feature = "export"))]
     {
-        let _ = (source, index, name);
+        let _ = (source, index, diffusion, name);
         bail!("This build cannot import voices (built without the export feature)")
     }
 }
@@ -2711,10 +2803,47 @@ mod tests {
             ("aria", "in.wav".into(), "out.wav".into())
         );
         assert!(tuning.auto_device);
+
+        let Command::Convert { tuning, .. } = parsed(
+            "convert dsvc in.wav out.wav --diffusion off --diffusion-steps 10 --diffusion-depth 40",
+        )
+        .command
+        else {
+            panic!("not convert");
+        };
+        let s = tuning.settings;
+        assert!(!s.diffusion);
+        assert_eq!((s.diffusion_sampler_steps, s.diffusion_steps), (10, 40));
+        let Command::Convert { tuning, .. } = parsed("convert dsvc in.wav out.wav").command else {
+            panic!("not convert");
+        };
+        assert!(tuning.settings.diffusion);
+        assert!(tuning.settings.enhancer);
+        let Command::Convert { tuning, .. } =
+            parsed("convert ddsp in.wav out.wav --enhancer off").command
+        else {
+            panic!("not convert");
+        };
+        assert!(!tuning.settings.enhancer);
+        assert_eq!(tuning.settings.auto_octave, None);
+        let Command::Convert { tuning, .. } =
+            parsed("convert ddsp in.wav out.wav --auto-octave female").command
+        else {
+            panic!("not convert");
+        };
+        assert_eq!(
+            tuning.settings.auto_octave,
+            Some(crate::config::Register::Female)
+        );
     }
 
     #[test]
     fn bad_command_lines_are_usage_errors() {
+        assert!(rejected("convert a b c --diffusion maybe").contains("on or off"));
+        assert!(rejected("convert a b c --enhancer maybe").contains("--enhancer"));
+        assert!(rejected("convert a b c --auto-octave alto").contains("--auto-octave"));
+        assert!(rejected("convert a b c --diffusion-steps many").contains("--diffusion-steps"));
+        assert!(rejected("convert a b c --diffusion-depth 5000").contains("Invalid"));
         assert!(rejected("convert aria in.wav").contains("missing"));
         assert!(rejected("convert aria in.wav out.wav extra").contains("extra"));
         assert!(rejected("convert a b c --semitones high").contains("--semitones"));
@@ -2752,6 +2881,7 @@ mod tests {
         let Command::VoicesImport {
             source,
             index,
+            diffusion,
             name,
         } = parsed("voices import kobo.pth --index added.index --name Kobo").command
         else {
@@ -2759,7 +2889,20 @@ mod tests {
         };
         assert_eq!(source, PathBuf::from("kobo.pth"));
         assert_eq!(index, Some("added.index".into()));
+        assert_eq!(diffusion, None);
         assert_eq!(name.as_deref(), Some("Kobo"));
+        let Command::VoicesImport {
+            source, diffusion, ..
+        } = parsed("voices import exp/combsub/model_best.pt --diffusion exp/diff/model_best.pt")
+            .command
+        else {
+            panic!("not import");
+        };
+        assert_eq!(source, PathBuf::from("exp/combsub/model_best.pt"));
+        assert_eq!(diffusion, Some("exp/diff/model_best.pt".into()));
+        assert!(
+            rejected("voices import a.pt --index b.index --diffusion c.pt").contains("not both")
+        );
         assert!(matches!(
             parsed("voices set-index aria --none").command,
             Command::VoicesSetIndex { index: None, .. }

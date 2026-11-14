@@ -70,6 +70,19 @@ pub fn delete_voice(manifest: &std::path::Path) -> std::io::Result<Option<PathBu
     Ok(Some(folder))
 }
 
+/// The name of the Diffusion-SVC voice `manifest` describes, read without
+/// checking its files.
+fn diffusion_voice_name(manifest: &std::path::Path) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest).ok()?).ok()?;
+    (value.get("engine")?.as_str()? == "diffusion-svc").then(|| {
+        value
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("Diffusion-SVC voice")
+            .to_string()
+    })
+}
+
 pub fn discover_models() -> Vec<(String, PathBuf)> {
     let mut models = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -93,8 +106,16 @@ pub fn discover_models() -> Vec<(String, PathBuf)> {
             if !seen.insert(canonical.clone()) {
                 continue;
             }
-            if let Ok(model) = crate::config::ModelManifest::load(&canonical) {
-                models.push((model.name, canonical));
+            match crate::config::ModelManifest::load(&canonical) {
+                Ok(model) => models.push((model.name, canonical)),
+                // A Diffusion-SVC voice is listed even when it cannot load yet (most
+                // often the shared vocoder is still to be downloaded), so it can be
+                // chosen and say what it needs.
+                Err(_) => {
+                    if let Some(name) = diffusion_voice_name(&canonical) {
+                        models.push((name, canonical));
+                    }
+                }
             }
         }
     }

@@ -130,6 +130,10 @@ fn rebuild_tensor(
             f32::from_bits((u16::from_le_bytes(b.try_into().unwrap()) as u32) << 16)
         }),
         "DoubleStorage" => (8, |b| f64::from_le_bytes(b.try_into().unwrap()) as f32),
+        // Integer buffers (DDSP-SVC keeps its sample rate and block size as int64
+        // tensors), read as floats like the rest.
+        "LongStorage" => (8, |b| i64::from_le_bytes(b.try_into().unwrap()) as f32),
+        "IntStorage" => (4, |b| i32::from_le_bytes(b.try_into().unwrap()) as f32),
         other => bail!("Unsupported tensor storage {other}"),
     };
     let count: usize = shape.iter().product();
@@ -335,6 +339,7 @@ fn unpickle(data: &[u8], storage: &mut dyn FnMut(&str) -> Result<Vec<u8>>) -> Re
             b's' => {
                 let value = pop!();
                 let key = pop!();
+                dict_subclass_as_dict(&mut stack);
                 let Some(Value::Dict(items)) = stack.last_mut() else {
                     bail!("SETITEM on non-dict")
                 };
@@ -342,6 +347,7 @@ fn unpickle(data: &[u8], storage: &mut dyn FnMut(&str) -> Result<Vec<u8>>) -> Re
             }
             b'u' => {
                 let values = pop_mark!();
+                dict_subclass_as_dict(&mut stack);
                 let Some(Value::Dict(items)) = stack.last_mut() else {
                     bail!("SETITEMS on non-dict")
                 };
@@ -390,6 +396,17 @@ fn unpickle(data: &[u8], storage: &mut dyn FnMut(&str) -> Result<Vec<u8>>) -> Re
                 stack.push(value);
             }
             other => bail!("Unsupported pickle opcode 0x{other:02x}"),
+        }
+    }
+}
+
+/// An object made with no arguments that then receives items is a dict subclass
+/// (such as a `DotDict` holding a config); keep it as a plain dict.
+fn dict_subclass_as_dict(stack: &mut [Value]) {
+    if let Some(top) = stack.last_mut() {
+        let empty_args = |args: &Value| matches!(args, Value::Tuple(a) if a.is_empty());
+        if matches!(top, Value::Object(_, args) if empty_args(args)) {
+            *top = Value::Dict(Vec::new());
         }
     }
 }

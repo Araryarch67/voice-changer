@@ -615,6 +615,142 @@ fn world_input(audio: &[f32]) -> Option<Vec<f64>> {
     (audio.len() >= 1600).then(|| audio.iter().map(|s| f64::from(*s)).collect())
 }
 
+/// How much of the singing Auto octave looks back on: 15 s of 10 ms frames.
+const GUARD_FRAMES: usize = 1500;
+/// A pause this long (ms) ends a phrase; only then may the octave change.
+const GUARD_PAUSE_MS: f32 = 500.0;
+/// At least a second of singing before the octave is chosen.
+const GUARD_MIN_FRAMES: usize = 100;
+/// Going back up needs the high notes this far (one semitone) below the ceiling,
+/// so a melody sitting at the edge does not switch back and forth.
+const GUARD_MARGIN: f32 = 0.943_874_3;
+
+/// Auto octave, the live counterpart of a cover's automatic Tune: it remembers
+/// the pitch sung over the last 15 s and, at each pause, lowers Tune by whole
+/// octaves (up to two) while the high notes (the 95th percentile) would go above
+/// what a voice of the register sings well. It never raises Tune above what the
+/// user chose, and it changes only between phrases, never inside one.
+#[derive(Debug, Default)]
+pub struct OctaveGuard {
+    sung: VecDeque<f32>,
+    pause_ms: f32,
+    octaves: i32,
+}
+
+impl OctaveGuard {
+    /// The octaves added to Tune now: 0, -1 or -2.
+    pub fn octaves(&self) -> i32 {
+        self.octaves
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Notes a block: its input pitch (Hz per frame, 0 when unvoiced), its length
+    /// and whether it was quiet. A pause long enough ends the phrase and picks the
+    /// octave for the next one.
+    pub fn update(
+        &mut self,
+        f0: &[f32],
+        block_ms: f32,
+        silent: bool,
+        semitones: f32,
+        register: crate::config::Register,
+    ) {
+        if !silent {
+            self.pause_ms = 0.0;
+            self.sung
+                .extend(f0.iter().copied().filter(|hz| hz.is_finite() && *hz > 0.0));
+            while self.sung.len() > GUARD_FRAMES {
+                self.sung.pop_front();
+            }
+            return;
+        }
+        let ended = self.pause_ms < GUARD_PAUSE_MS && self.pause_ms + block_ms >= GUARD_PAUSE_MS;
+        self.pause_ms += block_ms;
+        if ended && self.sung.len() >= GUARD_MIN_FRAMES {
+            let mut sorted: Vec<f32> = self.sung.iter().copied().collect();
+            sorted.sort_by(f32::total_cmp);
+            let high = sorted[(sorted.len() - 1) * 95 / 100];
+            self.octaves = guard_octaves(high, semitones, register, self.octaves);
+        }
+    }
+}
+
+/// The octaves (0, -1 or -2) to add to `semitones` so that `high_hz` sung lands at
+/// or below the register's ceiling; going up from `current` needs a semitone of
+/// room.
+pub fn guard_octaves(
+    high_hz: f32,
+    semitones: f32,
+    register: crate::config::Register,
+    current: i32,
+) -> i32 {
+    let ceiling = register.ceiling_hz();
+    let lands = |octaves: i32| high_hz * 2f32.powf((semitones + 12.0 * octaves as f32) / 12.0);
+    let mut octaves = 0;
+    while octaves > -2 && lands(octaves) > ceiling {
+        octaves -= 1;
+    }
+    // Raising back needs the margin; otherwise keep the current, lower octave.
+    while octaves > current && lands(octaves) > ceiling * GUARD_MARGIN {
+        octaves -= 1;
+    }
+    octaves
+}
+
+#[cfg(test)]
+mod octave_guard_tests {
+    use crate::config::Register;
+
+    fn sing(guard: &mut super::OctaveGuard, hz: f32, blocks: usize, semitones: f32) {
+        for _ in 0..blocks {
+            guard.update(&[hz; 32], 320.0, false, semitones, Register::Female);
+        }
+    }
+
+    fn pause(guard: &mut super::OctaveGuard, blocks: usize, semitones: f32) {
+        for _ in 0..blocks {
+            guard.update(&[0.0; 32], 320.0, true, semitones, Register::Female);
+        }
+    }
+
+    #[test]
+    fn auto_octave_lowers_high_phrases_only_at_pauses() {
+        let mut guard = super::OctaveGuard::default();
+        // A male singer at 300 Hz with Tune +12 for a female voice: 600 Hz, fine.
+        sing(&mut guard, 300.0, 10, 12.0);
+        pause(&mut guard, 2, 12.0);
+        assert_eq!(guard.octaves(), 0);
+        // A high passage at 520 Hz would land at 1040 Hz: not mid-phrase...
+        sing(&mut guard, 520.0, 40, 12.0);
+        assert_eq!(guard.octaves(), 0);
+        // ...but after the pause the next phrase is an octave lower.
+        pause(&mut guard, 1, 12.0);
+        assert_eq!(guard.octaves(), 0, "one block is not yet a pause");
+        pause(&mut guard, 1, 12.0);
+        assert_eq!(guard.octaves(), -1);
+        // A long pause does not decide again; singing low for 15 s brings it back.
+        pause(&mut guard, 20, 12.0);
+        assert_eq!(guard.octaves(), -1);
+        sing(&mut guard, 250.0, 60, 12.0);
+        pause(&mut guard, 2, 12.0);
+        assert_eq!(guard.octaves(), 0);
+    }
+
+    #[test]
+    fn auto_octave_keeps_a_semitone_of_room_before_going_back_up() {
+        // 860 Hz fits under A5 (880 Hz) but not with the margin: stay down.
+        assert_eq!(super::guard_octaves(860.0, 0.0, Register::Female, -1), -1);
+        assert_eq!(super::guard_octaves(860.0, 0.0, Register::Female, 0), 0);
+        assert_eq!(super::guard_octaves(800.0, 0.0, Register::Female, -1), 0);
+        // Never more than two octaves down, never up past the chosen Tune.
+        assert_eq!(super::guard_octaves(5000.0, 0.0, Register::Male, 0), -2);
+        assert_eq!(super::guard_octaves(100.0, 0.0, Register::Male, 0), 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1198,7 +1198,14 @@ pub fn banner(ui: &mut Ui, glyph: char, fill: Color32, content: Color32, text: &
     dismissed
 }
 
-/// Basic dialog over a scrim. Returns the body's value and whether it was dismissed.
+/// The tallest a dialog's body may be: the window's height less the dialog's
+/// 24 px gap to the window edges, its padding and its heading.
+pub fn dialog_body_height(ctx: &egui::Context) -> f32 {
+    (ctx.screen_rect().height() - 48.0 - 48.0 - 40.0).max(80.0)
+}
+
+/// Basic dialog over a scrim, never larger than the window: a body taller than
+/// the window scrolls. Returns the body's value and whether it was dismissed.
 pub fn dialog<R>(
     ctx: &egui::Context,
     id: &str,
@@ -1206,6 +1213,7 @@ pub fn dialog<R>(
     body: impl FnOnce(&mut Ui) -> R,
 ) -> (R, bool) {
     let width = (ctx.screen_rect().width() - 48.0).min(520.0) - 48.0;
+    let max_height = dialog_body_height(ctx);
     let response = egui::Modal::new(egui::Id::new(id))
         .frame(
             Frame::new()
@@ -1218,7 +1226,19 @@ pub fn dialog<R>(
             ui.set_width(width);
             ui.label(RichText::new(heading).size(24.0).color(ON_SURFACE));
             ui.add_space(8.0);
-            body(ui)
+            // The modal's own room is only last frame's size, so a scroll area in it
+            // could shrink but never grow back; give it the whole allowed height.
+            ui.allocate_ui(Vec2::new(width, max_height), |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt((id, "body"))
+                    .max_height(max_height)
+                    .show(ui, |ui| {
+                        ui.set_width(width);
+                        body(ui)
+                    })
+                    .inner
+            })
+            .inner
         });
     let dismissed = response.should_close();
     (response.inner, dismissed)
@@ -1456,6 +1476,70 @@ pub fn text_edit<'a>(text: &'a mut String, hint: &str, width: f32) -> egui::Text
 #[cfg(test)]
 mod tests {
     use super::Format;
+    use eframe::egui;
+
+    /// Runs `frames` frames of a window of `size`, clicking at `click` on the
+    /// given frame; returns how many times the dialog's button reported a click.
+    fn click_in_dialog(
+        size: egui::Vec2,
+        lines: usize,
+        click: impl Fn(egui::Rect) -> egui::Pos2,
+    ) -> usize {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        let mut button = egui::Rect::NOTHING;
+        let mut clicks = 0;
+        for frame in 0..12 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            if frame >= 6 {
+                let pos = click(button);
+                input.events.push(egui::Event::PointerMoved(pos));
+                if frame == 8 || frame == 9 {
+                    input.events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: frame == 8,
+                        modifiers: Default::default(),
+                    });
+                }
+            }
+            let _ = ctx.run(input, |ctx| {
+                super::dialog(ctx, "test-dialog", "Test", |ui| {
+                    for i in 0..lines {
+                        ui.label(format!("line {i}"));
+                    }
+                    let response = ui.button("Press");
+                    button = response.rect;
+                    if response.clicked() {
+                        clicks += 1;
+                    }
+                });
+            });
+        }
+        clicks
+    }
+
+    #[test]
+    fn a_dialog_button_can_be_clicked_short_or_scrolled() {
+        // A short dialog, and one taller than the window whose body scrolls; the
+        // button is clicked where it was last drawn.
+        assert_eq!(
+            click_in_dialog(egui::vec2(800.0, 600.0), 3, |r| r.center()),
+            1
+        );
+        assert_eq!(
+            click_in_dialog(egui::vec2(800.0, 300.0), 3, |r| r.center()),
+            1
+        );
+        // A click outside the dialog does not reach its button.
+        assert_eq!(
+            click_in_dialog(egui::vec2(800.0, 600.0), 3, |_| egui::pos2(5.0, 5.0)),
+            0
+        );
+    }
 
     #[test]
     fn numbers_read_and_type_in_their_units() {

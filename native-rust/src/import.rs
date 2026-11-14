@@ -1,6 +1,12 @@
 //! Turns an RVC checkpoint (`.pth`), or a zip holding one, into a ready voice folder:
 //! ONNX export, the matching `.index` if there is one, and the `model.json` manifest.
-use crate::{config::ModelManifest, export, runtime};
+//! A Diffusion-SVC combo model (`.ptc`) becomes a voice the same way, with its graphs
+//! built by `diffusion_svc::export`, and so does a DDSP-SVC model (`.pt` beside its
+//! `config.yaml`, optionally with a diffusion model), built by `ddsp_svc::export`.
+use crate::{
+    config::{ModelManifest, VoiceEngine},
+    export, runtime,
+};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -26,6 +32,47 @@ pub fn import_pair(checkpoint: &Path, index: Option<&Path>) -> Result<PathBuf> {
         "The voice engine (shared/contentvec.onnx and shared/rmvpe.onnx) is not set up yet; download it in Settings under Processing",
     )?;
     import_pair_into(&root, checkpoint, index)
+}
+
+/// Imports a DDSP-SVC model (`model_*.pt` beside its `config.yaml`) as a voice, with
+/// the shallow-diffusion model trained for it when `diffusion` names one.
+pub fn import_ddsp(model: &Path, diffusion: Option<&Path>, name: Option<&str>) -> Result<PathBuf> {
+    let root = runtime::models_root().context(
+        "The voice engine (shared/contentvec.onnx and shared/rmvpe.onnx) is not set up yet; run `setup download` first",
+    )?;
+    import_ddsp_into(&root, model, diffusion, name)
+}
+
+fn import_ddsp_into(
+    root: &Path,
+    model: &Path,
+    diffusion: Option<&Path>,
+    name: Option<&str>,
+) -> Result<PathBuf> {
+    for file in std::iter::once(model).chain(diffusion) {
+        anyhow::ensure!(
+            file.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("pt")),
+            "A DDSP-SVC model is a .pt checkpoint with its config.yaml beside it: {}",
+            file.display()
+        );
+        anyhow::ensure!(
+            file.is_file(),
+            "The model does not exist: {}",
+            file.display()
+        );
+    }
+    // DDSP-SVC names every checkpoint model_<steps>.pt; its folder names the voice.
+    let fallback = model
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned());
+    let (folder, stem) = new_folder(root, model, name.or(fallback.as_deref()))?;
+    let result = build_ddsp(&folder, model, diffusion, &stem);
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+    result
 }
 
 /// Imports `source` (a `.pth` or a `.zip` holding one) as a voice, optionally with an
@@ -89,6 +136,10 @@ fn import_named(root: &Path, source: &Path, name: Option<&str>) -> Result<PathBu
             let index = source.parent().and_then(find_index);
             import_checkpoint(root, source, index.as_deref(), false, name)
         }
+        // A Diffusion-SVC combo model has no index.
+        "ptc" => import_checkpoint(root, source, None, false, name),
+        // A DDSP-SVC model, without a diffusion model.
+        "pt" => import_ddsp_into(root, source, None, name),
         "zip" => {
             let unpacked = root.join(format!(".import-{}", std::process::id()));
             let result = unpack(source, &unpacked).and_then(|checkpoint| {
@@ -108,7 +159,7 @@ fn import_named(root: &Path, source: &Path, name: Option<&str>) -> Result<PathBu
             result
         }
         _ => bail!(
-            "Choose an RVC .pth checkpoint, a .zip that contains one, or a model.json manifest"
+            "Choose an RVC .pth checkpoint, a .zip that contains one, a Diffusion-SVC .ptc combo model, a DDSP-SVC .pt model, or a model.json manifest"
         ),
     }
 }
@@ -204,6 +255,24 @@ fn import_checkpoint(
     take_index: bool,
     name: Option<&str>,
 ) -> Result<PathBuf> {
+    let (folder, stem) = new_folder(root, checkpoint, name)?;
+    let diffusion = checkpoint
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("ptc"));
+    let result = if diffusion {
+        build_diffusion(&folder, checkpoint, &stem)
+    } else {
+        build(&folder, checkpoint, index, take_index, &stem)
+    };
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+    result
+}
+
+/// A new, empty voice folder named after `name` (or the checkpoint's file name),
+/// and the voice's display name.
+fn new_folder(root: &Path, checkpoint: &Path, name: Option<&str>) -> Result<(PathBuf, String)> {
     let file_stem = checkpoint
         .file_stem()
         .map(|s| s.to_string_lossy().replace(['_', '-'], " "))
@@ -241,11 +310,7 @@ fn import_checkpoint(
         .find(|folder| !folder.exists())
         .expect("an unused folder name exists");
     std::fs::create_dir_all(&folder)?;
-    let result = build(&folder, checkpoint, index, take_index, &stem);
-    if result.is_err() {
-        let _ = std::fs::remove_dir_all(&folder);
-    }
-    result
+    Ok((folder, stem))
 }
 
 fn build(
@@ -286,11 +351,83 @@ fn build(
         .into(),
         output_scale: 1.0,
         feature_bank,
-        intra_threads: std::thread::available_parallelism().map_or(4, |n| n.get().min(8)),
+        intra_threads: threads(),
+        ..ModelManifest::default()
     };
     let path = folder.join("model.json");
     std::fs::write(&path, serde_json::to_string_pretty(&manifest)?)?;
     ModelManifest::load(&path).context("The imported voice did not pass validation")?;
+    Ok(path)
+}
+
+fn threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get().min(8))
+}
+
+/// A Diffusion-SVC voice: its three graphs, ContentVec layer 12 and RMVPE from the
+/// shared folder, and the shared NSF-HiFiGAN vocoder (which may be downloaded later;
+/// the voice says so when it loads without it).
+fn build_diffusion(folder: &Path, checkpoint: &Path, stem: &str) -> Result<PathBuf> {
+    let exported = crate::diffusion_svc::export(checkpoint, folder)?;
+    let file_name = |path: &Path| PathBuf::from(path.file_name().expect("exported file"));
+    let manifest = ModelManifest {
+        engine: VoiceEngine::DiffusionSvc,
+        name: stem.to_owned(),
+        model: file_name(&exported.naive),
+        embedder: "../shared/contentvec.onnx".into(),
+        pitch: "../shared/rmvpe.onnx".into(),
+        sample_rate: exported.info.sample_rate,
+        channels: exported.info.units,
+        use_f0: true,
+        embedder_input: "audio".into(),
+        embedder_output: "unit12".into(),
+        output_scale: 1.0,
+        feature_bank: None,
+        intra_threads: threads(),
+        condition: Some(file_name(&exported.condition)),
+        denoiser: Some(file_name(&exported.denoiser)),
+        vocoder: Some(format!("../shared/{}", crate::diffusion_svc::VOCODER_FILE).into()),
+    };
+    // The graphs must be in place; the vocoder is a shared download that loading
+    // asks for when it is missing.
+    for file in [&exported.naive, &exported.condition, &exported.denoiser] {
+        anyhow::ensure!(file.is_file(), "Export did not write {}", file.display());
+    }
+    let path = folder.join("model.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&manifest)?)?;
+    Ok(path)
+}
+
+/// A DDSP-SVC voice: `ddsp.onnx` (and the diffusion model's two graphs), ContentVec
+/// layer 12 and RMVPE from the shared folder, and the shared NSF-HiFiGAN vocoder.
+fn build_ddsp(
+    folder: &Path,
+    model: &Path,
+    diffusion: Option<&Path>,
+    stem: &str,
+) -> Result<PathBuf> {
+    let exported = crate::ddsp_svc::export(model, diffusion, folder)?;
+    let file_name = |path: &Path| PathBuf::from(path.file_name().expect("exported file"));
+    let manifest = ModelManifest {
+        engine: VoiceEngine::DdspSvc,
+        name: stem.to_owned(),
+        model: file_name(&exported.ddsp),
+        embedder: "../shared/contentvec.onnx".into(),
+        pitch: "../shared/rmvpe.onnx".into(),
+        sample_rate: exported.info.sample_rate,
+        channels: exported.info.units,
+        use_f0: true,
+        embedder_input: "audio".into(),
+        embedder_output: "unit12".into(),
+        output_scale: 1.0,
+        feature_bank: None,
+        intra_threads: threads(),
+        condition: exported.condition.as_deref().map(file_name),
+        denoiser: exported.denoiser.as_deref().map(file_name),
+        vocoder: Some(format!("../shared/{}", crate::config::VOCODER_FILE).into()),
+    };
+    let path = folder.join("model.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&manifest)?)?;
     Ok(path)
 }
 

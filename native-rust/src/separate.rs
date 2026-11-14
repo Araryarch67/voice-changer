@@ -131,25 +131,6 @@ pub struct CoverJob<'a> {
 
 pub use crate::config::Register;
 
-impl Register {
-    /// The middle of a melody sung comfortably in this register: E4 and E3.
-    fn centre_hz(self) -> f32 {
-        match self {
-            Register::Female => 330.0,
-            Register::Male => 165.0,
-        }
-    }
-
-    /// Above this (A5 and A4) high notes start to thin out or break up in voices
-    /// trained on this register.
-    fn ceiling_hz(self) -> f32 {
-        match self {
-            Register::Female => 880.0,
-            Register::Male => 440.0,
-        }
-    }
-}
-
 /// How high a song's vocals are sung.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SongPitch {

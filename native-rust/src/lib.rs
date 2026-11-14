@@ -12,7 +12,15 @@ pub mod config;
 #[cfg(feature = "catalog")]
 pub mod cuda_setup;
 pub mod dataset;
+#[cfg(any(feature = "export", feature = "onnx", feature = "onnx-static"))]
+pub mod ddsp_svc;
+#[cfg(feature = "export")]
+pub mod ddsp_svc_export;
 pub mod denoise;
+#[cfg(any(feature = "export", feature = "onnx", feature = "onnx-static"))]
+pub mod diffusion_svc;
+#[cfg(feature = "export")]
+pub mod diffusion_svc_export;
 pub mod dsp;
 pub mod echo;
 pub mod engine;
@@ -26,6 +34,8 @@ pub mod i18n;
 pub mod import;
 #[cfg(feature = "gui")]
 pub mod m3;
+#[cfg(feature = "export")]
+pub mod onnx_build;
 pub mod pitch;
 pub mod platform;
 #[cfg(feature = "export")]

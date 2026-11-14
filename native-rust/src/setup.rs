@@ -26,7 +26,9 @@ pub struct SharedModel {
     pub recommended: bool,
 }
 
-pub const SHARED: [SharedModel; 6] = [
+pub use crate::config::VOCODER_FILE;
+
+pub const SHARED: [SharedModel; 7] = [
     SharedModel {
         file: "contentvec.onnx",
         title: "ContentVec",
@@ -91,6 +93,19 @@ pub const SHARED: [SharedModel; 6] = [
         url: "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/Kim_Vocal_2.onnx",
         bytes: 66_759_214,
         sha256: "ce74ef3b6a6024ce44211a07be9cf8bc6d87728cc852a68ab34eb8e58cde9c8b",
+        required: false,
+        recommended: false,
+    },
+    // OpenVPI's NSF-HiFiGAN (2022-12-11), the ONNX copy the reference downloads for
+    // DDSP-SVC and Diffusion-SVC voices. Its weights are CC BY-NC-SA 4.0: not for
+    // commercial use, so it is never bundled and its purpose says so.
+    SharedModel {
+        file: VOCODER_FILE,
+        title: "NSF-HiFiGAN",
+        purpose: "Turns Diffusion-SVC and DDSP-SVC voices into sound; its licence (CC BY-NC-SA 4.0) does not allow commercial use",
+        url: "https://huggingface.co/wok000/weights/resolve/main/ddsp-svc30/nsf_hifigan_onnx_20221211/nsf_hifigan.onnx",
+        bytes: 56_724_227,
+        sha256: "a3e26672a8c655e3faf65f31cb4339a7fbca7758ba86be9af89e03dced7c3fa4",
         required: false,
         recommended: false,
     },

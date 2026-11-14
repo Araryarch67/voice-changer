@@ -49,20 +49,157 @@ pub(crate) fn open_session(file: &Path, threads: usize, device: Device) -> Resul
     Ok(builder.commit_from_file(file)?)
 }
 
+/// ContentVec/HuBERT features `[T, channels]` of 16 kHz `audio`, from the embedder's
+/// `input` and its `output` (the first output when empty).
+pub(crate) fn embed(
+    embedder: &mut Session,
+    input: &str,
+    output: &str,
+    audio: &[f32],
+    channels: usize,
+) -> Result<Vec<f32>> {
+    let source = Tensor::from_array(([1, audio.len()], audio.to_vec().into_boxed_slice()))?;
+    let has_mask = embedder.inputs.iter().any(|i| i.name == "padding_mask");
+    let outputs = if has_mask {
+        let mask = Tensor::from_array((
+            [1, audio.len()],
+            vec![false; audio.len()].into_boxed_slice(),
+        ))?;
+        embedder.run(ort::inputs! { input => source, "padding_mask" => mask })?
+    } else {
+        embedder.run(ort::inputs! { input => source })?
+    };
+    let output = if output.is_empty() {
+        &outputs[0]
+    } else {
+        outputs.get(output).context("Embedder output not found")?
+    };
+    let (shape, values) = output
+        .try_extract_tensor::<f32>()
+        .context("Embedder must output float32 features")?;
+    anyhow::ensure!(shape.len() == 3 && shape[0] == 1 && shape[2] == channels as i64,
+            "Expected embedding [1,T,{}], got {:?}. RVC v1 needs projected layer 9 / 256 channels; v2 layer 12 / 768 channels.", channels, shape);
+    anyhow::ensure!(
+        !values.is_empty() && values.iter().all(|v| v.is_finite()),
+        "Empty/non-finite embedding"
+    );
+    Ok(values.to_vec())
+}
+
+/// The pitch detectors a voice can use: RMVPE, loaded with the voice, and the one
+/// CREPE or FCPE model in use, loaded beside it on first use. Shared by every
+/// engine that needs F0.
+pub(crate) struct Detectors {
+    rmvpe: Session,
+    rmvpe_path: std::path::PathBuf,
+    extra: Option<(F0Detector, Session)>,
+    threads: usize,
+    device: Device,
+}
+
+impl Detectors {
+    pub(crate) fn new(rmvpe: Session, rmvpe_path: &Path, threads: usize, device: Device) -> Self {
+        Self {
+            rmvpe,
+            rmvpe_path: rmvpe_path.to_path_buf(),
+            extra: None,
+            threads,
+            device,
+        }
+    }
+
+    /// The session of `detector`'s own model (`F0Detector::model_file` beside the
+    /// RMVPE model), loaded on first use; `input` is the input it must take.
+    fn model(&mut self, detector: F0Detector, input: &str) -> Result<&mut Session> {
+        if self
+            .extra
+            .as_ref()
+            .is_none_or(|(loaded, _)| *loaded != detector)
+        {
+            let name = detector.model_file().expect("detectors with a model");
+            let file = self.rmvpe_path.with_file_name(name);
+            anyhow::ensure!(
+                file.is_file(),
+                "{detector:?} model not found: {}. Put {name} beside the RMVPE model, download it in Settings under Processing, or choose another F0 detector",
+                file.display()
+            );
+            let model = open_session(&file, self.threads, self.device)
+                .with_context(|| format!("Load {name}"))?;
+            anyhow::ensure!(
+                model.inputs.iter().any(|i| i.name == input),
+                "{name} must take an `{input}` input"
+            );
+            self.extra = Some((detector, model));
+        }
+        Ok(&mut self.extra.as_mut().expect("loaded above").1)
+    }
+
+    /// F0 per frame for `frames` 10 ms frames of `audio`, from `detector`.
+    pub fn detect(
+        &mut self,
+        audio: &[f32],
+        frames: usize,
+        detector: F0Detector,
+    ) -> Result<Vec<f32>> {
+        let detected = match detector {
+            F0Detector::Yin => crate::pitch::yin(audio, frames),
+            #[cfg(feature = "world")]
+            F0Detector::Harvest => crate::pitch::harvest(audio),
+            #[cfg(feature = "world")]
+            F0Detector::Dio => crate::pitch::dio(audio),
+            #[cfg(not(feature = "world"))]
+            F0Detector::Harvest | F0Detector::Dio => {
+                bail!("This build does not include the Harvest and DIO detectors")
+            }
+            F0Detector::CrepeFull | F0Detector::CrepeTiny => {
+                let model = self.model(detector, "frames")?;
+                let (input, count) = crate::pitch::crepe_frames(audio);
+                let input = Tensor::from_array(([count, 1024], input.into_boxed_slice()))?;
+                let output = model.run(ort::inputs! { "frames" => input })?;
+                let (_, activations) = output[0].try_extract_tensor::<f32>()?;
+                crate::pitch::crepe_decode(activations)
+            }
+            F0Detector::Fcpe => {
+                let model = self.model(detector, "audio")?;
+                let input =
+                    Tensor::from_array(([1, audio.len()], audio.to_vec().into_boxed_slice()))?;
+                let output = model.run(ort::inputs! { "audio" => input })?;
+                let (_, salience) = output[0].try_extract_tensor::<f32>()?;
+                crate::pitch::fcpe_decode(salience)
+            }
+            F0Detector::Rmvpe => {
+                let model = &mut self.rmvpe;
+                let waveform =
+                    Tensor::from_array(([1, audio.len()], audio.to_vec().into_boxed_slice()))?;
+                let output = if model.inputs.iter().any(|i| i.name == "threshold") {
+                    let threshold = Tensor::from_array(([1], vec![0.03_f32].into_boxed_slice()))?;
+                    model.run(ort::inputs! { "waveform" => waveform, "threshold" => threshold })?
+                } else {
+                    model.run(ort::inputs! { "waveform" => waveform })?
+                };
+                output[0].try_extract_tensor::<f32>()?.1.to_vec()
+            }
+        };
+        anyhow::ensure!(
+            !detected.is_empty() && detected.iter().all(|v| v.is_finite() && *v >= 0.0),
+            "Invalid pitch detector output"
+        );
+        Ok((0..frames)
+            .map(|i| detected[(i * detected.len() / frames).min(detected.len() - 1)])
+            .collect())
+    }
+}
+
 /// RVC ONNX with waveform-in ContentVec and waveform-in RMVPE exports.
 pub struct Rvc {
     manifest: ModelManifest,
     voice: Session,
     embedder: Session,
-    pitch: Option<Session>,
-    /// Loaded on first use of a CREPE or FCPE detector, with the detector it was
-    /// loaded for.
-    detector_model: Option<(F0Detector, Session)>,
+    pitch: Option<Detectors>,
     /// Blocks still converted after the input fell under the noise gate.
     gate_hold: u32,
     /// Whether the noise gate is currently open (needs a smooth fade-out before muting).
     gate_open: bool,
-    device: Device,
     history: Vec<f32>,
     samples_seen: i64,
     pitch_tracker: crate::pitch::PitchTracker,
@@ -157,7 +294,12 @@ impl Rvc {
             anyhow::ensure!(model.inputs.iter().any(|i| i.name == "waveform")
                 && model.inputs.iter().all(|i| i.name == "waveform" || i.name == "threshold"),
                 "RMVPE must accept waveform [1,N] and optional threshold [1]; mel-input exports are not supported");
-            Some(model)
+            Some(Detectors::new(
+                model,
+                &manifest.pitch,
+                manifest.intra_threads,
+                device,
+            ))
         } else {
             None
         };
@@ -179,10 +321,8 @@ impl Rvc {
             voice,
             embedder,
             pitch,
-            detector_model: None,
             gate_hold: 0,
             gate_open: false,
-            device,
             history: Vec::new(),
             samples_seen: 0,
             pitch_tracker: crate::pitch::PitchTracker::default(),
@@ -195,115 +335,17 @@ impl Rvc {
     }
 
     fn features(&mut self, audio: &[f32]) -> Result<Vec<f32>> {
-        let source = Tensor::from_array(([1, audio.len()], audio.to_vec().into_boxed_slice()))?;
-        let has_mask = self
-            .embedder
-            .inputs
-            .iter()
-            .any(|i| i.name == "padding_mask");
-        let outputs = if has_mask {
-            let mask = Tensor::from_array((
-                [1, audio.len()],
-                vec![false; audio.len()].into_boxed_slice(),
-            ))?;
-            self.embedder.run(ort::inputs! { self.manifest.embedder_input.as_str() => source, "padding_mask" => mask })?
-        } else {
-            self.embedder
-                .run(ort::inputs! { self.manifest.embedder_input.as_str() => source })?
-        };
-        let output = if self.manifest.embedder_output.is_empty() {
-            &outputs[0]
-        } else {
-            outputs
-                .get(self.manifest.embedder_output.as_str())
-                .context("Embedder output not found")?
-        };
-        let (shape, values) = output
-            .try_extract_tensor::<f32>()
-            .context("Embedder must output float32 features")?;
-        anyhow::ensure!(shape.len() == 3 && shape[0] == 1 && shape[2] == self.manifest.channels as i64,
-            "Expected embedding [1,T,{}], got {:?}. RVC v1 needs projected layer 9 / 256 channels; v2 layer 12 / 768 channels.", self.manifest.channels, shape);
-        anyhow::ensure!(
-            !values.is_empty() && values.iter().all(|v| v.is_finite()),
-            "Empty/non-finite embedding"
-        );
-        Ok(values.to_vec())
+        embed(
+            &mut self.embedder,
+            &self.manifest.embedder_input,
+            &self.manifest.embedder_output,
+            audio,
+            self.manifest.channels,
+        )
     }
 
-    /// The session of `detector`'s own model (`F0Detector::model_file` beside the
-    /// RMVPE model), loaded on first use; `input` is the input it must take.
-    fn detector_model(&mut self, detector: F0Detector, input: &str) -> Result<&mut Session> {
-        if self
-            .detector_model
-            .as_ref()
-            .is_none_or(|(loaded, _)| *loaded != detector)
-        {
-            let name = detector.model_file().expect("detectors with a model");
-            let file = self.manifest.pitch.with_file_name(name);
-            anyhow::ensure!(
-                file.is_file(),
-                "{detector:?} model not found: {}. Put {name} beside the RMVPE model, download it in Settings under Processing, or choose another F0 detector",
-                file.display()
-            );
-            let model = open_session(&file, self.manifest.intra_threads, self.device)
-                .with_context(|| format!("Load {name}"))?;
-            anyhow::ensure!(
-                model.inputs.iter().any(|i| i.name == input),
-                "{name} must take an `{input}` input"
-            );
-            self.detector_model = Some((detector, model));
-        }
-        Ok(&mut self.detector_model.as_mut().expect("loaded above").1)
-    }
-
-    /// F0 per frame for `frames` 10 ms frames of `audio`, from `detector`.
-    fn detect(&mut self, audio: &[f32], frames: usize, detector: F0Detector) -> Result<Vec<f32>> {
-        let detected = match detector {
-            F0Detector::Yin => crate::pitch::yin(audio, frames),
-            #[cfg(feature = "world")]
-            F0Detector::Harvest => crate::pitch::harvest(audio),
-            #[cfg(feature = "world")]
-            F0Detector::Dio => crate::pitch::dio(audio),
-            #[cfg(not(feature = "world"))]
-            F0Detector::Harvest | F0Detector::Dio => {
-                bail!("This build does not include the Harvest and DIO detectors")
-            }
-            F0Detector::CrepeFull | F0Detector::CrepeTiny => {
-                let model = self.detector_model(detector, "frames")?;
-                let (input, count) = crate::pitch::crepe_frames(audio);
-                let input = Tensor::from_array(([count, 1024], input.into_boxed_slice()))?;
-                let output = model.run(ort::inputs! { "frames" => input })?;
-                let (_, activations) = output[0].try_extract_tensor::<f32>()?;
-                crate::pitch::crepe_decode(activations)
-            }
-            F0Detector::Fcpe => {
-                let model = self.detector_model(detector, "audio")?;
-                let input =
-                    Tensor::from_array(([1, audio.len()], audio.to_vec().into_boxed_slice()))?;
-                let output = model.run(ort::inputs! { "audio" => input })?;
-                let (_, salience) = output[0].try_extract_tensor::<f32>()?;
-                crate::pitch::fcpe_decode(salience)
-            }
-            F0Detector::Rmvpe => {
-                let model = self.pitch.as_mut().expect("checked by the caller");
-                let waveform =
-                    Tensor::from_array(([1, audio.len()], audio.to_vec().into_boxed_slice()))?;
-                let output = if model.inputs.iter().any(|i| i.name == "threshold") {
-                    let threshold = Tensor::from_array(([1], vec![0.03_f32].into_boxed_slice()))?;
-                    model.run(ort::inputs! { "waveform" => waveform, "threshold" => threshold })?
-                } else {
-                    model.run(ort::inputs! { "waveform" => waveform })?
-                };
-                output[0].try_extract_tensor::<f32>()?.1.to_vec()
-            }
-        };
-        anyhow::ensure!(
-            !detected.is_empty() && detected.iter().all(|v| v.is_finite() && *v >= 0.0),
-            "Invalid pitch detector output"
-        );
-        Ok((0..frames)
-            .map(|i| detected[(i * detected.len() / frames).min(detected.len() - 1)])
-            .collect())
+    fn detectors(&mut self) -> Result<&mut Detectors> {
+        self.pitch.as_mut().context("This voice has no pitch model")
     }
 
     /// Coarse and fine pitch for `frames` frames of `audio`. `fresh_frames` is how
@@ -332,12 +374,14 @@ impl Rvc {
         });
         let track = match reusable {
             Some(fresh) if tail < frames => {
-                let detected = self.detect(&audio[audio.len() - tail * 160..], tail, detector)?;
+                let detected =
+                    self.detectors()?
+                        .detect(&audio[audio.len() - tail * 160..], tail, detector)?;
                 let mut track = self.pitch_track[fresh..fresh + frames - tail].to_vec();
                 track.extend(detected);
                 track
             }
-            _ => self.detect(audio, frames, detector)?,
+            _ => self.detectors()?.detect(audio, frames, detector)?,
         };
         self.pitch_track.clone_from(&track);
         self.pitch_track_detector = Some(detector);

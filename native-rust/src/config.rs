@@ -63,12 +63,32 @@ impl Device {
     }
 }
 
-/// The register a voice sings in, for a cover's automatic Tune.
+/// The register a voice sings in, for a cover's automatic Tune and the live
+/// Auto octave.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Register {
     Female,
     Male,
+}
+
+impl Register {
+    /// The middle of a melody sung comfortably in this register: E4 and E3.
+    pub fn centre_hz(self) -> f32 {
+        match self {
+            Register::Female => 330.0,
+            Register::Male => 165.0,
+        }
+    }
+
+    /// Above this (A5 and A4) high notes start to thin out or break up in voices
+    /// trained on this register, well before RVC's pitch table ends at 1100 Hz.
+    pub fn ceiling_hz(self) -> f32 {
+        match self {
+            Register::Female => 880.0,
+            Register::Male => 440.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +115,22 @@ pub struct Settings {
     pub echo: bool,
     pub f0_detector: F0Detector,
     pub device: Device,
+    /// Diffusion-SVC and DDSP-SVC: refine the sound with shallow diffusion (the
+    /// reference's skipDiffusion off, or useDiff on).
+    pub diffusion: bool,
+    /// The diffusion depth, the reference's kStep; 0 is the model's default
+    /// (Diffusion-SVC: its maximum; DDSP-SVC: 120).
+    pub diffusion_steps: u32,
+    /// Diffusion sampler steps (the reference's kStep / speedUp or diffAcc); 0 is
+    /// the model's default (Diffusion-SVC: usually 2; DDSP-SVC: kStep / 20).
+    pub diffusion_sampler_steps: u32,
+    /// DDSP-SVC without diffusion: re-render the synthesizer's sound with the
+    /// NSF-HiFiGAN vocoder (the reference's useEnhancer).
+    pub enhancer: bool,
+    /// Live: lower Tune by whole octaves, between phrases, when the high notes
+    /// sung lately would go above what a voice of this register sings well (the
+    /// live counterpart of a cover's automatic Tune). `None` is off.
+    pub auto_octave: Option<Register>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -120,6 +156,11 @@ impl Default for Settings {
             echo: false,
             f0_detector: F0Detector::Rmvpe,
             device: Device::Cpu,
+            diffusion: true,
+            diffusion_steps: 0,
+            diffusion_sampler_steps: 0,
+            enhancer: true,
+            auto_octave: None,
         }
     }
 }
@@ -153,10 +194,37 @@ impl Settings {
             || !self.silence_threshold.is_finite()
             || !(0.0..=1.0).contains(&self.silence_threshold)
             || self.speaker_id < 0
+            || self.diffusion_steps > 1000
+            || self.diffusion_sampler_steps > 1000
         {
-            bail!("Invalid gain, pitch, speaker, index ratio, protect, leveling, or silence threshold");
+            bail!("Invalid gain, pitch, speaker, index ratio, protect, leveling, silence threshold or diffusion steps");
         }
         Ok(())
+    }
+}
+
+/// The NSF-HiFiGAN vocoder Diffusion-SVC voices need, in the shared models folder.
+pub const VOCODER_FILE: &str = "nsf_hifigan.onnx";
+
+/// The kind of voice a manifest describes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VoiceEngine {
+    #[default]
+    #[serde(rename = "rvc")]
+    Rvc,
+    #[serde(rename = "diffusion-svc")]
+    DiffusionSvc,
+    #[serde(rename = "ddsp-svc")]
+    DdspSvc,
+}
+
+impl VoiceEngine {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rvc => "RVC",
+            Self::DiffusionSvc => "Diffusion-SVC",
+            Self::DdspSvc => "DDSP-SVC",
+        }
     }
 }
 
@@ -164,6 +232,8 @@ impl Settings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelManifest {
+    /// RVC when absent, so every older manifest stays an RVC voice.
+    pub engine: VoiceEngine,
     pub name: String,
     pub model: PathBuf,
     pub embedder: PathBuf,
@@ -176,10 +246,19 @@ pub struct ModelManifest {
     pub output_scale: f32,
     pub feature_bank: Option<PathBuf>,
     pub intra_threads: usize,
+    /// Diffusion-SVC only (`model` is its naive model): the diffusion model's
+    /// conditioning, its denoiser and the NSF-HiFiGAN vocoder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denoiser: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vocoder: Option<PathBuf>,
 }
 impl Default for ModelManifest {
     fn default() -> Self {
         Self {
+            engine: VoiceEngine::Rvc,
             name: "RVC voice".into(),
             model: "voice.onnx".into(),
             embedder: "contentvec.onnx".into(),
@@ -192,6 +271,9 @@ impl Default for ModelManifest {
             output_scale: 1.0,
             feature_bank: None,
             intra_threads: 4,
+            condition: None,
+            denoiser: None,
+            vocoder: None,
         }
     }
 }
@@ -228,6 +310,38 @@ impl ModelManifest {
         if let Some(file) = &mut model.feature_bank {
             if file.is_relative() {
                 *file = base.join(&*file);
+            }
+        }
+        if model.engine != VoiceEngine::Rvc {
+            let label = model.engine.label();
+            // A DDSP-SVC voice's diffusion model is optional: both of its files or
+            // neither.
+            let optional = model.engine == VoiceEngine::DdspSvc
+                && model.condition.is_none()
+                && model.denoiser.is_none();
+            for (what, file) in [
+                ("conditioning", &mut model.condition),
+                ("denoiser", &mut model.denoiser),
+                ("vocoder", &mut model.vocoder),
+            ] {
+                if optional && what != "vocoder" {
+                    continue;
+                }
+                let file = file
+                    .as_mut()
+                    .with_context(|| format!("This {label} voice's model.json names no {what}"))?;
+                if file.is_relative() {
+                    *file = base.join(&*file);
+                }
+                if !file.is_file() {
+                    if what == "vocoder" {
+                        bail!(
+                            "The NSF-HiFiGAN vocoder is not installed ({}); {label} voices need it. Download it in Settings under Processing (Manage models), or run `voice-changer-native setup download nsf_hifigan`",
+                            file.display()
+                        );
+                    }
+                    bail!("Model file not found: {}", file.display());
+                }
             }
         }
         Ok(model)

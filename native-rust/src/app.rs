@@ -156,6 +156,8 @@ pub struct VoiceApp {
     songs: songs::SongsState,
     import_checkpoint: String,
     import_index: String,
+    /// The kind of model the import dialog takes.
+    import_engine: crate::config::VoiceEngine,
     file_output: String,
     file_analyze: bool,
     work: Option<mpsc::Receiver<Result<String, String>>>,
@@ -249,6 +251,7 @@ impl VoiceApp {
             songs: Default::default(),
             import_checkpoint: String::new(),
             import_index: String::new(),
+            import_engine: crate::config::VoiceEngine::Rvc,
             file_output: String::new(),
             file_analyze: true,
             work: None,
@@ -639,17 +642,31 @@ impl VoiceApp {
     /// Puts a checkpoint in the import dialog, with the index beside it if the index
     /// field is still empty.
     fn choose_checkpoint(&mut self, path: PathBuf) {
+        let extension = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let engine = match extension.as_str() {
+            "ptc" => crate::config::VoiceEngine::DiffusionSvc,
+            "pt" => crate::config::VoiceEngine::DdspSvc,
+            _ => crate::config::VoiceEngine::Rvc,
+        };
+        if engine != self.import_engine {
+            // The second field holds an RVC index or a DDSP-SVC diffusion model.
+            self.import_index.clear();
+        }
+        self.import_engine = engine;
         // Importing needs the exporter; a build without it only loads model.json files.
         #[cfg(feature = "export")]
-        if self.import_index.trim().is_empty() {
+        if engine == crate::config::VoiceEngine::Rvc && self.import_index.trim().is_empty() {
             if let Some(index) = path.parent().and_then(crate::import::find_index) {
                 self.import_index = index.to_string_lossy().into_owned();
             }
         }
         self.import_checkpoint = path.to_string_lossy().into_owned();
     }
-    /// A dropped `.pth` or `.index` opens the import dialog with it filled in; a
-    /// `.wav` opens Convert with it as the input.
+    /// A dropped `.pth`, `.ptc` or `.index` opens the import dialog with it filled
+    /// in; a `.wav` opens Convert with it as the input.
     fn drop_file(&mut self, path: PathBuf) {
         let extension = path
             .extension()
@@ -663,8 +680,11 @@ impl VoiceApp {
             return;
         }
         match extension.as_str() {
-            "pth" => self.choose_checkpoint(path),
-            "index" => self.import_index = path.to_string_lossy().into_owned(),
+            "pth" | "ptc" | "pt" => self.choose_checkpoint(path),
+            "index" => {
+                self.import_engine = crate::config::VoiceEngine::Rvc;
+                self.import_index = path.to_string_lossy().into_owned();
+            }
             "wav" => {
                 self.choose_input_wav(&path);
                 self.error = None;
@@ -673,7 +693,7 @@ impl VoiceApp {
             }
             _ => {
                 self.error = Some(
-                    t("Drop an RVC .pth checkpoint or its .index file, or a .wav file to convert.")
+                    t("Drop an RVC .pth checkpoint or its .index file, a Diffusion-SVC .ptc model, a DDSP-SVC .pt model, or a .wav file to convert.")
                         .into(),
                 );
                 return;
@@ -691,8 +711,11 @@ impl VoiceApp {
             return;
         }
         let checkpoint = PathBuf::from(self.import_checkpoint.trim());
+        let engine = self.import_engine;
+        let diffusion = engine == crate::config::VoiceEngine::DiffusionSvc;
+        // An RVC index, or a DDSP-SVC voice's diffusion model.
         let index = Some(self.import_index.trim())
-            .filter(|index| !index.is_empty())
+            .filter(|index| !index.is_empty() && !diffusion)
             .map(PathBuf::from);
         log::info!(
             "Importing {} with {}",
@@ -704,12 +727,39 @@ impl VoiceApp {
         #[cfg(feature = "export")]
         self.begin_work(move || {
             let started = std::time::Instant::now();
-            let manifest = crate::import::import_pair(&checkpoint, index.as_deref())?;
+            let manifest = match engine {
+                crate::config::VoiceEngine::DiffusionSvc => {
+                    anyhow::ensure!(
+                        checkpoint
+                            .extension()
+                            .is_some_and(|e| e.eq_ignore_ascii_case("ptc")),
+                        "A Diffusion-SVC model must be a .ptc combo model"
+                    );
+                    crate::import::import_voice(&checkpoint)?
+                }
+                crate::config::VoiceEngine::DdspSvc => {
+                    crate::import::import_ddsp(&checkpoint, index.as_deref(), None)?
+                }
+                crate::config::VoiceEngine::Rvc => {
+                    crate::import::import_pair(&checkpoint, index.as_deref())?
+                }
+            };
             log::info!(
                 "Converted to {} in {:.1} s",
                 manifest.parent().unwrap_or(&manifest).display(),
                 started.elapsed().as_secs_f32()
             );
+            if engine != crate::config::VoiceEngine::Rvc {
+                let name = serde_json::from_slice::<crate::config::ModelManifest>(&std::fs::read(
+                    &manifest,
+                )?)?
+                .name;
+                return Ok(if diffusion {
+                    tf("Imported the Diffusion-SVC voice {}.", &[&name])
+                } else {
+                    tf("Imported the DDSP-SVC voice {}.", &[&name])
+                });
+            }
             let voice = crate::config::ModelManifest::load(&manifest)?;
             Ok(tf(
                 "Imported {}{}.",
@@ -731,18 +781,91 @@ impl VoiceApp {
             );
         }
     }
+    /// Says when the NSF-HiFiGAN vocoder Diffusion-SVC and DDSP-SVC voices need is missing,
+    /// with its licence, and offers to download it.
+    fn vocoder_notice(&mut self, ui: &mut egui::Ui) {
+        let installed = crate::runtime::model_directories().iter().any(|folder| {
+            folder
+                .join("shared")
+                .join(crate::config::VOCODER_FILE)
+                .is_file()
+        });
+        if installed {
+            return;
+        }
+        m3::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(m3::icon(icons::INFO, 20.0, m3::ON_SURFACE_VARIANT));
+                ui.label(t(
+                    "Diffusion-SVC and DDSP-SVC voices also need the NSF-HiFiGAN vocoder (54 MB). Its licence (CC BY-NC-SA 4.0) does not allow commercial use.",
+                ));
+                #[cfg(feature = "catalog")]
+                if ui.add(m3::Button::tonal(t("Download"))).clicked() {
+                    self.offer_model(crate::config::VOCODER_FILE);
+                }
+            });
+        });
+    }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn import_dialog(&mut self, ctx: &egui::Context) {
         let busy = self.running() || self.work.is_some();
         let (mut close, mut import) = (false, false);
-        let (_, dismissed) = m3::dialog(ctx, "import-dialog", t("Import RVC voice"), |ui| {
+        let diffusion = self.import_engine == crate::config::VoiceEngine::DiffusionSvc;
+        let ddsp = self.import_engine == crate::config::VoiceEngine::DdspSvc;
+        let (_, dismissed) = m3::dialog(ctx, "import-dialog", t("Import voice"), |ui| {
             ui.add_enabled_ui(!busy, |ui| {
-                m3::field_label(ui, t("Model (.pth)"));
+                m3::field_label(ui, t("Model type"));
+                let mut chosen = None;
+                let width = ui.available_width().min(320.0);
+                m3::select(ui, self.import_engine.label(), width, |ui| {
+                    for engine in [
+                        crate::config::VoiceEngine::Rvc,
+                        crate::config::VoiceEngine::DiffusionSvc,
+                        crate::config::VoiceEngine::DdspSvc,
+                    ] {
+                        if m3::menu_item(ui, engine.label(), engine == self.import_engine)
+                            .clicked()
+                        {
+                            chosen = Some(engine);
+                        }
+                    }
+                });
+                if let Some(engine) = chosen {
+                    if engine != self.import_engine {
+                        self.import_engine = engine;
+                        self.import_checkpoint.clear();
+                        self.import_index.clear();
+                    }
+                }
+                ui.label(m3::supporting(if diffusion {
+                    t("A singing-voice model that refines its sound with diffusion: often smoother on long, high notes, slower than RVC.")
+                } else if ddsp {
+                    t("A singing-voice model that synthesizes the voice from its harmonics, optionally refined with diffusion. Without diffusion it is about as fast as RVC.")
+                } else {
+                    t("The common voice model (.pth): fast enough for live use on most computers.")
+                }));
+                m3::field_label(
+                    ui,
+                    if diffusion {
+                        t("Model (.ptc)")
+                    } else if ddsp {
+                        t("Model (.pt)")
+                    } else {
+                        t("Model (.pth)")
+                    },
+                );
                 ui.horizontal(|ui| {
                     let width = ui.available_width() - 48.0;
                     ui.add(m3::text_edit(
                         &mut self.import_checkpoint,
-                        "/path/to/voice.pth",
+                        if diffusion {
+                            "/path/to/voice.ptc"
+                        } else if ddsp {
+                            "/path/to/exp/combsub/model_best.pt"
+                        } else {
+                            "/path/to/voice.pth"
+                        },
                         width,
                     ));
                     if m3::icon_button(
@@ -753,15 +876,71 @@ impl VoiceApp {
                     )
                     .clicked()
                     {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter(t("RVC checkpoint"), &["pth"])
-                            .pick_file()
-                        {
+                        let dialog = if diffusion {
+                            rfd::FileDialog::new()
+                                .add_filter(t("Diffusion-SVC combo model"), &["ptc"])
+                        } else if ddsp {
+                            rfd::FileDialog::new().add_filter(t("DDSP-SVC model"), &["pt"])
+                        } else {
+                            rfd::FileDialog::new().add_filter(t("RVC checkpoint"), &["pth"])
+                        };
+                        if let Some(path) = dialog.pick_file() {
                             // Suggest the index beside it; the user can still change it.
                             self.choose_checkpoint(path);
                         }
                     }
                 });
+                if diffusion {
+                    ui.label(m3::supporting(t(
+                        "One .ptc file holding both of its models, as Diffusion-SVC's combo.py makes it. It is converted to ONNX, which takes a few seconds.",
+                    )));
+                    self.vocoder_notice(ui);
+                    return;
+                }
+                if ddsp {
+                    ui.label(m3::supporting(t(
+                        "The model_*.pt DDSP-SVC saves, with the config.yaml it was trained with in the same folder. It is converted to ONNX, which takes a few seconds.",
+                    )));
+                    m3::field_label(ui, t("Diffusion model (.pt, optional)"));
+                    ui.horizontal(|ui| {
+                        let width = ui.available_width() - 96.0;
+                        ui.add(m3::text_edit(
+                            &mut self.import_index,
+                            "/path/to/exp/diffusion/model_best.pt",
+                            width,
+                        ));
+                        if m3::icon_button(
+                            ui,
+                            icons::FOLDER_OPEN,
+                            m3::ON_SURFACE_VARIANT,
+                            t("Choose diffusion model…"),
+                        )
+                        .clicked()
+                        {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter(t("DDSP-SVC model"), &["pt"])
+                                .pick_file()
+                            {
+                                self.import_index = path.to_string_lossy().into_owned();
+                            }
+                        }
+                        if m3::icon_button(
+                            ui,
+                            icons::CLOSE,
+                            m3::ON_SURFACE_VARIANT,
+                            t("No diffusion model"),
+                        )
+                        .clicked()
+                        {
+                            self.import_index.clear();
+                        }
+                    });
+                    ui.label(m3::supporting(t(
+                        "The shallow-diffusion model trained for this voice, from its own folder with its config.yaml. It makes the voice smoother and slower; leave it empty if you have none.",
+                    )));
+                    self.vocoder_notice(ui);
+                    return;
+                }
                 ui.label(m3::supporting(
                     t("The trained voice. It is converted to ONNX, which takes a few seconds."),
                 ));
@@ -1017,15 +1196,30 @@ impl VoiceApp {
                     .truncate(),
             );
             let detail = if configured {
-                let index = crate::config::ModelManifest::load(std::path::Path::new(
-                    slot.manifest.trim(),
-                ))
-                .ok()
-                .map(|model| model.feature_bank.is_some());
-                match index {
-                    Some(true) => t("RVC · ONNX · with index").to_owned(),
-                    Some(false) => t("RVC · ONNX · no index").to_owned(),
-                    None => t("RVC · ONNX · files missing").to_owned(),
+                let model =
+                    crate::config::ModelManifest::load(std::path::Path::new(slot.manifest.trim()));
+                match model {
+                    Ok(model) if model.engine == crate::config::VoiceEngine::DiffusionSvc => {
+                        t("Diffusion-SVC · ONNX").to_owned()
+                    }
+                    Ok(model) if model.engine == crate::config::VoiceEngine::DdspSvc => {
+                        if model.denoiser.is_some() {
+                            t("DDSP-SVC · ONNX · with diffusion").to_owned()
+                        } else {
+                            t("DDSP-SVC · ONNX").to_owned()
+                        }
+                    }
+                    Ok(model) if model.feature_bank.is_some() => {
+                        t("RVC · ONNX · with index").to_owned()
+                    }
+                    Ok(_) => t("RVC · ONNX · no index").to_owned(),
+                    Err(_) if selected_engine(&slot.manifest) == crate::config::VoiceEngine::DiffusionSvc => {
+                        t("Diffusion-SVC · needs the NSF-HiFiGAN vocoder or files are missing").to_owned()
+                    }
+                    Err(_) if selected_engine(&slot.manifest) == crate::config::VoiceEngine::DdspSvc => {
+                        t("DDSP-SVC · needs the NSF-HiFiGAN vocoder or files are missing").to_owned()
+                    }
+                    Err(_) => t("RVC · ONNX · files missing").to_owned(),
                 }
             } else {
                 t("Empty slot. Import an RVC .pth to use it.").to_owned()
@@ -1395,6 +1589,7 @@ impl VoiceApp {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing = Vec2::splat(8.0);
             m3::card_title(ui, icons::VOICE, t("Voice"));
+            let lowered = self.auto_octave_now();
             let s = &mut self.saved.settings;
             m3::setting(
                 ui,
@@ -1408,6 +1603,24 @@ impl VoiceApp {
                 -24.0..=24.0,
                 0.1,
             );
+            choice(
+                ui,
+                t("Auto octave"),
+                t("For singing live: after a phrase whose high notes would go above what the voice sings well (A5 for a female voice, A4 for a male one), the next phrase is an octave lower, like Cover's automatic Tune. It changes only in pauses and never goes above your Tune."),
+                &mut s.auto_octave,
+                &[
+                    (None, t("Off")),
+                    (Some(crate::config::Register::Female), t("A female voice")),
+                    (Some(crate::config::Register::Male), t("A male voice")),
+                ],
+            );
+            if s.auto_octave.is_some() && lowered < 0 {
+                ui.label(m3::supporting(if lowered == -1 {
+                    t("Now one octave lower, after a high phrase.")
+                } else {
+                    t("Now two octaves lower, after a high phrase.")
+                }));
+            }
             m3::setting(
                 ui,
                 t("Index"), t("How much of the model's accent and tone to copy from its .index file. 50-75% usually sounds most like the character; higher can add a metallic edge. No effect on voices without an index."),
@@ -1448,6 +1661,61 @@ impl VoiceApp {
                     (F0Detector::Yin, "YIN"),
                 ],
             );
+            let engine = selected_engine(&self.saved.slots[self.saved.selected].manifest);
+            let ddsp_diffusion = engine == crate::config::VoiceEngine::DdspSvc
+                && has_diffusion(&self.saved.slots[self.saved.selected].manifest);
+            let s = &mut self.saved.settings;
+            if engine == crate::config::VoiceEngine::DdspSvc {
+                if ddsp_diffusion {
+                    ui.horizontal(|ui| {
+                        m3::switch(ui, &mut s.diffusion, t("Diffusion"));
+                        ui.label(t("Diffusion"));
+                    });
+                    ui.label(m3::supporting(t(
+                        "DDSP-SVC voices with a diffusion model: refines the synthesized voice with it, smoother but slower. Turn it off if live audio cannot keep up.",
+                    )));
+                }
+                if ddsp_diffusion && s.diffusion {
+                    choice(
+                        ui,
+                        t("Diffusion steps"),
+                        t("More steps can sound cleaner and take longer. The default is 6, as in the original app."),
+                        &mut s.diffusion_sampler_steps,
+                        &[(0, t("Default")), (3, "3"), (12, "12"), (30, "30")],
+                    );
+                } else {
+                    ui.horizontal(|ui| {
+                        m3::switch(ui, &mut s.enhancer, t("Enhancer"));
+                        ui.label(t("Enhancer"));
+                    });
+                    ui.label(m3::supporting(t(
+                        "Re-renders the synthesized voice with the NSF-HiFiGAN vocoder: fuller and clearer, a little slower. Off plays the synthesizer's own sound.",
+                    )));
+                }
+            }
+            if engine == crate::config::VoiceEngine::DiffusionSvc {
+                ui.horizontal(|ui| {
+                    m3::switch(ui, &mut s.diffusion, t("Diffusion"));
+                    ui.label(t("Diffusion"));
+                });
+                ui.label(m3::supporting(t(
+                    "Diffusion-SVC voices: refines the sound with the diffusion model, smoother but slower. Turn it off if live audio cannot keep up.",
+                )));
+                if s.diffusion {
+                    choice(
+                        ui,
+                        t("Diffusion steps"),
+                        t("More steps can sound cleaner and take longer. The model's default is usually 2, as in the original app."),
+                        &mut s.diffusion_sampler_steps,
+                        &[
+                            (0, t("Default")),
+                            (4, "4"),
+                            (10, "10"),
+                            (20, "20"),
+                        ],
+                    );
+                }
+            }
             // A CREPE detector needs its own model; offer it instead of failing on Start.
             #[cfg(feature = "catalog")]
             if !setup::detector_ready(s.f0_detector) {
@@ -1942,6 +2210,14 @@ impl VoiceApp {
         );
         #[cfg(feature = "audio")]
         self.live_stats(ui);
+    }
+    /// The octaves Auto octave adds to Tune in the running session (0 when off).
+    fn auto_octave_now(&self) -> i32 {
+        #[cfg(feature = "audio")]
+        if let Some(session) = &self.session {
+            return session.metrics.auto_octave.load(Ordering::Relaxed);
+        }
+        0
     }
     /// Live meters and chips under the bottom bar while audio runs: levels, how much
     /// delay the voice has, how hard the processor works, and any glitches.
@@ -2739,6 +3015,38 @@ const EXTRA_PRESETS: [f64; 6] = [
 fn extra_label(ms: f64) -> String {
     format!("{} ({ms:.0} ms)", (ms * 48.0).round())
 }
+/// Whether a voice's `model.json` names a diffusion denoiser (a DDSP-SVC voice
+/// imported with its diffusion model).
+fn has_diffusion(manifest: &str) -> bool {
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct Diffusion {
+        denoiser: Option<String>,
+    }
+    std::fs::read(manifest.trim())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Diffusion>(&bytes).ok())
+        .is_some_and(|d| d.denoiser.is_some())
+}
+/// The engine a voice's `model.json` names (RVC when it names none or cannot be
+/// read); only the `engine` field is read, so missing model files do not matter.
+fn selected_engine(manifest: &str) -> crate::config::VoiceEngine {
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct Engine {
+        engine: crate::config::VoiceEngine,
+    }
+    let manifest = manifest.trim();
+    if manifest.is_empty() {
+        return crate::config::VoiceEngine::Rvc;
+    }
+    std::fs::read(manifest)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Engine>(&bytes).ok())
+        .unwrap_or_default()
+        .engine
+}
+
 fn choice<T: Copy + PartialEq>(
     ui: &mut egui::Ui,
     label: &str,

@@ -12,7 +12,7 @@ use crossbeam_queue::ArrayQueue;
 use std::{
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -56,6 +56,8 @@ pub struct Metrics {
     pub dropped_input: AtomicU64,
     pub dropped_output: AtomicU64,
     pub underrun_samples: AtomicU64,
+    /// The octaves Auto octave currently adds to Tune (0 or negative).
+    pub auto_octave: AtomicI32,
     pub stream_error: AtomicBool,
     pub stream_error_detail: Mutex<Option<String>>,
     /// The monitor device failed; the main output keeps going.
@@ -766,6 +768,9 @@ fn run_devices(
             .store(dsp::rms(&pending).to_bits(), Ordering::Relaxed);
         let started = Instant::now();
         let processed = live.engine.process(&pending, input_rate, &live.settings)?;
+        metrics
+            .auto_octave
+            .store(live.engine.auto_octave(), Ordering::Relaxed);
         let took = started.elapsed().as_secs_f32() * 1000.0;
         metrics
             .processing_ms
