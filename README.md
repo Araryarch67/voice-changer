@@ -13,6 +13,8 @@ No Python, no browser, no local server: one desktop app.
 
 <img src="native-rust/docs/preview-desktop.png" alt="Voice Changer main window: a gallery of voice cards with a detail pane and an audio control bar" width="820">
 
+<img src="native-rust/docs/preview-cover.png" alt="The Cover page: a voice, a song and its output file, with Tune, voice volume and music volume" width="820">
+
 </div>
 
 ## About

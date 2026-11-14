@@ -4,7 +4,7 @@ A Rust + egui prototype based on the audio flow of the original Python applicati
 
 ![Desktop preview](docs/preview-desktop.png)
 
-[Studio preview](docs/preview-studio.png) · [Narrow layout preview](docs/preview-mobile.png)
+[Studio preview](docs/preview-studio.png) · [Cover preview](docs/preview-cover.png) · [Narrow layout preview](docs/preview-mobile.png)
 
 The application does not launch Python, a browser, or a server. It uses eframe/egui and WGPU for the interface, CPAL for audio, crossbeam-queue for bounded audio queues, and ort for ONNX inference. ONNX Runtime and operating-system audio/graphics libraries are native dependencies; “Rust application” does not mean every dependency is implemented in Rust.
 
