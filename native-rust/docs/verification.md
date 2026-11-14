@@ -58,6 +58,12 @@ Host: Windows 11 x86_64; Rust 1.100.
 - Release CLI on a 10 s synthetic song: `split` wrote both stems in 2.7 s; a second `split` without `--overwrite` was refused as a usage error; `cover` with the synthetic test voice from `tests/fixtures` (not a real voice), `--semitones 12 --keep-stems`, wrote the cover and three stems in 4.3 s.
 - Not checked: a real song and a real RVC voice (none on this machine), and the result's sound. The Split and Cover pages were checked as screenshots only (wide and narrow, English and Indonesian), without running a job from the window.
 
+## Update — first Android build (2026-11-14)
+
+- `cargo apk build --lib` (cargo-apk 0.10, NDK 28.2) built signed debug APKs for arm64-v8a and x86_64, with `android` and with `android,onnx` (ONNX Runtime 1.22 from Microsoft's Android AAR, SHA-256 checked against Maven Central). `cargo clippy --target aarch64-linux-android -- -D warnings` passed for both feature sets after three Android-only warnings were fixed.
+- On the Android 15 x86_64 emulator: the app first closed at once, because egui asked the GPU for wgpu's default limits (64 KB uniform buffers) and the emulator's Vulkan offers 16 KB; it now asks only for limits the GPU has (`lib.rs`). The interface then drew under the status bar; it now leaves room for the status and navigation bars (`platform::system_bar_insets`). After that the app opened, every page showed, Japanese text rendered, the microphone permission was asked, and Start opened AAudio input and output and went live in bypass.
+- Not checked: a real phone, a voice converting live (no voice was copied to the device), Split and Cover on a phone, and speed. The emulator crashed in its own OpenGL code with `-gpu swiftshader_indirect`; `-gpu host` worked.
+
 ## Before 1.0: checks by hand
 
 None of these has been run with real audio yet. Each needs a real RVC voice, a microphone and headphones.

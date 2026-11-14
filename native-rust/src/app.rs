@@ -682,7 +682,9 @@ impl VoiceApp {
         self.error = None;
         self.import_dialog = true;
     }
-    /// Converts the chosen checkpoint with the chosen index, or with none.
+    /// Converts the chosen checkpoint with the chosen index, or with none; the
+    /// import dialog's action (desktop only).
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn import_pair(&mut self) {
         if self.work.is_some() {
             self.error = Some(t("Wait for the current task to finish, then import again.").into());
@@ -2079,7 +2081,8 @@ impl VoiceApp {
                 .trim()
                 .is_empty();
         let (mut remove, mut done) = (false, false);
-        #[allow(unused_mut)]
+        // Pictures are chosen with the desktop file picker.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let mut picture: Option<PathBuf> = None;
         // Some(None) removes the index, Some(Some(path)) replaces it.
         #[allow(unused_mut)]
@@ -2502,6 +2505,23 @@ impl eframe::App for VoiceApp {
             }
         }
         let compact = ctx.screen_rect().width() < 650.0;
+        // Room for Android's status and navigation bars, which the window spans.
+        let (top_inset, bottom_inset) = crate::platform::system_bar_insets();
+        let points = ctx.pixels_per_point();
+        if top_inset > 0.0 {
+            egui::TopBottomPanel::top("status-bar-space")
+                .exact_height(top_inset / points)
+                .frame(egui::Frame::new().fill(m3::SURFACE_CONTAINER))
+                .show_separator_line(false)
+                .show(ctx, |_| {});
+        }
+        if bottom_inset > 0.0 {
+            egui::TopBottomPanel::bottom("navigation-bar-space")
+                .exact_height(bottom_inset / points)
+                .frame(egui::Frame::new().fill(m3::SURFACE_CONTAINER))
+                .show_separator_line(false)
+                .show(ctx, |_| {});
+        }
         let bar = |margin: Margin| {
             egui::Frame::new()
                 .fill(m3::SURFACE_CONTAINER)

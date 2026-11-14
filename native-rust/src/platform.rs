@@ -31,6 +31,81 @@ pub fn android_init(app: android_activity::AndroidApp) {
     let _ = ANDROID_APP.set(app);
 }
 
+/// Pixels at the top and bottom of the screen that Android's status bar and
+/// navigation bar cover: apps targeting Android 15 draw under them, so the
+/// interface leaves them free. (0, 0) elsewhere, or when they cannot be read.
+pub fn system_bar_insets() -> (f32, f32) {
+    #[cfg(target_os = "android")]
+    {
+        static INSETS: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+        *INSETS.get_or_init(|| {
+            android_system_bar_insets().unwrap_or_else(|error| {
+                log::warn!("System bar sizes: {error:#}");
+                (0.0, 0.0)
+            })
+        })
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        (0.0, 0.0)
+    }
+}
+
+/// The status and navigation bar heights from Android's own dimension resources.
+#[cfg(target_os = "android")]
+fn android_system_bar_insets() -> Result<(f32, f32)> {
+    use jni::{
+        objects::{JObject, JValue},
+        JavaVM,
+    };
+    let app = ANDROID_APP
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("Android activity is not initialized"))?;
+    let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) }?;
+    let mut env = vm.attach_current_thread()?;
+    let activity = unsafe { JObject::from_raw(app.activity_as_ptr().cast()) };
+    let resources = env
+        .call_method(
+            &activity,
+            "getResources",
+            "()Landroid/content/res/Resources;",
+            &[],
+        )?
+        .l()?;
+    let mut dimension = |name: &str| -> Result<f32> {
+        let name = JObject::from(env.new_string(name)?);
+        let kind = JObject::from(env.new_string("dimen")?);
+        let package = JObject::from(env.new_string("android")?);
+        let id = env
+            .call_method(
+                &resources,
+                "getIdentifier",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
+                &[
+                    JValue::Object(&name),
+                    JValue::Object(&kind),
+                    JValue::Object(&package),
+                ],
+            )?
+            .i()?;
+        if id == 0 {
+            return Ok(0.0);
+        }
+        Ok(env
+            .call_method(
+                &resources,
+                "getDimensionPixelSize",
+                "(I)I",
+                &[JValue::Int(id)],
+            )?
+            .i()? as f32)
+    };
+    Ok((
+        dimension("status_bar_height")?,
+        dimension("navigation_bar_height")?,
+    ))
+}
+
 #[cfg(target_os = "android")]
 fn android_permission() -> Result<bool> {
     use jni::{

@@ -167,13 +167,13 @@ Install Rust's `aarch64-linux-android` target, Android SDK/NDK and cargo-apk, th
 cargo apk build --lib --no-default-features --features android
 ```
 
-This builds the UI and audio path without ONNX, suitable for checking permissions and bypass first. For inference, put Android/arm64 **ONNX Runtime 1.22** `libonnxruntime.so` in `platforms/android/runtime-libs/arm64-v8a/` and build:
+This builds the UI and audio path without ONNX, suitable for checking permissions and bypass first. For inference, put Android/arm64 **ONNX Runtime 1.22** `libonnxruntime.so` in `platforms/android/runtime-libs/arm64-v8a/` (it is `jni/arm64-v8a/libonnxruntime.so` inside Microsoft's `onnxruntime-android-1.22.0.aar` on Maven Central) and build:
 
 ```sh
 cargo apk build --lib --no-default-features --features android,onnx
 ```
 
-The runtime must be an Android library, not a Linux aarch64 library. Cargo metadata includes `RECORD_AUDIO`; the Start button requests runtime permission. After granting access, press Start again. Relative model paths resolve inside the application's external-files directory (or internal storage when external files are unavailable). Copy the JSON and models there using Android development/file-sharing tools. Audio stops when the UI loses focus.
+The runtime must be an Android library, not a Linux aarch64 library. For the x86_64 Android emulator, add `--target x86_64-linux-android` and put the AAR's `jni/x86_64/libonnxruntime.so` in `runtime-libs/x86_64/`. Cargo metadata includes `RECORD_AUDIO`; the Start button requests runtime permission. After granting access, press Start again. Relative model paths resolve inside the application's external-files directory (or internal storage when external files are unavailable). Copy the JSON and models there using Android development/file-sharing tools. Audio stops when the UI loses focus.
 
 ### iOS
 

@@ -123,27 +123,27 @@ impl VoiceApp {
 
     /// A song field with a picker.
     fn song_field(ui: &mut egui::Ui, value: &mut String) -> bool {
-        let mut picked = false;
         let browse = cfg!(not(any(target_os = "android", target_os = "ios")));
         ui.horizontal(|ui| {
             let width = ui.available_width() - if browse { 48.0 } else { 0.0 };
             ui.add(m3::text_edit(value, "song.mp3", width));
+            // The desktop file picker; on phones the path is typed.
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            if m3::icon_button(
+            let picked = m3::icon_button(
                 ui,
                 icons::FOLDER_OPEN,
                 m3::ON_SURFACE_VARIANT,
                 t("Choose a song…"),
             )
             .clicked()
-            {
-                if let Some(path) = pick_song() {
-                    *value = path.to_string_lossy().into_owned();
-                    picked = true;
-                }
-            }
-        });
-        picked
+                && pick_song()
+                    .map(|path| *value = path.to_string_lossy().into_owned())
+                    .is_some();
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            let picked = false;
+            picked
+        })
+        .inner
     }
 
     pub(super) fn split_page(&mut self, ui: &mut egui::Ui) {
