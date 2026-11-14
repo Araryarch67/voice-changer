@@ -131,8 +131,12 @@ pub fn install(ctx: &egui::Context) {
         .insert(symbols(true), vec!["icons-filled".to_owned()]);
     ctx.set_fonts(fonts);
 
-    ctx.set_visuals(egui::Visuals::dark());
-    let mut style = (*ctx.style()).clone();
+    // The app has one palette. egui keeps a dark and a light style and eframe
+    // follows the system theme, so with Windows in light mode egui's own light
+    // colours would show; pin the theme and give both styles the app's colours.
+    ctx.set_theme(egui::ThemePreference::Dark);
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
+    style.visuals = egui::Visuals::dark();
     style.text_styles = [
         (egui::TextStyle::Heading, FontId::proportional(28.0)),
         (egui::TextStyle::Body, FontId::proportional(14.0)),
@@ -187,7 +191,8 @@ pub fn install(ctx: &egui::Context) {
     w.active.weak_bg_fill = ON_SURFACE.gamma_multiply(0.12);
     w.active.bg_stroke = Stroke::new(2.0_f32, PRIMARY);
     w.open.bg_stroke = Stroke::new(2.0_f32, PRIMARY);
-    ctx.set_style(style);
+    ctx.set_style_of(egui::Theme::Light, style.clone());
+    ctx.set_style_of(egui::Theme::Dark, style);
 }
 
 /// M3 state layer: the content colour at 8 % on hover/focus and 12 % while pressed.
@@ -1520,6 +1525,29 @@ mod tests {
             });
         }
         clicks
+    }
+
+    #[test]
+    fn the_app_keeps_its_own_colours_when_windows_is_in_light_mode() {
+        let ctx = egui::Context::default();
+        super::install(&ctx);
+        let input = egui::RawInput {
+            system_theme: Some(egui::Theme::Light),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |_| {});
+        assert_eq!(ctx.theme(), egui::Theme::Dark);
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            let visuals = &ctx.style_of(theme).visuals;
+            assert_eq!(visuals.panel_fill, super::SURFACE, "{theme:?}");
+            assert_eq!(
+                visuals.window_fill,
+                super::SURFACE_CONTAINER_HIGH,
+                "{theme:?}"
+            );
+            assert!(visuals.dark_mode, "{theme:?}");
+        }
+        assert_eq!(ctx.style().visuals.panel_fill, super::SURFACE);
     }
 
     #[test]

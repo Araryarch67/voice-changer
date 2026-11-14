@@ -7,6 +7,8 @@ No Python, no browser, no local server: one desktop app.
 
 [![Linux release](https://github.com/Araryarch67/voice-changer/actions/workflows/release-linux.yml/badge.svg)](https://github.com/Araryarch67/voice-changer/actions/workflows/release-linux.yml) [![Windows release](https://github.com/Araryarch67/voice-changer/actions/workflows/release-windows.yml/badge.svg)](https://github.com/Araryarch67/voice-changer/actions/workflows/release-windows.yml)
 [![Latest release](https://img.shields.io/github/v/release/Araryarch67/voice-changer?include_prereleases&label=release)](https://github.com/Araryarch67/voice-changer/releases)
+[![Downloads](https://img.shields.io/github/downloads/Araryarch67/voice-changer/total?label=downloads)](https://github.com/Araryarch67/voice-changer/releases)
+[![Latest release downloads](https://img.shields.io/github/downloads/Araryarch67/voice-changer/latest/total?label=latest%20downloads)](https://github.com/Araryarch67/voice-changer/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-stable-orange?logo=rust)
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-informational)
