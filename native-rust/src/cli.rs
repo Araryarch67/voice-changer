@@ -173,6 +173,15 @@ pub enum Command {
         name: String,
     },
     DatasetColab,
+    DatasetTrain {
+        name: String,
+        epochs: u32,
+        batch_size: u32,
+        sample_rate: u32,
+    },
+    DatasetTrainer {
+        remove: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +442,8 @@ Usage:
   dataset pack NAME [--out FILE.zip] [--overwrite] [--json]
   dataset delete NAME --yes [--json]   (also removes <datasets>/NAME.zip)
   dataset colab [--json]
+  dataset train NAME [--epochs N] [--batch-size N] [--sample-rate 40k|48k] [--json]
+  dataset trainer [--remove --yes] [--json]
 
 Clones a voice in three steps, like the GUI's Clone page:
   1. Collect at least {min} s (10 minutes or more is recommended) of one speaker in
@@ -443,9 +454,20 @@ Clones a voice in three steps, like the GUI's Clone page:
      Training takes about 1-3 hours on Colab's free GPU.
   3. Step 4 downloads NAME-rvc.zip; `voices import NAME-rvc.zip` installs it.
 
+Or train on this computer instead of steps 2-3: `train` needs an NVIDIA GPU. The
+first time it sets up the trainer (Applio {applio}, a private Python and PyTorch,
+about {gb} GB) in <models>/../trainer, then trains like the notebook (default 300
+epochs, batch size 8, 40k) and imports the voice as NAME. Progress goes to stderr.
+Stopping it keeps the last save (every 10 epochs); `train` again continues. Training
+accepts Applio's terms of use ({terms}). `trainer` shows the trainer's state;
+`trainer --remove --yes` deletes it (datasets and voices stay).
+
 NAME may contain letters, digits, - and _; other characters become _. Only clone
 voices you have the right to use.",
-            min = crate::dataset::MINIMUM_SECONDS
+            min = crate::dataset::MINIMUM_SECONDS,
+            applio = TRAIN_APPLIO,
+            gb = TRAIN_GB,
+            terms = TRAIN_TERMS,
         ),
         "version" => "Usage: version [--json]".to_owned(),
         "help" => "Usage: help [COMMAND]".to_owned(),
@@ -457,6 +479,16 @@ voices you have the right to use.",
 // ---------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------
+
+#[cfg(feature = "catalog")]
+const TRAIN_APPLIO: &str = crate::train::APPLIO_VERSION;
+#[cfg(not(feature = "catalog"))]
+const TRAIN_APPLIO: &str = "3.7.1";
+#[cfg(feature = "catalog")]
+const TRAIN_GB: u32 = crate::train::INSTALL_GB;
+#[cfg(not(feature = "catalog"))]
+const TRAIN_GB: u32 = 8;
+const TRAIN_TERMS: &str = "https://github.com/IAHispano/Applio/blob/main/TERMS_OF_USE.md";
 
 /// Arguments after the command, with `--flag=value` split in two.
 struct Cursor {
@@ -847,7 +879,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, UsageError> {
 
 fn parse_dataset(cursor: &mut Cursor) -> Result<Command, UsageError> {
     let Some(action) = cursor.next() else {
-        return usage("`dataset` needs an action: list, show, add, record, pack, delete or colab");
+        return usage("`dataset` needs an action: list, show, add, record, pack, delete, colab, train or trainer");
     };
     let action = match action.as_str() {
         "ls" => "list",
@@ -859,9 +891,23 @@ fn parse_dataset(cursor: &mut Cursor) -> Result<Command, UsageError> {
     let command = format!("dataset {action}");
     let mut positional = Vec::new();
     let (mut seconds, mut input, mut output) = (None, None, None);
-    let (mut overwrite, mut yes) = (false, false);
+    let (mut overwrite, mut yes, mut remove) = (false, false, false);
+    let (mut epochs, mut batch_size, mut sample_rate) = (300u32, 8u32, 40_000u32);
     while let Some(arg) = cursor.next() {
         match (action.as_str(), arg.as_str()) {
+            ("train", "--epochs") => epochs = number(&arg, &cursor.value(&arg)?)?,
+            ("train", "--batch-size") => batch_size = number(&arg, &cursor.value(&arg)?)?,
+            ("train", "--sample-rate") => {
+                sample_rate = match cursor.value(&arg)?.to_ascii_lowercase().as_str() {
+                    "40k" | "40000" => 40_000,
+                    "48k" | "48000" => 48_000,
+                    other => {
+                        return usage(format!("--sample-rate must be 40k or 48k, not {other}"))
+                    }
+                }
+            }
+            ("trainer", "--remove") => remove = true,
+            ("trainer", "--yes" | "-y") => yes = true,
             ("record", "--seconds") => seconds = Some(number(&arg, &cursor.value(&arg)?)?),
             ("record", "--input") => input = Some(cursor.value(&arg)?),
             ("pack", "--out") => output = Some(PathBuf::from(cursor.value(&arg)?)),
@@ -922,6 +968,30 @@ fn parse_dataset(cursor: &mut Cursor) -> Result<Command, UsageError> {
                 overwrite,
             }
         }
+        "train" => {
+            positional_count(&command, &positional, 1..=1)?;
+            if !(1..=10_000).contains(&epochs) {
+                return usage("`dataset train`: --epochs must be 1..10000");
+            }
+            if !(1..=50).contains(&batch_size) {
+                return usage("`dataset train`: --batch-size must be 1..50");
+            }
+            Command::DatasetTrain {
+                name: name(&positional)?,
+                epochs,
+                batch_size,
+                sample_rate,
+            }
+        }
+        "trainer" => {
+            positional_count(&command, &positional, 0..=0)?;
+            if remove && !yes {
+                return usage(
+                    "`dataset trainer --remove` deletes the trainer (several GB); add --yes to confirm",
+                );
+            }
+            Command::DatasetTrainer { remove }
+        }
         "delete" => {
             positional_count(&command, &positional, 1..=1)?;
             if !yes {
@@ -935,7 +1005,7 @@ fn parse_dataset(cursor: &mut Cursor) -> Result<Command, UsageError> {
         }
         other => {
             return usage(format!(
-            "Unknown action `dataset {other}`; use list, show, add, record, pack, delete or colab"
+            "Unknown action `dataset {other}`; use list, show, add, record, pack, delete, colab, train or trainer"
         ))
         }
     })
@@ -1478,6 +1548,13 @@ fn run(invocation: &Invocation) -> Result<Report> {
             overwrite,
         } => dataset_pack(name, output.as_deref(), *overwrite),
         Command::DatasetDelete { name } => dataset_delete(name),
+        Command::DatasetTrain {
+            name,
+            epochs,
+            batch_size,
+            sample_rate,
+        } => dataset_train(name, *epochs, *batch_size, *sample_rate, invocation.quiet),
+        Command::DatasetTrainer { remove } => dataset_trainer(*remove),
         Command::DatasetColab => {
             let url = crate::dataset::colab_url();
             Ok(Report {
@@ -2434,6 +2511,137 @@ fn dataset_pack(_: &str, _: Option<&Path>, _: bool) -> Result<Report> {
     bail!("This build cannot pack datasets (built without the export feature)")
 }
 
+#[cfg(feature = "catalog")]
+fn dataset_train(
+    name: &str,
+    epochs: u32,
+    batch_size: u32,
+    sample_rate: u32,
+    quiet: bool,
+) -> Result<Report> {
+    use crate::train::{Options, Progress, Stage};
+    let folder = crate::dataset::root().join(name);
+    anyhow::ensure!(
+        folder.is_dir(),
+        "No dataset named {name}; see `dataset list`"
+    );
+    anyhow::ensure!(
+        crate::runtime::models_root().is_some(),
+        "The voice engine is not set up yet; run `setup download` first (the trained voice is imported with it)"
+    );
+    let options = Options {
+        epochs,
+        batch_size,
+        sample_rate,
+        ..Options::new(name, folder)
+    };
+    if !quiet && !crate::train::installed() {
+        eprintln!(
+            "First training: setting up the trainer (Applio {}, about {} GB) in {}.",
+            crate::train::APPLIO_VERSION,
+            crate::train::INSTALL_GB,
+            display(&crate::train::root())
+        );
+    }
+    let progress = std::sync::Arc::new(Progress::default());
+    let worker = {
+        let progress = progress.clone();
+        let options = options.clone();
+        std::thread::spawn(move || crate::train::train(&options, &progress))
+    };
+    let mut shown = (None::<Stage>, 0u32, None::<String>);
+    while !worker.is_finished() {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if quiet {
+            continue;
+        }
+        let stage = progress.stage();
+        let (epoch, total) = progress.epochs();
+        if stage != shown.0 {
+            if let Some(stage) = stage {
+                eprintln!("[{stage:?}]");
+            }
+            shown.0 = stage;
+        }
+        if stage == Some(Stage::Training) && epoch != shown.1 {
+            eprintln!("epoch {epoch} of {total}");
+            shown.1 = epoch;
+        } else if stage != Some(Stage::Training) {
+            // The trainer's own output while it sets up and prepares: the lines
+            // after the last one printed (the buffer keeps only the latest ones).
+            let lines = progress.lines(200);
+            let start = shown
+                .2
+                .as_ref()
+                .and_then(|last| lines.iter().rposition(|line| line == last))
+                .map_or(0, |i| i + 1);
+            for line in &lines[start..] {
+                eprintln!("  {line}");
+            }
+            if let Some(last) = lines.last() {
+                shown.2 = Some(last.clone());
+            }
+        }
+    }
+    let manifest = worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("The training worker panicked"))??;
+    let entry = voice_entry(&manifest);
+    Ok(Report {
+        text: format!("Trained and imported\n{}", voice_text(&entry)),
+        data: entry,
+    })
+}
+#[cfg(not(feature = "catalog"))]
+fn dataset_train(_: &str, _: u32, _: u32, _: u32, _: bool) -> Result<Report> {
+    bail!("This build cannot train voices (built without the catalog feature)")
+}
+
+#[cfg(feature = "catalog")]
+fn dataset_trainer(remove: bool) -> Result<Report> {
+    let root = crate::train::root();
+    if remove {
+        let bytes = crate::train::disk_bytes();
+        crate::train::remove()?;
+        return Ok(Report {
+            text: format!(
+                "Removed the trainer ({:.1} GB) from {}",
+                bytes as f64 / 1e9,
+                display(&root)
+            ),
+            data: json!({ "removed": display(&root), "bytes": bytes }),
+        });
+    }
+    let installed = crate::train::installed();
+    let bytes = crate::train::disk_bytes();
+    let gpu = crate::train::gpu();
+    let text = format!(
+        "Trainer: {} (Applio {}, {:.1} GB in {})\nGPU: {}",
+        if installed { "set up" } else { "not set up" },
+        crate::train::APPLIO_VERSION,
+        bytes as f64 / 1e9,
+        display(&root),
+        match &gpu {
+            Ok(name) => name.clone(),
+            Err(error) => error.to_string(),
+        }
+    );
+    Ok(Report {
+        text,
+        data: json!({
+            "installed": installed,
+            "applio": crate::train::APPLIO_VERSION,
+            "folder": display(&root),
+            "bytes": bytes,
+            "gpu": gpu.ok(),
+        }),
+    })
+}
+#[cfg(not(feature = "catalog"))]
+fn dataset_trainer(_: bool) -> Result<Report> {
+    bail!("This build cannot train voices (built without the catalog feature)")
+}
+
 fn dataset_delete(name: &str) -> Result<Report> {
     let folder = crate::dataset::root().join(name);
     anyhow::ensure!(
@@ -2692,6 +2900,26 @@ mod tests {
     #[test]
     fn dataset_commands_parse() {
         assert!(matches!(parsed("dataset ls").command, Command::DatasetList));
+        assert!(matches!(
+            parsed("dataset train My-Voice --epochs 200 --batch-size 4 --sample-rate 48k").command,
+            Command::DatasetTrain { ref name, epochs: 200, batch_size: 4, sample_rate: 48_000 } if name == "My-Voice"
+        ));
+        assert!(matches!(
+            parsed("dataset train me").command,
+            Command::DatasetTrain {
+                epochs: 300,
+                batch_size: 8,
+                sample_rate: 40_000,
+                ..
+            }
+        ));
+        assert!(rejected("dataset train me --sample-rate 44k").contains("40k or 48k"));
+        assert!(rejected("dataset train me --epochs 0").contains("--epochs"));
+        assert!(rejected("dataset trainer --remove").contains("--yes"));
+        assert!(matches!(
+            parsed("dataset trainer --remove --yes").command,
+            Command::DatasetTrainer { remove: true }
+        ));
         match parsed("dataset add My.Voice a.wav b.wav").command {
             Command::DatasetAdd { name, files } => {
                 assert_eq!(name, "My_Voice");

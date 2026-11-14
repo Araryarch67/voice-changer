@@ -50,6 +50,8 @@ pub mod rvc;
 pub mod separate;
 #[cfg(feature = "catalog")]
 pub mod setup;
+#[cfg(feature = "catalog")]
+pub mod train;
 #[cfg(all(feature = "audio", target_os = "linux"))]
 pub mod virtual_mic;
 pub mod wav;

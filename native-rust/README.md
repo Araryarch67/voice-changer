@@ -73,13 +73,15 @@ Separation follows UVR and AICoverGen for this MDX-Net model (`src/separate.rs`)
 
 ## Cloning your own voice
 
-The **Clone** page makes an RVC v2 voice from your own recordings. The app does not train (training needs PyTorch and a GPU for an hour or more); it prepares the recordings for a Google Colab notebook that trains on Colab's free GPU, and imports what it produces.
+The **Clone** page makes an RVC v2 voice from your own recordings, trained either on this computer's NVIDIA GPU or with a Google Colab notebook on Colab's free GPU; both run the same trainer with the same settings.
 
 1. **Record.** Give the voice a name and read the sentences shown, or speak or sing freely. Each take is trimmed of silence, its peak set to -1 dBFS, and kept in `datasets/<name>/` beside the models folder; a take that clipped or was very quiet is flagged. **Add WAV recordings…** adds recordings you already have. At least one minute is needed; ten minutes or more of only your voice, in a quiet room, gives a good voice.
-2. **Train on Google Colab.** **Pack for Colab** writes `datasets/<name>.zip` (the takes plus `voice-changer-dataset.json` with the name). **Open Colab notebook** opens [`colab/train_voice.ipynb`](colab/train_voice.ipynb) at this app's version. In Colab choose a T4 GPU and run its four steps: install the trainer ([Applio](https://github.com/IAHispano/Applio) 3.7.1, pinned), upload the ZIP, train (RMVPE pitch, ContentVec, HiFi-GAN, 40 kHz, 300 epochs by default, about 1–3 hours), and download `<name>-rvc.zip`. With **keep_in_drive** on, training is saved to `MyDrive/VoiceChanger/<name>` and continues after a disconnect.
-3. **Import the trained voice** takes that ZIP like any other voice.
+2. **Train**, under **Where**:
+   - **This computer** (`src/train.rs`) needs an NVIDIA GPU (found with `nvidia-smi`). The first training sets up the trainer in `trainer/` beside the models folder: uv, a private Python 3.12, PyTorch for CUDA 12.8, [Applio](https://github.com/IAHispano/Applio) 3.7.1 and its pretrained models, about 8 GB; uv and Applio are checked against their size and SHA-256, and nothing is installed elsewhere. Training then cuts the takes into 3 s slices, extracts ContentVec features and RMVPE pitch, trains from the pretrained HiFi-GAN (**Epochs** 300, **Batch size** 8, **Sample rate** 40 kHz by default), saving every 10 epochs, builds the index and imports the voice, which is then selected. The card shows the stage, the epoch and the trainer's latest output; **Stop** keeps the last save and **Train** continues from it. **Remove trainer** deletes `trainer/` (recordings and voices stay). Starting a training accepts Applio's terms of use.
+   - **Google Colab**: **Pack for Colab** writes `datasets/<name>.zip` (the takes plus `voice-changer-dataset.json` with the name). **Open Colab notebook** opens [`colab/train_voice.ipynb`](colab/train_voice.ipynb) at this app's version. In Colab choose a T4 GPU and run its four steps: install the trainer ([Applio](https://github.com/IAHispano/Applio) 3.7.1, pinned), upload the ZIP, train (RMVPE pitch, ContentVec, HiFi-GAN, 40 kHz, 300 epochs by default, about 1–3 hours), and download `<name>-rvc.zip`. With **keep_in_drive** on, training is saved to `MyDrive/VoiceChanger/<name>` and continues after a disconnect.
+3. **Import the trained voice** takes the ZIP from Colab like any other voice (a local training imports its voice itself).
 
-Only clone voices you have the right to use. Training on your own computer is planned as a later step.
+Only clone voices you have the right to use.
 
 ## Model contract
 
@@ -126,6 +128,7 @@ Run without arguments, the program opens the GUI. With a command it works withou
 | `dataset list` / `dataset show NAME` | Recordings collected for cloning a voice, with their length and whether there is enough to train |
 | `dataset add NAME FILE.wav...` / `dataset record NAME --seconds N [--input DEV]` | Adds WAV files or records the microphone into `datasets/NAME/`, trimmed and normalized like the Clone page |
 | `dataset pack NAME [--out FILE.zip] [--overwrite]` / `dataset colab` | Packs the recordings for the Colab notebook and prints its URL; import the trained `NAME-rvc.zip` with `voices import` |
+| `dataset train NAME [--epochs N] [--batch-size N] [--sample-rate 40k\|48k]` / `dataset trainer [--remove --yes]` | Trains NAME on this computer's NVIDIA GPU and imports it, like **This computer** on the Clone page; `trainer` shows or removes the trainer |
 | `dataset delete NAME --yes` | Deletes the recordings and their packed ZIP |
 
 `VOICE` is a voice's name or folder name as `voices list` shows them (case does not matter), a voice folder, or a `model.json` path. A device is an ID from `devices`, its exact name, or a unique part of the name.

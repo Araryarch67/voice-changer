@@ -4068,6 +4068,7 @@ dependencies = [
  "hound",
  "image",
  "jni 0.21.1",
+ "libc",
  "libloading",
  "log",
  "lzma-rs",

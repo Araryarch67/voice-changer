@@ -70,6 +70,12 @@ Host: Windows 11 x86_64; Rust 1.100.
 - A real song ("From The Start", Laufey, 171 s WAV) separated with Kim Vocal 2 measured: median 310 Hz (D#4), 95th percentile 449 Hz, peak 713 Hz. `cover --auto-tune female` chose +0 and `--auto-tune male` −12, about 86 s each on CPU. The voice was the synthetic test voice, so the sound was not judged.
 - Unit tests: octave choice, pitch measurement of harmonic tones with quiet bleed ignored, the cover settings, and the CLI flag. fmt, clippy (`-D warnings`) and `cargo test` passed; the Cover page was checked as a screenshot.
 
+## Update — local training on the Clone page (2026-11-15)
+
+- The Clone page's **2. Train** card chooses **This computer** or **Google Colab**; without an NVIDIA GPU it starts on Colab. The local card uses `train::train` through the app's worker, so the trained voice is adopted into a slot and selected like an import. Rendered on Windows (1100×1400): the GPU line read "NVIDIA GeForce RTX 5070 Ti Laptop GPU" from `nvidia-smi`, with the options and the first-download note.
+- fmt, clippy (`-D warnings`, default and `gui,audio`, `gui,audio,onnx`, `gui,onnx,export`) and `cargo test` passed; every new text is translated and the Japanese font subset covers it.
+- Not run: a real training. It downloads about 8 GB (Python, PyTorch, Applio) and takes an hour or more on the GPU; the setup, a full training, Stop and continuing, and the import of the result still need a run on this machine.
+
 ## Before 1.0: checks by hand
 
 None of these has been run with real audio yet. Each needs a real RVC voice, a microphone and headphones.
@@ -89,6 +95,7 @@ Voices and files
 - [ ] Find online: search, add a voice from Hugging Face, Google Drive and MediaFire.
 - [ ] Add slot past eight; move a card earlier and later and remove one (right-click, and press and hold on a touch screen); the selected voice and its tuning stay with it.
 - [ ] Convert: a WAV converts with the chosen voice and the report is written; dropping a `.wav` opens Convert with it.
+- [ ] Train on this computer: first setup, a short training (for example 20 epochs), Stop and Train again continue from the last save, the voice is imported and selected; Remove trainer frees the space.
 - [ ] Split and Cover on real songs (MP3 and WAV) with a real voice: the vocals and music are clean, the cover sounds in tune, Cancel stops a job, and CUDA/DirectML work for separation.
 
 Setup and settings

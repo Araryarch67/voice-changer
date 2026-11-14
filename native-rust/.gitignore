@@ -12,3 +12,4 @@
 /platforms/ios/vendor/
 /platforms/ios/*.xcodeproj/
 /datasets/
+/trainer/

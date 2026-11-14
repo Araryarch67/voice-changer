@@ -1,5 +1,6 @@
-//! Clone page: records the user's voice into a dataset (`crate::dataset`), packs it
-//! for the Colab notebook that trains an RVC v2 voice, and imports the result.
+//! Clone page: records the user's voice into a dataset (`crate::dataset`), trains an
+//! RVC v2 voice from it on this computer's NVIDIA GPU (`crate::train`) or packs it
+//! for the Colab notebook that does the same, and imports the result.
 use super::{header, icons, m3, VoiceApp};
 use crate::dataset::{self, Take};
 use crate::i18n::{t, tf, Lang};
@@ -26,6 +27,24 @@ pub(super) struct CloneState {
     packed: Option<PathBuf>,
     /// The name was filled in from the most recent dataset.
     started: bool,
+    /// Train on Google Colab instead of this computer.
+    colab: bool,
+    /// The NVIDIA GPU `nvidia-smi` reports, or why there is none; asked once.
+    #[cfg(feature = "catalog")]
+    gpu: Option<Result<String, String>>,
+    /// The local training's options; 0 until the page first shows them.
+    epochs: u32,
+    batch_size: u32,
+    sample_rate: u32,
+    /// The local training that is running.
+    #[cfg(feature = "catalog")]
+    training: Option<std::sync::Arc<crate::train::Progress>>,
+    /// The trainer's size on disk, read when the page opens and after a training.
+    #[cfg(feature = "catalog")]
+    trainer_bytes: Option<u64>,
+    /// Remove trainer was pressed once; the second press removes it.
+    #[cfg(feature = "catalog")]
+    confirm_remove: bool,
 }
 
 /// The dataset folder of `name`; `None` while it has no usable name.
@@ -144,6 +163,20 @@ impl VoiceApp {
             if let Some(name) = latest_dataset() {
                 self.clone.name = name;
             }
+            self.clone.epochs = 300;
+            self.clone.batch_size = 8;
+            self.clone.sample_rate = 40_000;
+            // Without an NVIDIA GPU, Colab is the way to train.
+            #[cfg(feature = "catalog")]
+            {
+                let gpu = crate::train::gpu().map_err(|e| e.to_string());
+                self.clone.colab = gpu.is_err();
+                self.clone.gpu = Some(gpu);
+            }
+            #[cfg(not(feature = "catalog"))]
+            {
+                self.clone.colab = true;
+            }
         }
         let folder = folder(&self.clone.name);
         if self.clone.listed != folder {
@@ -154,7 +187,7 @@ impl VoiceApp {
         header(
             ui,
             t("Clone your voice"),
-            t("Record yourself, train an RVC v2 voice on Google Colab's free GPU, and import it here. Only clone voices you have the right to use."),
+            t("Record yourself, train an RVC v2 voice on this computer's NVIDIA GPU or on Google Colab's free GPU, and use it here. Only clone voices you have the right to use."),
         );
         self.record_card(ui, folder.as_deref());
         ui.add_space(16.0);
@@ -406,7 +439,36 @@ impl VoiceApp {
         m3::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing = Vec2::splat(8.0);
-            m3::card_title(ui, icons::MEMORY, t("2. Train on Google Colab"));
+            m3::card_title(ui, icons::MEMORY, t("2. Train"));
+            #[cfg(feature = "catalog")]
+            let training = self.clone.training.is_some();
+            #[cfg(not(feature = "catalog"))]
+            let training = false;
+            ui.add_enabled_ui(!training, |ui| {
+                super::choice(
+                    ui,
+                    t("Where"),
+                    t("This computer needs an NVIDIA GPU and downloads the trainer the first time; Google Colab needs a Google account and a browser."),
+                    &mut self.clone.colab,
+                    &[(false, t("This computer")), (true, t("Google Colab"))],
+                );
+            });
+            if !self.clone.colab {
+                #[cfg(feature = "catalog")]
+                self.local_training(ui, folder, enough, busy && !training);
+                #[cfg(not(feature = "catalog"))]
+                ui.label(m3::supporting(t("This build cannot train on this computer; use Google Colab.")));
+                if !enough {
+                    ui.label(m3::supporting(&tf(
+                        "Record at least {} first; {} or more gives a much better voice.",
+                        &[
+                            &clock(dataset::MINIMUM_SECONDS),
+                            &clock(dataset::RECOMMENDED_SECONDS),
+                        ],
+                    )));
+                }
+                return;
+            }
             ui.add(
                 egui::Label::new(m3::supporting(t(
                     "Pack the recordings into a ZIP and open the notebook. In Colab choose Runtime > Change runtime type > T4 GPU, run the four steps in order and upload the ZIP in step 2. Training takes about 1–3 hours; step 4 downloads your voice. You need a Google account.",
@@ -456,6 +518,232 @@ impl VoiceApp {
                     open_external(&parent.to_string_lossy());
                 }
             }
+        });
+    }
+
+    /// Local training: the GPU and trainer, the options, and while it runs its stage,
+    /// epochs and the trainer's latest output, with Stop.
+    #[cfg(feature = "catalog")]
+    fn local_training(
+        &mut self,
+        ui: &mut egui::Ui,
+        folder: Option<&Path>,
+        enough: bool,
+        busy: bool,
+    ) {
+        use crate::train::{self, Stage};
+        // The worker is done: the voice was imported (or it failed or stopped).
+        if self.clone.training.is_some() && self.work.is_none() {
+            self.clone.training = None;
+            self.clone.trainer_bytes = None;
+        }
+        let gpu_ok = match &self.clone.gpu {
+            Some(Ok(name)) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(m3::icon(icons::MEMORY, 20.0, m3::SUCCESS));
+                    ui.label(name);
+                });
+                true
+            }
+            Some(Err(problem)) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(m3::icon(icons::ERROR, 20.0, m3::ERROR));
+                    ui.label(t("No NVIDIA GPU found, so this computer cannot train. Use Google Colab instead."));
+                });
+                ui.label(m3::supporting(problem));
+                false
+            }
+            None => false,
+        };
+        let installed = train::installed();
+        let bytes = *self
+            .clone
+            .trainer_bytes
+            .get_or_insert_with(train::disk_bytes);
+        if let Some(progress) = self.clone.training.clone() {
+            let (epoch, epochs) = progress.epochs();
+            let stage = match progress.stage() {
+                None | Some(Stage::Checking) => t("Checking the GPU…").to_owned(),
+                Some(Stage::Downloading) => {
+                    let (received, total) = (
+                        progress.received.load(std::sync::atomic::Ordering::Relaxed),
+                        progress.total.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                    tf(
+                        "Downloading the trainer… {} of {} MB",
+                        &[&(received / 1_000_000), &(total / 1_000_000)],
+                    )
+                }
+                Some(Stage::Installing) => t("Setting up the trainer (Python, PyTorch and Applio); only the first time, it can take a while…").to_owned(),
+                Some(Stage::Preparing) => t("Cutting the recordings into slices…").to_owned(),
+                Some(Stage::Extracting) => t("Reading features and pitch…").to_owned(),
+                Some(Stage::Training) => tf("Training: epoch {} of {}", &[&epoch, &epochs]),
+                Some(Stage::Indexing) => t("Building the index…").to_owned(),
+                Some(Stage::Importing) => t("Importing the voice…").to_owned(),
+            };
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().color(m3::PRIMARY));
+                ui.label(stage);
+            });
+            if progress.stage() == Some(Stage::Training) && epochs > 0 {
+                m3::linear_progress(ui, epoch as f32 / epochs as f32);
+            }
+            let lines = progress.lines(6);
+            if !lines.is_empty() {
+                egui::Frame::new()
+                    .fill(m3::SURFACE_CONTAINER_HIGHEST)
+                    .corner_radius(8.0)
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        for line in lines {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(line)
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(m3::ON_SURFACE_VARIANT),
+                                )
+                                .truncate(),
+                            );
+                        }
+                    });
+            }
+            let mut stop = false;
+            m3::actions(ui, |ui| {
+                stop = ui
+                    .add_enabled(
+                        !progress.cancel.load(std::sync::atomic::Ordering::Relaxed),
+                        m3::Button::tonal(t("Stop")).icon(icons::STOP),
+                    )
+                    .clicked();
+            });
+            ui.label(m3::supporting(t(
+                "Stopping keeps the last save (every 10 epochs); press Train again to continue from it.",
+            )));
+            if stop {
+                progress
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(500));
+            return;
+        }
+        let c = &mut self.clone;
+        m3::setting(
+            ui,
+            t("Epochs"),
+            t("How many times training goes through the recordings. 300 suits 10 minutes of voice; fewer is faster but sounds less like you, too many can sound harsh."),
+            m3::Format::new("").presets(&[100.0, 200.0, 300.0, 500.0]),
+            &mut c.epochs,
+            10..=1000,
+            10.0,
+        );
+        super::choice(
+            ui,
+            t("Batch size"),
+            t("Recordings trained on at once. 8 suits a GPU with 8 GB of memory; lower it if training runs out of GPU memory."),
+            &mut c.batch_size,
+            &[(4, "4"), (8, "8"), (12, "12"), (16, "16")],
+        );
+        super::choice(
+            ui,
+            t("Sample rate"),
+            t("40 kHz is the usual choice and trains faster; 48 kHz keeps a little more of the highest sounds."),
+            &mut c.sample_rate,
+            &[(40_000, "40 kHz"), (48_000, "48 kHz")],
+        );
+        if installed {
+            ui.label(m3::supporting(&tf(
+                "The trainer is set up ({} GB in {}).",
+                &[
+                    &format!("{:.1}", bytes as f64 / 1e9),
+                    &super::plain_path(&train::root()),
+                ],
+            )));
+        } else {
+            ui.label(m3::supporting(&tf(
+                "The first training downloads the trainer (Applio {}, a private Python and PyTorch, about {} GB) into {}. Nothing is installed elsewhere.",
+                &[&train::APPLIO_VERSION, &train::INSTALL_GB, &super::plain_path(&train::root())],
+            )));
+        }
+        ui.label(m3::supporting(t(
+            "Training uses Applio, and starting it accepts Applio's terms of use.",
+        )));
+        let (mut start, mut terms, mut remove) = (false, false, false);
+        m3::actions(ui, |ui| {
+            start = ui
+                .add_enabled(
+                    gpu_ok && enough && !busy && folder.is_some(),
+                    m3::Button::filled(t("Train")).icon(icons::MEMORY),
+                )
+                .clicked();
+            terms = ui
+                .add(m3::Button::text(t("Applio's terms")).icon(icons::ROUTING))
+                .clicked();
+            if installed || bytes > 0 {
+                let label = if self.clone.confirm_remove {
+                    t("Press again to remove the trainer")
+                } else {
+                    t("Remove trainer")
+                };
+                remove = ui
+                    .add_enabled(!busy, m3::Button::text(label).icon(icons::DELETE))
+                    .clicked();
+            }
+        });
+        if terms {
+            open_external(train::terms_url());
+        }
+        if remove {
+            if self.clone.confirm_remove {
+                self.clone.confirm_remove = false;
+                self.clone.trainer_bytes = None;
+                match train::remove() {
+                    Ok(()) => {
+                        self.message = Some(
+                            t("The trainer was removed. Recordings and voices are kept.").into(),
+                        )
+                    }
+                    Err(error) => self.error = Some(format!("{error:#}")),
+                }
+            } else {
+                self.clone.confirm_remove = true;
+            }
+        }
+        if start {
+            self.start_training();
+        }
+    }
+
+    #[cfg(feature = "catalog")]
+    fn start_training(&mut self) {
+        if !self.shared_models_ready() {
+            return;
+        }
+        let Some(folder) = self.clone.listed.clone() else {
+            return;
+        };
+        let name = dataset::safe_name(&self.clone.name);
+        let options = crate::train::Options {
+            epochs: self.clone.epochs,
+            batch_size: self.clone.batch_size,
+            sample_rate: self.clone.sample_rate,
+            ..crate::train::Options::new(&name, folder)
+        };
+        let progress = std::sync::Arc::new(crate::train::Progress::default());
+        self.clone.training = Some(progress.clone());
+        self.clone.confirm_remove = false;
+        self.begin_work(move || {
+            let manifest = crate::train::train(&options, &progress)?;
+            let voice = crate::config::ModelManifest::load(&manifest)
+                .map(|m| m.name)
+                .unwrap_or(options.name);
+            Ok(tf(
+                "Trained and imported {}. It is selected in Voices.",
+                &[&voice],
+            ))
         });
     }
 

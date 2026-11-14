@@ -1309,9 +1309,9 @@ impl VoiceApp {
             egui::pos2(left, tile.bottom() + 33.0),
             egui::Align2::LEFT_TOP,
             if configured {
-                "RVC · ONNX"
+                format!("{} · ONNX", selected_engine(&slot.manifest).label())
             } else {
-                t("Empty slot")
+                t("Empty slot").to_owned()
             },
             FontId::proportional(12.0),
             if configured {
