@@ -25,7 +25,7 @@ The application does not launch Python, a browser, or a server. It uses eframe/e
 - A command line for scripts and AI agents (`--json` output, exit codes, no prompts): voice import and deletion, shared model downloads, device listing, offline WAV conversion and live conversion.
 - Android NativeActivity entry point and runtime microphone permission request; iOS entry point, permission/audio-session integration and XcodeGen project.
 
-This is **not yet feature parity** with the reference. non-standard RVC checkpoint architectures (and the WebUI `params` checkpoint format), FAISS index types other than L2 IVF-Flat, FP16 model inputs, the FCPE pitch detector, training, soundboard and the other VC engines (apart from Diffusion-SVC and DDSP-SVC) are not implemented. Model import currently accepts a JSON path, rather than downloading models; checkpoints are converted with `--export-rvc` or `voices import` (below). The portable bank does exhaustive nearest-neighbor search and is intended for small banks; IVF indexes search the stored `nprobe` closest lists, like the reference.
+This is **not yet feature parity** with the reference. Non-standard RVC checkpoint architectures (and the WebUI `params` checkpoint format), FAISS index types other than L2 IVF-Flat, FP16 model inputs, the soundboard and the other VC engines (apart from Diffusion-SVC and DDSP-SVC) are not implemented. Voices are imported from a checkpoint (`voices import` or the import dialog, below), found online, or loaded from a `model.json`; training your own RVC v2 voice is on the Clone page. The portable bank does exhaustive nearest-neighbor search and is intended for small banks; IVF indexes search the stored `nprobe` closest lists, like the reference.
 
 ## Run on desktop
 
