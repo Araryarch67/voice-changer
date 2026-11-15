@@ -10,7 +10,10 @@ use ort::{
     session::Session,
     value::Tensor,
 };
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{mpsc, Arc},
+};
 
 /// Pitch is detected again for this much audio before the part that is converted
 /// (10 ms frames), so the detector has some context; older frames keep the pitch
@@ -90,7 +93,7 @@ pub(crate) fn embed(
 /// CREPE or FCPE model in use, loaded beside it on first use. Shared by every
 /// engine that needs F0.
 pub(crate) struct Detectors {
-    rmvpe: Session,
+    rmvpe: Option<Session>,
     rmvpe_path: std::path::PathBuf,
     extra: Option<(F0Detector, Session)>,
     threads: usize,
@@ -100,10 +103,21 @@ pub(crate) struct Detectors {
 impl Detectors {
     pub(crate) fn new(rmvpe: Session, rmvpe_path: &Path, threads: usize, device: Device) -> Self {
         Self {
-            rmvpe,
+            rmvpe: Some(rmvpe),
             rmvpe_path: rmvpe_path.to_path_buf(),
             extra: None,
             threads,
+            device,
+        }
+    }
+
+    #[cfg(test)]
+    fn without_rmvpe_for_test(device: Device) -> Self {
+        Self {
+            rmvpe: None,
+            rmvpe_path: std::path::PathBuf::new(),
+            extra: None,
+            threads: 1,
             device,
         }
     }
@@ -134,8 +148,8 @@ impl Detectors {
         Ok(&mut self.extra.as_mut().expect("loaded above").1)
     }
 
-    /// F0 per frame for `frames` 10 ms frames of `audio`, from `detector`.
-    pub fn detect(
+    /// Raw F0 contour for `audio` from `detector`, before resampling to `frames`.
+    pub fn detect_raw(
         &mut self,
         audio: &[f32],
         frames: usize,
@@ -168,7 +182,10 @@ impl Detectors {
                 crate::pitch::fcpe_decode(salience)
             }
             F0Detector::Rmvpe => {
-                let model = &mut self.rmvpe;
+                let model = self
+                    .rmvpe
+                    .as_mut()
+                    .context("This voice has no pitch model")?;
                 let waveform =
                     Tensor::from_array(([1, audio.len()], audio.to_vec().into_boxed_slice()))?;
                 let output = if model.inputs.iter().any(|i| i.name == "threshold") {
@@ -184,10 +201,131 @@ impl Detectors {
             !detected.is_empty() && detected.iter().all(|v| v.is_finite() && *v >= 0.0),
             "Invalid pitch detector output"
         );
-        Ok((0..frames)
-            .map(|i| detected[(i * detected.len() / frames).min(detected.len() - 1)])
-            .collect())
+        Ok(detected)
     }
+
+    /// F0 per frame for `frames` 10 ms frames of `audio`, from `detector`.
+    pub fn detect(
+        &mut self,
+        audio: &[f32],
+        frames: usize,
+        detector: F0Detector,
+    ) -> Result<Vec<f32>> {
+        let detected = self.detect_raw(audio, frames, detector)?;
+        Ok(resample_detected(&detected, frames))
+    }
+}
+
+fn resample_detected(detected: &[f32], frames: usize) -> Vec<f32> {
+    (0..frames)
+        .map(|i| detected[(i * detected.len() / frames).min(detected.len() - 1)])
+        .collect()
+}
+
+fn detector_uses_onnx(detector: F0Detector) -> bool {
+    matches!(
+        detector,
+        F0Detector::Rmvpe | F0Detector::CrepeFull | F0Detector::CrepeTiny | F0Detector::Fcpe
+    )
+}
+
+fn should_parallelize_pitch(device: Device, detector: F0Detector) -> bool {
+    // Overlap feature extraction and pitch detection when they do not fight
+    // over the same execution engine:
+    // - DirectML serializes GPU work and rejects concurrent ONNX sessions.
+    // - Two CPU ONNX sessions contend on ORT's intra-op thread pools and cache.
+    // - CUDA and any CPU-DSP detector (YIN/Harvest/DIO) overlap cleanly.
+    !detector_uses_onnx(detector) || device == Device::Gpu
+}
+
+struct PitchJob {
+    audio: Arc<[f32]>,
+    offset: usize,
+    frames: usize,
+    detector: F0Detector,
+}
+
+struct PitchOutput {
+    detected: Result<Vec<f32>>,
+    elapsed_ms: f64,
+}
+
+/// Runs pitch detection on a dedicated thread so feature extraction and F0
+/// estimation overlap in parallel while keeping ONNX/CUDA thread-local state warm.
+struct PitchWorker {
+    tx: Option<mpsc::SyncSender<PitchJob>>,
+    rx: mpsc::Receiver<PitchOutput>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PitchWorker {
+    fn spawn(mut detectors: Detectors) -> Result<Self> {
+        let (job_tx, job_rx) = mpsc::sync_channel::<PitchJob>(1);
+        let (out_tx, out_rx) = mpsc::sync_channel::<PitchOutput>(1);
+        let handle = std::thread::Builder::new()
+            .name("rvc-pitch".into())
+            .spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let started = std::time::Instant::now();
+                    let detected =
+                        detectors.detect_raw(&job.audio[job.offset..], job.frames, job.detector);
+                    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    if out_tx
+                        .send(PitchOutput {
+                            detected,
+                            elapsed_ms,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .context("Spawn pitch worker thread")?;
+        Ok(Self {
+            tx: Some(job_tx),
+            rx: out_rx,
+            handle: Some(handle),
+        })
+    }
+
+    fn start(&self, job: PitchJob) -> Result<()> {
+        self.tx
+            .as_ref()
+            .context("Pitch worker shut down")?
+            .send(job)
+            .map_err(|_| anyhow::anyhow!("Pitch worker stopped unexpectedly"))
+    }
+
+    fn finish(&self) -> Result<PitchOutput> {
+        self.rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("Pitch worker stopped unexpectedly"))
+    }
+
+    fn run_sync(&self, job: PitchJob) -> Result<PitchOutput> {
+        self.start(job)?;
+        self.finish()
+    }
+}
+
+impl Drop for PitchWorker {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+struct PreparedInputs {
+    features: Vec<f32>,
+    frames: usize,
+    pitch: Vec<i64>,
+    pitchf: Vec<f32>,
+    feature_ms: f64,
+    pitch_ms: f64,
+    parallel_pitch: bool,
 }
 
 /// RVC ONNX with waveform-in ContentVec and waveform-in RMVPE exports.
@@ -195,7 +333,8 @@ pub struct Rvc {
     manifest: ModelManifest,
     voice: Session,
     embedder: Session,
-    pitch: Option<Detectors>,
+    pitch_worker: Option<PitchWorker>,
+    device: Device,
     /// Blocks still converted after the input fell under the noise gate.
     gate_hold: u32,
     /// Whether the noise gate is currently open (needs a smooth fade-out before muting).
@@ -289,17 +428,17 @@ impl Rvc {
                 .all(|i| i.name == manifest.embedder_input || i.name == "padding_mask"),
             "Unsupported embedder inputs; export a waveform-in graph with optional padding_mask"
         );
-        let pitch = if manifest.use_f0 {
+        let pitch_worker = if manifest.use_f0 {
             let model = session(&manifest.pitch).context("Load RMVPE ONNX")?;
             anyhow::ensure!(model.inputs.iter().any(|i| i.name == "waveform")
                 && model.inputs.iter().all(|i| i.name == "waveform" || i.name == "threshold"),
                 "RMVPE must accept waveform [1,N] and optional threshold [1]; mel-input exports are not supported");
-            Some(Detectors::new(
+            Some(PitchWorker::spawn(Detectors::new(
                 model,
                 &manifest.pitch,
                 manifest.intra_threads,
                 device,
-            ))
+            ))?)
         } else {
             None
         };
@@ -320,7 +459,8 @@ impl Rvc {
             manifest,
             voice,
             embedder,
-            pitch,
+            pitch_worker,
+            device,
             gate_hold: 0,
             gate_open: false,
             history: Vec::new(),
@@ -344,44 +484,124 @@ impl Rvc {
         )
     }
 
-    fn detectors(&mut self) -> Result<&mut Detectors> {
-        self.pitch.as_mut().context("This voice has no pitch model")
-    }
-
-    /// Coarse and fine pitch for `frames` frames of `audio`. `fresh_frames` is how
-    /// many frames at the end are new since the last block (`None` when the blocks
-    /// do not line up with 10 ms frames) and `tail_frames` how many at the end must
-    /// be detected again; the rest come from the previous block's track.
-    fn pitches(
+    /// Runs feature extraction and raw F0 detection together when safe for the
+    /// active execution provider, then assembles the stabilized pitch curves.
+    #[allow(clippy::too_many_arguments)]
+    fn features_and_pitches(
         &mut self,
-        audio: &[f32],
+        audio: Arc<[f32]>,
         history_start: i64,
-        frames: usize,
+        required: usize,
         fresh_frames: Option<usize>,
         tail_frames: usize,
         settings: &Settings,
-    ) -> Result<(Vec<i64>, Vec<f32>)> {
-        if self.pitch.is_none() {
-            return Ok((Vec::new(), Vec::new()));
-        }
+    ) -> Result<PreparedInputs> {
         let detector = settings.f0_detector;
-        let tail = tail_frames.min(frames);
-        let reusable = fresh_frames.filter(|&fresh| {
+        let frames_hint = if !self.pitch_track.is_empty() {
+            self.pitch_track.len()
+        } else {
+            required / 160
+        };
+        let tail = tail_frames.min(frames_hint);
+        let reusable_fresh = fresh_frames.filter(|&fresh| {
             self.pitch_track_detector == Some(detector)
-                && self.pitch_track.len() == frames
+                && self.pitch_track.len() == frames_hint
                 && fresh <= tail
                 && audio.len() >= tail * 160
         });
-        let track = match reusable {
-            Some(fresh) if tail < frames => {
-                let detected =
-                    self.detectors()?
-                        .detect(&audio[audio.len() - tail * 160..], tail, detector)?;
-                let mut track = self.pitch_track[fresh..fresh + frames - tail].to_vec();
-                track.extend(detected);
-                track
-            }
-            _ => self.detectors()?.detect(audio, frames, detector)?,
+        let (detect_offset, detect_frames, used_tail) = match reusable_fresh {
+            Some(_) if tail < frames_hint => (audio.len() - tail * 160, tail, true),
+            _ => (0, frames_hint, false),
+        };
+        let parallel_pitch =
+            self.pitch_worker.is_some() && should_parallelize_pitch(self.device, detector);
+
+        if parallel_pitch {
+            self.pitch_worker
+                .as_ref()
+                .expect("checked above")
+                .start(PitchJob {
+                    audio: Arc::clone(&audio),
+                    offset: detect_offset,
+                    frames: detect_frames,
+                    detector,
+                })?;
+        }
+
+        let feature_start = std::time::Instant::now();
+        let extracted_result = self.features(&audio);
+        let feature_ms = feature_start.elapsed().as_secs_f64() * 1000.0;
+        // Always drain the in-flight job before propagating a feature error so the
+        // worker channel never falls out of sync on subsequent blocks.
+        let prefetched = if parallel_pitch {
+            Some(
+                self.pitch_worker
+                    .as_ref()
+                    .expect("checked above")
+                    .finish()?,
+            )
+        } else {
+            None
+        };
+        let extracted = extracted_result?;
+
+        let source_frames = extracted.len() / self.manifest.channels;
+        let frames = (required / 160).min(source_frames * 2);
+        anyhow::ensure!(frames > 0, "Embedding contains no frames");
+        // Matches nearest-neighbor x2 interpolation in the reference RVC pipeline.
+        let mut features = Vec::with_capacity(frames * self.manifest.channels);
+        for frame in 0..frames {
+            let offset = (frame / 2) * self.manifest.channels;
+            features.extend_from_slice(&extracted[offset..offset + self.manifest.channels]);
+        }
+
+        let Some(worker) = &self.pitch_worker else {
+            return Ok(PreparedInputs {
+                features,
+                frames,
+                pitch: Vec::new(),
+                pitchf: Vec::new(),
+                feature_ms,
+                pitch_ms: 0.0,
+                parallel_pitch: false,
+            });
+        };
+
+        let output = match prefetched {
+            Some(output) => output,
+            None => worker.run_sync(PitchJob {
+                audio: Arc::clone(&audio),
+                offset: detect_offset,
+                frames: detect_frames,
+                detector,
+            })?,
+        };
+        let mut detected = output.detected?;
+        let mut pitch_ms = output.elapsed_ms;
+        let mut used_tail_actual = used_tail;
+
+        // If `frames` differed from our pre-embedder estimate (e.g., an odd
+        // `required / 160` on block 1) and the slice or detector depended on it,
+        // re-run over the exact window for parity with sequential execution.
+        if frames != frames_hint && (used_tail || detector == F0Detector::Yin) {
+            let fallback = worker.run_sync(PitchJob {
+                audio,
+                offset: 0,
+                frames,
+                detector,
+            })?;
+            detected = fallback.detected?;
+            pitch_ms += fallback.elapsed_ms;
+            used_tail_actual = false;
+        }
+
+        let track = if used_tail_actual {
+            let fresh = reusable_fresh.expect("used_tail_actual implies reusable_fresh");
+            let mut track = self.pitch_track[fresh..fresh + frames - tail].to_vec();
+            track.extend(resample_detected(&detected, tail));
+            track
+        } else {
+            resample_detected(&detected, frames)
         };
         self.pitch_track.clone_from(&track);
         self.pitch_track_detector = Some(detector);
@@ -394,7 +614,15 @@ impl Rvc {
             settings.pitch_correct,
         );
         let pitch = pitchf.iter().map(|v| dsp::coarse_pitch(*v)).collect();
-        Ok((pitch, pitchf))
+        Ok(PreparedInputs {
+            features,
+            frames,
+            pitch,
+            pitchf,
+            feature_ms,
+            pitch_ms,
+            parallel_pitch,
+        })
     }
 
     fn retrieve(&self, features: &mut [f32], pitch: &[f32], settings: &Settings) -> Result<()> {
@@ -492,29 +720,25 @@ impl Converter for Rvc {
             self.pitch_tracker.reset();
             return Ok(vec![0.0; input.len()]);
         }
-        let audio = self.history.clone();
-        let profile_start = std::time::Instant::now();
-        let extracted = self.features(&audio)?;
-        let feature_ms = profile_start.elapsed().as_secs_f64() * 1000.0;
-        let source_frames = extracted.len() / self.manifest.channels;
-        let frames = (required / 160).min(source_frames * 2);
-        anyhow::ensure!(frames > 0, "Embedding contains no frames");
-        // Matches nearest-neighbor x2 interpolation in the reference RVC pipeline.
-        let mut features = Vec::with_capacity(frames * self.manifest.channels);
-        for frame in 0..frames {
-            let offset = (frame / 2) * self.manifest.channels;
-            features.extend_from_slice(&extracted[offset..offset + self.manifest.channels]);
-        }
-        let pitch_start = std::time::Instant::now();
-        let (pitch, pitchf) = self.pitches(
-            &audio,
-            history_start,
+        let audio: Arc<[f32]> = Arc::from(self.history.as_slice());
+        let prep_start = std::time::Instant::now();
+        let PreparedInputs {
+            mut features,
             frames,
+            pitch,
+            pitchf,
+            feature_ms,
+            pitch_ms,
+            parallel_pitch,
+        } = self.features_and_pitches(
+            audio,
+            history_start,
+            required,
             fresh_frames,
             convert_frames + PITCH_MARGIN_FRAMES,
             settings,
         )?;
-        let pitch_ms = pitch_start.elapsed().as_secs_f64() * 1000.0;
+        let prep_ms = prep_start.elapsed().as_secs_f64() * 1000.0;
         self.retrieve(&mut features, &pitchf, settings)?;
         let feats = Tensor::from_array((
             [1, frames, self.manifest.channels],
@@ -557,7 +781,8 @@ impl Converter for Rvc {
             .collect();
         drop(output);
         log::trace!(
-            "block: features {feature_ms:.1} ms, pitch {pitch_ms:.1} ms, voice {:.1} ms",
+            "block: prep {prep_ms:.1} ms (features {feature_ms:.1} ms, pitch {pitch_ms:.1} ms, {}), voice {:.1} ms",
+            if parallel_pitch { "parallel" } else { "serial" },
             voice_start.elapsed().as_secs_f64() * 1000.0
         );
         let converted = dsp::resample(&values, self.manifest.sample_rate, rate);
@@ -584,5 +809,49 @@ impl Converter for Rvc {
         self.gate_open = false;
         self.pitch_track.clear();
         self.pitch_track_detector = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parallel_policy_matches_execution_provider_constraints() {
+        assert!(!should_parallelize_pitch(Device::Cpu, F0Detector::Rmvpe));
+        assert!(!should_parallelize_pitch(Device::Cpu, F0Detector::Fcpe));
+        assert!(!should_parallelize_pitch(
+            Device::DirectMl,
+            F0Detector::Rmvpe
+        ));
+        assert!(should_parallelize_pitch(Device::Cpu, F0Detector::Yin));
+        assert!(should_parallelize_pitch(Device::DirectMl, F0Detector::Yin));
+        assert!(should_parallelize_pitch(Device::Gpu, F0Detector::Rmvpe));
+        assert!(should_parallelize_pitch(Device::Gpu, F0Detector::Yin));
+    }
+
+    #[test]
+    fn pitch_worker_runs_and_slices_jobs_cleanly() {
+        let worker = PitchWorker::spawn(Detectors::without_rmvpe_for_test(Device::Cpu)).unwrap();
+        let mut audio = vec![0.0_f32; 1600];
+        for sample in 0..8000 {
+            audio.push(0.25 * (2.0 * std::f32::consts::PI * 220.0 * sample as f32 / 16000.0).sin());
+        }
+        let shared: Arc<[f32]> = Arc::from(audio.as_slice());
+        worker
+            .start(PitchJob {
+                audio: Arc::clone(&shared),
+                offset: 1600,
+                frames: 50,
+                detector: F0Detector::Yin,
+            })
+            .unwrap();
+        let out = worker.finish().unwrap();
+        let detected = out.detected.unwrap();
+        let resampled = resample_detected(&detected, 50);
+        assert_eq!(resampled.len(), 50);
+        for &hz in &resampled[5..45] {
+            assert!((hz - 220.0).abs() < 3.0, "expected ~220 Hz, got {hz}");
+        }
     }
 }
