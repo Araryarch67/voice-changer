@@ -75,6 +75,59 @@ fn import_ddsp_into(
     result
 }
 
+/// Imports a so-vits-svc generator checkpoint (`G_*.pth`) as a voice, with the
+/// config.json it was trained with (the one beside it when `config` is `None`).
+pub fn import_sovits(
+    checkpoint: &Path,
+    config: Option<&Path>,
+    name: Option<&str>,
+) -> Result<PathBuf> {
+    let root = runtime::models_root().context(
+        "The voice engine (shared/contentvec.onnx and shared/rmvpe.onnx) is not set up yet; run `setup download` first",
+    )?;
+    import_sovits_into(&root, checkpoint, config, name)
+}
+
+fn import_sovits_into(
+    root: &Path,
+    checkpoint: &Path,
+    config: Option<&Path>,
+    name: Option<&str>,
+) -> Result<PathBuf> {
+    anyhow::ensure!(
+        checkpoint.is_file(),
+        "The checkpoint does not exist: {}",
+        checkpoint.display()
+    );
+    let config = match config {
+        Some(config) => config.to_path_buf(),
+        None => checkpoint
+            .parent()
+            .map(|folder| folder.join("config.json"))
+            .filter(|config| config.is_file())
+            .context("A so-vits-svc voice needs the config.json it was trained with; put it beside the G_*.pth or choose it")?,
+    };
+    anyhow::ensure!(
+        config.is_file(),
+        "The config.json does not exist: {}",
+        config.display()
+    );
+    // so-vits-svc names its checkpoints G_<steps>.pth; their folder names the voice.
+    let generic = checkpoint
+        .file_stem()
+        .is_some_and(|s| s.to_string_lossy().starts_with("G_"));
+    let fallback = generic
+        .then(|| checkpoint.parent().and_then(Path::file_name))
+        .flatten()
+        .map(|n| n.to_string_lossy().into_owned());
+    let (folder, stem) = new_folder(root, checkpoint, name.or(fallback.as_deref()))?;
+    let result = build_sovits(&folder, checkpoint, &config, &stem);
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+    result
+}
+
 /// Imports `source` (a `.pth` or a `.zip` holding one) as a voice, optionally with an
 /// index the caller chose (only with a `.pth`) and a display name; the command line's
 /// `voices import`. Without `index`, a `.pth` takes the index beside it, like
@@ -132,6 +185,10 @@ fn import_named(root: &Path, source: &Path, name: Option<&str>) -> Result<PathBu
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     match extension.as_str() {
+        // A .pth beside a so-vits-svc config.json is a so-vits-svc voice.
+        "pth" if crate::sovits::looks_like_sovits(source).is_some() => {
+            import_sovits_into(root, source, None, name)
+        }
         "pth" => {
             let index = source.parent().and_then(find_index);
             import_checkpoint(root, source, index.as_deref(), false, name)
@@ -428,6 +485,37 @@ fn build_ddsp(
     };
     let path = folder.join("model.json");
     std::fs::write(&path, serde_json::to_string_pretty(&manifest)?)?;
+    Ok(path)
+}
+
+/// A so-vits-svc voice: `voice.onnx` from its template, with ContentVec (layer 9
+/// projected for 256 channels, layer 12 for 768) and RMVPE from the shared folder.
+fn build_sovits(folder: &Path, checkpoint: &Path, config: &Path, stem: &str) -> Result<PathBuf> {
+    let exported = crate::sovits::export(checkpoint, config, folder)?;
+    let manifest = ModelManifest {
+        engine: VoiceEngine::SoVitsSvc,
+        name: stem.to_owned(),
+        model: PathBuf::from(exported.model.file_name().expect("exported file")),
+        embedder: "../shared/contentvec.onnx".into(),
+        pitch: "../shared/rmvpe.onnx".into(),
+        sample_rate: exported.info.sample_rate,
+        channels: exported.info.ssl_dim,
+        use_f0: true,
+        embedder_input: "audio".into(),
+        embedder_output: if exported.info.ssl_dim == 256 {
+            "units9"
+        } else {
+            "unit12"
+        }
+        .into(),
+        output_scale: 1.0,
+        feature_bank: None,
+        intra_threads: threads(),
+        ..ModelManifest::default()
+    };
+    let path = folder.join("model.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&manifest)?)?;
+    ModelManifest::load(&path).context("The imported voice did not pass validation")?;
     Ok(path)
 }
 

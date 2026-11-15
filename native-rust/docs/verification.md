@@ -76,6 +76,14 @@ Host: Windows 11 x86_64; Rust 1.100.
 - fmt, clippy (`-D warnings`, default and `gui,audio`, `gui,audio,onnx`, `gui,onnx,export`) and `cargo test` passed; every new text is translated and the Japanese font subset covers it.
 - Not run: a real training. It downloads about 8 GB (Python, PyTorch, Applio) and takes an hour or more on the GPU; the setup, a full training, Stop and continuing, and the import of the result still need a run on this machine.
 
+## Update — so-vits-svc voices (2026-11-15)
+
+- Two graph templates from the reference's `SoVitsSvc40` `SynthesizerTrn` (`tools/dev/make_sovits_templates.py`, torch 2.8 legacy exporter): 4.0's default (ssl_dim 256, gin 256) and 4.1's (768, 768). Template weights are matched to checkpoint tensors by value and shape (a 1×9 weight and its transpose have the same bytes).
+- `tools/dev/verify_sovits_export.py`: random-weight generator checkpoints (fp32 and fp16, 7 speakers where the template has 4) with their config.json, imported with the release CLI's `voices import`, then run in ONNX Runtime with the NSF source's random nodes zeroed against the reference model with randomness patched to zero, at 6, 40 and 87 frames: all 12 runs within 1.2e-7 (output peaks 0.025 to 0.097); manifest (engine, channels, embedder output) and metadata (speakers, names) correct.
+- `tests/sovits.rs` (ignored): a random-weight 768-channel voice through the engine block by block with the synthetic embedder and pitch models: finite, non-silent, full-length output, about 200 ms per 320 ms block on CPU.
+- The RVC export now shares the template filler; `tools/dev/verify_rvc_export.py` passed again for all 24 variants (within 3.2e-7 of PyTorch, 2.2e-8 of the reference export procedure).
+- fmt, clippy (`-D warnings`, default and the three reduced feature sets) and `cargo test` passed. Not checked: a real so-vits-svc voice and its sound.
+
 ## Before 1.0: checks by hand
 
 None of these has been run with real audio yet. Each needs a real RVC voice, a microphone and headphones.
@@ -96,6 +104,7 @@ Voices and files
 - [ ] Add slot past eight; move a card earlier and later and remove one (right-click, and press and hold on a touch screen); the selected voice and its tuning stay with it.
 - [ ] Convert: a WAV converts with the chosen voice and the report is written; dropping a `.wav` opens Convert with it.
 - [ ] Train on this computer: first setup, a short training (for example 20 epochs), Stop and Train again continue from the last save, the voice is imported and selected; Remove trainer frees the space.
+- [ ] A real so-vits-svc 4.0 and 4.1 voice (G_*.pth with config.json) imports, converts live and in Cover, and Noise scale changes the sound.
 - [ ] Split and Cover on real songs (MP3 and WAV) with a real voice: the vocals and music are clean, the cover sounds in tune, Cancel stops a job, and CUDA/DirectML work for separation.
 
 Setup and settings

@@ -216,31 +216,103 @@ pub fn export_rvc(checkpoint: &Path, output: &Path, realtime: bool) -> Result<Ex
         .iter()
         .find(|t| (t.0, t.1, t.2, t.3) == (version, sample_rate, f0, realtime))
         .with_context(|| format!("No RVC {version} template for {sample_rate} Hz; standard rates are 32000, 40000 and 48000"))?;
+    // v1 uses the projected layer-9 embedding, v2 layer 12 (RVCModelSlotGenerator).
+    let v1 = version == "v1";
+    let channels = if v1 { 256 } else { 768 };
+    let metadata = serde_json::json!({
+        "application": "VC_CLIENT", "version": "2.1", "samplingRate": sample_rate,
+        "f0": f0, "embChannels": channels, "embOutputLayer": if v1 { 9 } else { 12 },
+        "useFinalProj": v1, "embedder": "contentvec", "speakers": speakers, "realtimeDecoder": realtime,
+    });
+    let weights: HashMap<&str, &Tensor> = weights.into_iter().collect();
+    let model = fill_template(
+        compressed,
+        &weights,
+        &["enc_q."],
+        &metadata.to_string(),
+        |template| {
+            ensure!(
+                template.f0 == f0 && template.channels == channels,
+                "Template f0 or channels mismatch"
+            );
+            ensure!(
+                template.config.len() == config.len()
+                    && (0..config.len())
+                        .filter(|i| !GRAPH_INDEPENDENT_CONFIG.contains(i))
+                        .all(|i| template.config[i] == config[i]),
+                "Checkpoint architecture {config:?} differs from the standard {sample_rate} Hz RVC {version} configuration"
+            );
+            Ok(())
+        },
+    )?;
+    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = output.with_extension("partial.onnx");
+    std::fs::write(&temporary, model).with_context(|| format!("Write {}", temporary.display()))?;
+    std::fs::rename(&temporary, output)?;
+    Ok(Exported {
+        version: version.to_owned(),
+        f0,
+        sample_rate,
+        channels,
+        speakers,
+    })
+}
+
+fn transpose(tensor: &Tensor) -> Result<Tensor> {
+    let [rows, cols] = tensor.shape[..] else {
+        bail!("Transpose expects a matrix")
+    };
+    let data = (0..cols * rows)
+        .map(|i| tensor.data[(i % rows) * cols + i / rows])
+        .collect();
+    Ok(Tensor {
+        shape: vec![cols, rows],
+        data,
+    })
+}
+
+/// What a template says about the architecture it was made for.
+pub(crate) struct TemplateInfo {
+    pub config: Vec<serde_json::Value>,
+    pub channels: usize,
+    pub f0: bool,
+}
+
+/// Fills a zlib-compressed template (made like `tools/dev/make_rvc_templates.py`) with
+/// `weights` and writes `metadata`. The checkpoint must hold exactly the template's
+/// state keys, apart from keys starting with one of `optional` (training-only parts).
+/// `check` sees the template's config first and can refuse the checkpoint.
+pub(crate) fn fill_template(
+    compressed: &[u8],
+    weights: &HashMap<&str, &Tensor>,
+    optional: &[&str],
+    metadata: &str,
+    check: impl FnOnce(&TemplateInfo) -> Result<()>,
+) -> Result<Vec<u8>> {
     let bytes = &inflate(compressed)?;
     let template = read_template(bytes)?;
     ensure!(template.format == 1, "Unsupported template format");
-    ensure!(template.f0 == f0, "Template f0 mismatch");
-    ensure!(
-        template.config.len() == config.len()
-            && (0..config.len())
-                .filter(|i| !GRAPH_INDEPENDENT_CONFIG.contains(i))
-                .all(|i| template.config[i] == config[i]),
-        "Checkpoint architecture {config:?} differs from the standard {sample_rate} Hz RVC {version} configuration"
-    );
+    check(&TemplateInfo {
+        config: template.config.clone(),
+        channels: template.channels,
+        f0: template.f0,
+    })?;
+    let is_optional = |key: &str| optional.iter().any(|prefix| key.starts_with(prefix));
     let missing: Vec<_> = template
         .state_keys
         .iter()
-        .filter(|k| !k.starts_with("enc_q.") && !weights.contains_key(k.as_str()))
+        .filter(|k| !is_optional(k) && !weights.contains_key(k.as_str()))
         .collect();
     let unexpected: Vec<_> = weights
         .keys()
-        .filter(|k| !template.state_keys.iter().any(|s| s == *k))
+        .filter(|k| !is_optional(k) && !template.state_keys.iter().any(|s| s == *k))
         .collect();
     ensure!(
         missing.is_empty() && unexpected.is_empty(),
         "Checkpoint architecture mismatch: missing={missing:?}, unexpected={unexpected:?}"
     );
-
     let get = |key: &str| {
         weights
             .get(key)
@@ -261,40 +333,7 @@ pub fn export_rvc(checkpoint: &Path, output: &Path, realtime: bool) -> Result<Ex
         );
         initializers.insert(name.as_str(), tensor);
     }
-    // v1 uses the projected layer-9 embedding, v2 layer 12 (RVCModelSlotGenerator).
-    let v1 = version == "v1";
-    let metadata = serde_json::json!({
-        "application": "VC_CLIENT", "version": "2.1", "samplingRate": sample_rate,
-        "f0": f0, "embChannels": template.channels, "embOutputLayer": if v1 { 9 } else { 12 },
-        "useFinalProj": v1, "embedder": "contentvec", "speakers": speakers, "realtimeDecoder": realtime,
-    });
-    let model = fill_model(bytes, &initializers, &metadata.to_string())?;
-    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temporary = output.with_extension("partial.onnx");
-    std::fs::write(&temporary, model).with_context(|| format!("Write {}", temporary.display()))?;
-    std::fs::rename(&temporary, output)?;
-    Ok(Exported {
-        version: version.to_owned(),
-        f0,
-        sample_rate,
-        channels: template.channels,
-        speakers,
-    })
-}
-
-fn transpose(tensor: &Tensor) -> Result<Tensor> {
-    let [rows, cols] = tensor.shape[..] else {
-        bail!("Transpose expects a matrix")
-    };
-    let data = (0..cols * rows)
-        .map(|i| tensor.data[(i % rows) * cols + i / rows])
-        .collect();
-    Ok(Tensor {
-        shape: vec![cols, rows],
-        data,
-    })
+    fill_model(bytes, &initializers, metadata)
 }
 
 /// `torch._weight_norm(v, g, dim=0)`: each output channel of `v` scaled to norm `g`.
@@ -352,10 +391,13 @@ fn fill_model(model: &[u8], weights: &HashMap<&str, Tensor>, metadata: &str) -> 
                         continue;
                     };
                     let (name, dims, data_type) = tensor_header(tensor)?;
+                    // Graph constants the template kept (shapes, small scalars).
+                    let Some(weight) = weights.get(name.as_str()) else {
+                        ensure!(tensor_has_data(tensor)?, "No weights for {name}");
+                        graph_out.extend_from_slice(raw);
+                        continue;
+                    };
                     ensure!(data_type == 1, "Template initializer {name} is not float32");
-                    let weight = weights
-                        .get(name.as_str())
-                        .with_context(|| format!("No weights for {name}"))?;
                     // Speaker count is the only shape allowed to differ from the template.
                     ensure!(
                         dims == weight.shape
@@ -393,6 +435,14 @@ fn fill_model(model: &[u8], weights: &HashMap<&str, Tensor>, metadata: &str) -> 
     Ok(out)
 }
 
+/// Whether a template initializer still holds its data (a graph constant, not a
+/// weight to fill).
+fn tensor_has_data(tensor: &[u8]) -> Result<bool> {
+    Ok(fields(tensor)?
+        .iter()
+        .any(|(number, _)| matches!(number, 4 | 5 | 7 | 9)))
+}
+
 fn tensor_header(tensor: &[u8]) -> Result<(String, Vec<usize>, u64)> {
     let (mut name, mut dims, mut data_type) = (String::new(), Vec::new(), 0);
     for (number, wire) in fields(tensor)? {
@@ -406,7 +456,6 @@ fn tensor_header(tensor: &[u8]) -> Result<(String, Vec<usize>, u64)> {
             }
             (2, Wire::Varint(v)) => data_type = v,
             (8, Wire::Bytes(b)) => name = String::from_utf8(b.to_vec())?,
-            (9 | 4, _) => bail!("Template initializer {name} still holds data"),
             _ => {}
         }
     }

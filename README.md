@@ -28,12 +28,12 @@ Voice Changer converts your microphone into another voice as you speak, using [R
 
 ## Features
 
-- **Real-time conversion** with RVC v1 and v2 voices, and with Diffusion-SVC and DDSP-SVC voices; pitch shifting (Tune) and speaker selection.
+- **Real-time conversion** with RVC v1 and v2 voices, and with so-vits-svc, Diffusion-SVC and DDSP-SVC voices; pitch shifting (Tune) and speaker selection.
 - **Index retrieval** that reads RVC's FAISS `IndexIVFFlat` `.index` files directly, without the FAISS library.
 - **Noise handling**: RNNoise suppression in two strengths (Sup1, Sup2), a noise gate and echo cancellation.
 - **Pitch detectors**: RMVPE, CREPE, FCPE, Harvest, DIO and YIN.
 - **GPU or CPU**: CUDA through ONNX Runtime where available, CPU everywhere else.
-- **One-step import**: pick an RVC `.pth` or `.zip` (or a Diffusion-SVC `.ptc`, or a DDSP-SVC model) and the app converts it to ONNX, finds its index and adds the voice, no Python needed. Each voice can have its own picture.
+- **One-step import**: pick an RVC `.pth` or `.zip` (or a so-vits-svc `G_*.pth` with its `config.json`, a Diffusion-SVC `.ptc`, or a DDSP-SVC model) and the app converts it to ONNX, finds its index and adds the voice, no Python needed. Each voice can have its own picture.
 - **Clone your own voice**: record yourself on the **Clone** page, then train an RVC v2 voice on this computer's NVIDIA GPU or on Google Colab's free GPU.
 - **Song covers and vocal separation**: the **Cover** page sings a song (MP3, FLAC, OGG, M4A or WAV) in one of your voices, and the **Split** page separates a song's vocals from its music, with the Kim Vocal 2 MDX-Net model that Ultimate Vocal Remover uses.
 - **Recording** of the microphone and the converted voice to WAV, and a **Convert** page that changes the voice in a WAV file (drop a `.wav` on the window to open it).
@@ -99,6 +99,7 @@ Then choose **GPU (CUDA)** under **Settings → Processing**. As a rough guide f
 | RVC v1 and v2, with and without f0 (32, 40, 48 kHz) | Supported |
 | Diffusion-SVC voices (`.ptc` combo models, ContentVec layer 12) | Supported; needs the NSF-HiFiGAN vocoder (CC BY-NC-SA 4.0, downloaded on request) |
 | DDSP-SVC 3.0 voices, with or without their diffusion model | Supported; NSF-HiFiGAN as above |
+| so-vits-svc 4.0 and 4.1 voices (ContentVec vec256l9 or vec768l12, 44.1 kHz) | Supported; kmeans cluster models and 4.1's optional extras (volume embedding, depthwise convolution, transformer flow) are not |
 | Tune, index ratio, protect, gain, chunk, extra, crossfade | Supported |
 | Noise suppression and noise gate | Supported |
 | Pitch detection | RMVPE, CREPE (full, tiny), FCPE, Harvest, DIO and built-in YIN |
@@ -108,7 +109,8 @@ Then choose **GPU (CUDA)** under **Settings → Processing**. As a rough guide f
 | Echo cancellation | Supported (WebRTC AEC3) |
 | Checkpoint export for RVC v1 and v2, with and without f0 | Supported |
 | Training your own voice (RVC v2) | Supported: on this computer's NVIDIA GPU (Applio, set up on first use) or on Google Colab |
-| Other engines (MMVC, so-vits-svc, Beatrice) | Not planned for now |
+| MMVC | Not planned for now: its models only suit the voice they were trained with |
+| Beatrice | Not possible: the reference has only a stub, and the engine is closed and non-commercial |
 
 Development and testing happen on Linux and Windows; Windows and Linux builds are produced by CI. Android and iOS entry points exist but are experimental. What has and has not been checked by hand is listed in [native-rust/docs/verification.md](native-rust/docs/verification.md).
 

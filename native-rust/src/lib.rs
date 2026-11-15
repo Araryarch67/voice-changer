@@ -50,6 +50,8 @@ pub mod rvc;
 pub mod separate;
 #[cfg(feature = "catalog")]
 pub mod setup;
+#[cfg(any(feature = "export", feature = "onnx", feature = "onnx-static"))]
+pub mod sovits;
 #[cfg(feature = "catalog")]
 pub mod train;
 #[cfg(all(feature = "audio", target_os = "linux"))]

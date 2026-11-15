@@ -234,6 +234,9 @@ pub fn load_converter_on(path: &std::path::Path, device: Device) -> Result<Box<d
             crate::config::VoiceEngine::DdspSvc => {
                 Box::new(crate::ddsp_svc::DdspSvc::load_on(path, device)?)
             }
+            crate::config::VoiceEngine::SoVitsSvc => {
+                Box::new(crate::sovits::SoVitsSvc::load_on(path, device)?)
+            }
         })
     }
     #[cfg(not(any(feature = "onnx", feature = "onnx-static")))]

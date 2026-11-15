@@ -646,9 +646,18 @@ impl VoiceApp {
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
+        // A .pth beside a so-vits-svc config.json is a so-vits-svc voice.
+        #[cfg(feature = "export")]
+        let sovits_config = crate::sovits::looks_like_sovits(&path);
+        #[cfg(not(feature = "export"))]
+        let sovits_config: Option<PathBuf> = None;
         let engine = match extension.as_str() {
             "ptc" => crate::config::VoiceEngine::DiffusionSvc,
             "pt" => crate::config::VoiceEngine::DdspSvc,
+            "pth" if sovits_config.is_some() => crate::config::VoiceEngine::SoVitsSvc,
+            _ if self.import_engine == crate::config::VoiceEngine::SoVitsSvc => {
+                crate::config::VoiceEngine::SoVitsSvc
+            }
             _ => crate::config::VoiceEngine::Rvc,
         };
         if engine != self.import_engine {
@@ -656,6 +665,9 @@ impl VoiceApp {
             self.import_index.clear();
         }
         self.import_engine = engine;
+        if let Some(config) = sovits_config.filter(|_| self.import_index.trim().is_empty()) {
+            self.import_index = config.to_string_lossy().into_owned();
+        }
         // Importing needs the exporter; a build without it only loads model.json files.
         #[cfg(feature = "export")]
         if engine == crate::config::VoiceEngine::Rvc && self.import_index.trim().is_empty() {
@@ -740,6 +752,10 @@ impl VoiceApp {
                 crate::config::VoiceEngine::DdspSvc => {
                     crate::import::import_ddsp(&checkpoint, index.as_deref(), None)?
                 }
+                // The second field holds its config.json.
+                crate::config::VoiceEngine::SoVitsSvc => {
+                    crate::import::import_sovits(&checkpoint, index.as_deref(), None)?
+                }
                 crate::config::VoiceEngine::Rvc => {
                     crate::import::import_pair(&checkpoint, index.as_deref())?
                 }
@@ -754,10 +770,14 @@ impl VoiceApp {
                     &manifest,
                 )?)?
                 .name;
-                return Ok(if diffusion {
-                    tf("Imported the Diffusion-SVC voice {}.", &[&name])
-                } else {
-                    tf("Imported the DDSP-SVC voice {}.", &[&name])
+                return Ok(match engine {
+                    crate::config::VoiceEngine::DiffusionSvc => {
+                        tf("Imported the Diffusion-SVC voice {}.", &[&name])
+                    }
+                    crate::config::VoiceEngine::SoVitsSvc => {
+                        tf("Imported the so-vits-svc voice {}.", &[&name])
+                    }
+                    _ => tf("Imported the DDSP-SVC voice {}.", &[&name]),
                 });
             }
             let voice = crate::config::ModelManifest::load(&manifest)?;
@@ -813,6 +833,7 @@ impl VoiceApp {
         let (mut close, mut import) = (false, false);
         let diffusion = self.import_engine == crate::config::VoiceEngine::DiffusionSvc;
         let ddsp = self.import_engine == crate::config::VoiceEngine::DdspSvc;
+        let sovits = self.import_engine == crate::config::VoiceEngine::SoVitsSvc;
         let (_, dismissed) = m3::dialog(ctx, "import-dialog", t("Import voice"), |ui| {
             ui.add_enabled_ui(!busy, |ui| {
                 m3::field_label(ui, t("Model type"));
@@ -823,6 +844,7 @@ impl VoiceApp {
                         crate::config::VoiceEngine::Rvc,
                         crate::config::VoiceEngine::DiffusionSvc,
                         crate::config::VoiceEngine::DdspSvc,
+                        crate::config::VoiceEngine::SoVitsSvc,
                     ] {
                         if m3::menu_item(ui, engine.label(), engine == self.import_engine)
                             .clicked()
@@ -842,6 +864,8 @@ impl VoiceApp {
                     t("A singing-voice model that refines its sound with diffusion: often smoother on long, high notes, slower than RVC.")
                 } else if ddsp {
                     t("A singing-voice model that synthesizes the voice from its harmonics, optionally refined with diffusion. Without diffusion it is about as fast as RVC.")
+                } else if sovits {
+                    t("A voice model close to RVC that many singing covers use; the G_*.pth with its config.json.")
                 } else {
                     t("The common voice model (.pth): fast enough for live use on most computers.")
                 }));
@@ -863,6 +887,8 @@ impl VoiceApp {
                             "/path/to/voice.ptc"
                         } else if ddsp {
                             "/path/to/exp/combsub/model_best.pt"
+                        } else if sovits {
+                            "/path/to/logs/44k/G_10000.pth"
                         } else {
                             "/path/to/voice.pth"
                         },
@@ -895,6 +921,39 @@ impl VoiceApp {
                         "One .ptc file holding both of its models, as Diffusion-SVC's combo.py makes it. It is converted to ONNX, which takes a few seconds.",
                     )));
                     self.vocoder_notice(ui);
+                    return;
+                }
+                if sovits {
+                    ui.label(m3::supporting(t(
+                        "The generator checkpoint so-vits-svc saves (G_*.pth, not D_*.pth). It is converted to ONNX, which takes a few seconds.",
+                    )));
+                    m3::field_label(ui, t("Config (config.json)"));
+                    ui.horizontal(|ui| {
+                        let width = ui.available_width() - 48.0;
+                        ui.add(m3::text_edit(
+                            &mut self.import_index,
+                            "/path/to/config.json",
+                            width,
+                        ));
+                        if m3::icon_button(
+                            ui,
+                            icons::FOLDER_OPEN,
+                            m3::ON_SURFACE_VARIANT,
+                            t("Choose config…"),
+                        )
+                        .clicked()
+                        {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter(t("so-vits-svc config"), &["json"])
+                                .pick_file()
+                            {
+                                self.import_index = path.to_string_lossy().into_owned();
+                            }
+                        }
+                    });
+                    ui.label(m3::supporting(t(
+                        "The config.json the voice was trained with; the one beside the checkpoint is filled in. 4.0 and 4.1 voices with ContentVec (vec256l9 or vec768l12) are supported.",
+                    )));
                     return;
                 }
                 if ddsp {
@@ -1209,6 +1268,9 @@ impl VoiceApp {
                             t("DDSP-SVC · ONNX").to_owned()
                         }
                     }
+                    Ok(model) if model.engine == crate::config::VoiceEngine::SoVitsSvc => {
+                        t("so-vits-svc · ONNX").to_owned()
+                    }
                     Ok(model) if model.feature_bank.is_some() => {
                         t("RVC · ONNX · with index").to_owned()
                     }
@@ -1218,6 +1280,9 @@ impl VoiceApp {
                     }
                     Err(_) if selected_engine(&slot.manifest) == crate::config::VoiceEngine::DdspSvc => {
                         t("DDSP-SVC · needs the NSF-HiFiGAN vocoder or files are missing").to_owned()
+                    }
+                    Err(_) if selected_engine(&slot.manifest) == crate::config::VoiceEngine::SoVitsSvc => {
+                        t("so-vits-svc · ONNX · files missing").to_owned()
                     }
                     Err(_) => t("RVC · ONNX · files missing").to_owned(),
                 }
@@ -1692,6 +1757,17 @@ impl VoiceApp {
                         "Re-renders the synthesized voice with the NSF-HiFiGAN vocoder: fuller and clearer, a little slower. Off plays the synthesizer's own sound.",
                     )));
                 }
+            }
+            if engine == crate::config::VoiceEngine::SoVitsSvc {
+                m3::setting(
+                    ui,
+                    t("Noise scale"),
+                    t("so-vits-svc voices: how much natural variation the voice gets. Around 0.3 sounds most natural; lower is steadier but flatter, higher can sound breathy or rough."),
+                    m3::Format::new("").decimals(2).presets(&[0.0, 0.2, 0.3, 0.5, 0.8]),
+                    &mut s.noise_scale,
+                    0.0..=1.0,
+                    0.01,
+                );
             }
             if engine == crate::config::VoiceEngine::DiffusionSvc {
                 ui.horizontal(|ui| {

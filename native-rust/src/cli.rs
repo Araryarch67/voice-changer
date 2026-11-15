@@ -270,6 +270,8 @@ Settings (all optional; the GUI's names in brackets):
   --output-gain G        0..4 (default 1)  [GAIN out]
   --speaker-id N         Speaker of a multi-speaker voice (default 0)
   --echo                 Echo cancellation, for speakers instead of headphones
+  --noise-scale S        so-vits-svc voices: the text encoder's noise, 0..1
+                         (default 0.3)
   --diffusion on|off     Diffusion-SVC and DDSP-SVC voices: refine with the
                          diffusion model (default on; off is faster)
   --diffusion-steps N    Diffusion sampler steps, 0 for the model's default
@@ -319,6 +321,9 @@ import     FILE is an RVC .pth checkpoint or a .zip holding one. The checkpoint 
            --diffusion adds the shallow-diffusion model trained for it (its own
            model_*.pt beside its config.yaml). DDSP-SVC voices also need
            `setup download nsf_hifigan`; --name defaults to the model's folder.
+           A .pth with a so-vits-svc config.json beside it (4.0 or 4.1, ContentVec
+           vec256l9 or vec768l12, 44.1 kHz) is imported as a so-vits-svc voice: the
+           generator G_*.pth, not D_*.pth; --name defaults to its folder.
 set-index  Copies INDEX.index into the voice's folder and uses it; --none removes it.
            The change is undone if the voice does not load with it.
 delete     Removes the voice's whole folder from disk. Only folders directly inside a
@@ -624,6 +629,7 @@ impl TuningFlags {
             | "--output-gain"
             | "--speaker-id"
             | "--diffusion"
+            | "--noise-scale"
             | "--diffusion-steps"
             | "--diffusion-depth"
             | "--enhancer"
@@ -688,6 +694,7 @@ impl TuningFlags {
                     }
                 }
                 "--diffusion-steps" => settings.diffusion_sampler_steps = number(flag, value)?,
+                "--noise-scale" => settings.noise_scale = number(flag, value)?,
                 "--diffusion-depth" => settings.diffusion_steps = number(flag, value)?,
                 "--device" => match parse_device(value)? {
                     Some(device) => {

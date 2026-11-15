@@ -131,6 +131,9 @@ pub struct Settings {
     /// sung lately would go above what a voice of this register sings well (the
     /// live counterpart of a cover's automatic Tune). `None` is off.
     pub auto_octave: Option<Register>,
+    /// so-vits-svc: how much randomness the text encoder adds (the reference's
+    /// noiseScale, 0.3 by default).
+    pub noise_scale: f32,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -161,6 +164,7 @@ impl Default for Settings {
             diffusion_sampler_steps: 0,
             enhancer: true,
             auto_octave: None,
+            noise_scale: 0.3,
         }
     }
 }
@@ -196,8 +200,10 @@ impl Settings {
             || self.speaker_id < 0
             || self.diffusion_steps > 1000
             || self.diffusion_sampler_steps > 1000
+            || !self.noise_scale.is_finite()
+            || !(0.0..=1.0).contains(&self.noise_scale)
         {
-            bail!("Invalid gain, pitch, speaker, index ratio, protect, leveling, silence threshold or diffusion steps");
+            bail!("Invalid gain, pitch, speaker, index ratio, protect, leveling, silence threshold, diffusion steps or noise scale");
         }
         Ok(())
     }
@@ -216,6 +222,8 @@ pub enum VoiceEngine {
     DiffusionSvc,
     #[serde(rename = "ddsp-svc")]
     DdspSvc,
+    #[serde(rename = "so-vits-svc")]
+    SoVitsSvc,
 }
 
 impl VoiceEngine {
@@ -224,6 +232,7 @@ impl VoiceEngine {
             Self::Rvc => "RVC",
             Self::DiffusionSvc => "Diffusion-SVC",
             Self::DdspSvc => "DDSP-SVC",
+            Self::SoVitsSvc => "so-vits-svc",
         }
     }
 }
@@ -312,7 +321,12 @@ impl ModelManifest {
                 *file = base.join(&*file);
             }
         }
-        if model.engine != VoiceEngine::Rvc {
+        // RVC and so-vits-svc voices carry their own decoder; the others render
+        // with the shared NSF-HiFiGAN vocoder.
+        if matches!(
+            model.engine,
+            VoiceEngine::DiffusionSvc | VoiceEngine::DdspSvc
+        ) {
             let label = model.engine.label();
             // A DDSP-SVC voice's diffusion model is optional: both of its files or
             // neither.
